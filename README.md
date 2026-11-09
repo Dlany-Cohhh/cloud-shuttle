@@ -95,9 +95,9 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 
 ### 7. 设置
 
-![设置页：并发、定时启停、传输参数与 NAS 主页地址](docs/screenshots/07-settings.png)
+![设置页：并发、定时启停、传输参数、NAS 主页地址与自定义代理地址](docs/screenshots/07-settings.png)
 
-同时下载任务上限、每天自动开始 / 暂停时间、每任务传输线程数、校验器并发数、磁盘最低可用空间、高级 rclone 参数、限速与代理开关，以及可自定义的「NAS 主页地址」（侧边栏「返回 NAS 主页」用）。页面底部的「版本与更新」卡片用来检查 GitHub 新版本并一键升级。所有设置持久化到 `settings.json`，源码 `DEFAULTS` 会自动补齐缺失字段。
+同时下载任务上限、每天自动开始 / 暂停时间、每任务传输线程数、校验器并发数、磁盘最低可用空间、高级 rclone 参数、限速与代理开关，以及可自定义的「NAS 主页地址」（侧边栏「返回 NAS 主页」用）。**自定义代理地址在页面往下滚后的「代理下载」卡片第三行**：输入框填 `http(s)://host:port`、`socks5://host:port` 或 `off`，点右侧「保存」，下方「当前生效」会回显实际地址。页面更底部的「版本与更新」卡片用来检查 GitHub 新版本并一键升级。所有设置持久化到 `settings.json`，源码 `DEFAULTS` 会自动补齐缺失字段。
 
 ---
 
@@ -198,7 +198,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
 
 Linux 版用 host 网络（直接占用 5566）；Windows 版自动叠加 `docker-compose.windows.yml` 改成 bridge 端口映射，可用 `-Port` 改对外端口。两者都通过 `docker.sock` 让控制台指挥 rclone-backend，账号配置与下载数据全部留在宿主机目录，停掉容器不会丢数据。
 
-部署后进「账号」页导入 PikPak 账号即可用。代理地址随时能在「设置 → 代理下载」里改，优先级高于 `.env` 的 `PROXY_URL`，保存即生效；细节见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+部署后进「账号」页导入 PikPak 账号即可用。代理地址随时能在「设置 → 往下滚 → 代理下载卡片的『自定义代理地址』输入框」里改，优先级高于 `.env` 的 `PROXY_URL`，保存即生效；细节见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
 ---
 
