@@ -1,4 +1,4 @@
-# 云梭 CloudShuttle · 最小可运行部署示例（所有敏感值都来自 .env，本文件可安全提交）
+# PikPak 多账号下载器（云梭 CloudShuttle）· 最小可运行部署示例（所有敏感值都来自 .env，本文件可安全提交）
 #
 #   cp .env.example .env      # 然后修改路径与凭据
 #   # 在 RCLONE_CONFIG_DIR 放好 rclone.conf，见 docs/DEPLOYMENT.md

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""云梭 CloudShuttle · PikPak 批量下载控制台 v3.0 —— metacubexd 设计系统重构（sunset 暗色主题 · Vue 3 · 弹性动效）
+"""PikPak 多账号下载器（云梭 CloudShuttle）· 批量下载控制台 v3.0 —— metacubexd 设计系统重构（sunset 暗色主题 · Vue 3 · 弹性动效）
    前端在 ./static/（Vue3 + Tailwind v4 + DaisyUI v5 全部自托管，无外网 CDN 依赖）；
    API 与 v2.2 完全兼容，任务/设置数据路径不变"""
 import base64, hashlib, io, json, os, re, select, shutil, socket, ssl, stat as statmod, subprocess, sys, tarfile, threading, time
@@ -5995,7 +5995,7 @@ if __name__ == "__main__":
     print("%s 数据目录: %s" % (time.strftime("%F %T"), DATA_DIR))
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=cred_keepalive_loop, daemon=True).start()
-    print("云梭 CloudShuttle %s (按任务选择 mihomo 代理 · 凭证保活 · 测速每路 %ss): "
+    print("PikPak 多账号下载器（云梭 CloudShuttle）%s (按任务选择 mihomo 代理 · 凭证保活 · 测速每路 %ss): "
           "http://0.0.0.0:5566  ·  static: %s"
           % (APP_VERSION, SPEEDTEST_SECONDS, STATIC_DIR))
     class ConsoleHTTPServer(ThreadingHTTPServer):

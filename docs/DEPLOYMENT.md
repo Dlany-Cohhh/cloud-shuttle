@@ -1,6 +1,6 @@
-# 云梭 CloudShuttle · 部署与运维
+# PikPak 多账号下载器 · 部署与运维
 
-面向从零部署一份新的云梭控制台。文中所有路径、账号、密码都是占位符，请按自己的环境替换。
+面向从零部署一份新的 PikPak 多账号下载器（云梭控制台）。文中所有路径、账号、密码都是占位符，请按自己的环境替换。
 
 ## 1. 端口与依赖
 
@@ -46,7 +46,7 @@ cp .env.example .env
 
 docker compose -f docker-compose.example.yml up -d --build
 docker compose -f docker-compose.example.yml logs -f download-console
-# 看到「云梭 CloudShuttle v3.54」启动横幅即正常
+# 看到「PikPak 多账号下载器（云梭 CloudShuttle）v3.54」启动横幅即正常
 
 curl -s -X POST http://127.0.0.1:5566/api \
   -H 'Content-Type: application/json' -d '{"action":"version"}'

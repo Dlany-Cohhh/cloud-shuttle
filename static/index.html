@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>云梭 CloudShuttle · 下载控制台</title>
+<title>PikPak 多账号下载器 · 云梭 CloudShuttle</title>
 <script>
 /* 主题预上色：在 CSS 加载前落好 data-theme，避免闪白 */
 (function(){try{
@@ -35,7 +35,10 @@
     <header class="relative z-30 flex h-14 shrink-0 items-center justify-between border-b border-base-content/10 bg-base-300/95 px-3 shadow-[0_4px_20px_color-mix(in_oklab,var(--color-base-content)_5%,transparent)] backdrop-blur-[12px] lg:hidden">
       <div class="flex items-center gap-2 text-primary">
         <i class="ti ti-download text-xl leading-none"></i>
-        <span class="text-sm font-bold tracking-tight">云梭 CloudShuttle</span>
+        <span class="flex flex-col leading-tight">
+          <span class="text-sm font-bold tracking-tight">PikPak 下载器</span>
+          <span class="text-[10px] font-medium text-base-content/50">多账号 · 云梭</span>
+        </span>
       </div>
       <div class="relative flex items-center">
         <!-- 移动端也保留返回入口（窄屏没有左侧栏） -->
@@ -80,7 +83,10 @@
         <div class="flex flex-col gap-2 border-b border-base-content/10 p-3">
           <div class="flex min-h-7 items-center gap-2.5 px-1" v-show="!collapsed">
             <i class="ti ti-download text-xl leading-none text-primary"></i>
-            <span class="text-[15px] font-bold tracking-tight">云梭 CloudShuttle</span>
+            <div class="flex min-w-0 flex-col leading-tight">
+              <span class="text-[15px] font-bold tracking-tight">PikPak 下载器</span>
+              <span class="text-[10px] font-medium tracking-wide text-base-content/50">云梭 · 多账号下载</span>
+            </div>
           </div>
           <button class="press-tactile flex h-9 items-center justify-center rounded-lg border border-base-content/10 text-base-content/80 transition-colors hover:border-base-content/20 hover:bg-base-content/5"
                   :class="collapsed ? 'aspect-square w-9 self-center' : 'w-full'"

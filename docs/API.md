@@ -1,4 +1,4 @@
-# 云梭 CloudShuttle · API 速查
+# PikPak 多账号下载器 · API 速查
 
 所有接口都是 `POST /api`，请求体为 JSON，用 `action` 字段区分操作：
 

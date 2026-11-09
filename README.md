@@ -1,6 +1,6 @@
-# 云梭 · CloudShuttle
+# PikPak 多账号下载器 · 云梭 CloudShuttle
 
-> NAS 网盘下载控制台 —— 把多个网盘账号里的资源批量搬到 NAS，并用一个页面管完下载任务、云盘目录、本地文件和账号凭证。
+> **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
 ![version](https://img.shields.io/badge/version-v3.54-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
@@ -38,7 +38,7 @@
 
 ## 它解决什么问题
 
-在 NAS 上用网盘，真正的麻烦往往不是「下载」本身，而是这些琐碎事：账号多了要挨个试能不能连；夜里想排队、白天想限速；下载完还得开文件管理器找文件、改名、校验；代理该走哪条链路每次都要重配容器。
+这是一个给 **PikPak 多账号** 用的下载器：多个 PikPak 账号统一接入后，把资源批量搬到 NAS。真正麻烦的从来不是「下载」本身，而是账号多了要挨个试能不能连、夜里想排队白天想限速、下载完还得开文件管理器找文件改名校验、代理每次都要重配容器。
 
 这个项目把这些环节收进一个单页控制台：
 
@@ -109,17 +109,11 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 
 ## 检查更新与一键升级
 
-「设置 → 版本与更新」里点「检查更新」，控制台会请求 GitHub Releases 的 `releases/latest`，把最新 tag 与本地 `APP_VERSION` 比较；发现新版本后显示版本、发布时间与发行说明，点「下载并更新到 vX.YZ」即可完成升级。
+「设置 → 版本与更新」点「检查更新」，发现新版后一键下载升级；升级会校验发行包并自动备份，只替换程序文件，账号与任务数据不受影响，也可在同一卡片回滚上一版。
 
-![设置页「版本与更新」卡片：检查更新、下载并更新、回滚](docs/screenshots/09-update.png)
+![设置页「版本与更新」卡片](docs/screenshots/09-update.png)
 
-- **双重校验**：整包 `.sha256` + 包内 `release-manifest.json` 逐文件 sha256，主程序还会先做 Python 语法编译检查；
-- **只换程序文件**：白名单之外的东西一律不动 —— 设置、任务记录、账号凭证、`rclone.conf`、TLS 私钥与已下载文件都不会因更新丢失；
-- **可回滚**：替换前按时间戳备份到 `update-backups/`，卡片里一键「回滚上一版」；
-- **自动生效**：容器部署会延迟 `docker restart`，正在跑的 rclone 传输不受影响；裸机部署会提示手动重启；
-- **可换源**：把自己的 fork 写进 `UPDATE_REPO` 环境变量，就能跟随自己的发行版。
-
-维护者的打包与发版流程见 [docs/UPDATE.md](docs/UPDATE.md)：可以直接 `python3 scripts/publish_release.py` 本地一键发布，也可以把 [docs/release-workflow.yml](docs/release-workflow.yml) 复制到 `.github/workflows/release.yml` 启用「打 tag 自动构建」的 CI。
+完整流程见 [docs/UPDATE.md](docs/UPDATE.md)。
 
 ---
 
@@ -333,7 +327,7 @@ curl -s http://localhost:5566/api -H 'Content-Type: application/json' \
 
 ## 与 NAS 运行实例的差异
 
-本仓库是从一台正在运行的 NAS 实例整理出来的**发布版**，对外名为「云梭 CloudShuttle」，为了能公开上传做了 4 处脱敏，**NAS 上正在运行的文件没有被改动**（线上仍是 v3.53、旧品牌，且没有本仓库新增的在线更新功能）：
+本仓库是从一台正在运行的 NAS 实例整理出来的**发布版**，对外代号「云梭 CloudShuttle」，页面与项目介绍均保留「PikPak 下载器」字样，为了能公开上传做了 4 处脱敏，**NAS 上正在运行的文件没有被改动**（线上仍是 v3.53、旧品牌，且没有本仓库新增的在线更新功能）：
 
 1. rclone RC 的用户名 / 密码由源码字面量改为读取 `RCLONE_RC_USER` / `RCLONE_RC_PASS` 环境变量，采集脚本的兜底主机地址改为 `CONSOLE_PUBLIC_HOST`（现网实例仍用源码内的字面量）；
 2. 「NAS 主页地址」的默认示例值改为 `http://127.0.0.1:8080/`（现网 `settings.json` 已保存真实地址，不受影响）；

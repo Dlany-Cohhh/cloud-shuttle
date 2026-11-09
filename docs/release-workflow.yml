@@ -1,4 +1,4 @@
-# 云梭 CloudShuttle · 可选的自动发布工作流模板
+# PikPak 多账号下载器（云梭 CloudShuttle）· 可选的自动发布工作流模板
 # 复制本文件内容到 .github/workflows/release.yml 即可启用：
 #   - 在 GitHub 网页端 Add file → Create new file 粘贴（推荐，无需额外令牌权限）
 #   - 或本机执行 gh auth refresh -s workflow 后 git add / git push
@@ -60,5 +60,5 @@ jobs:
           else
             gh release create "$TAG" \
               dist/cloud-shuttle.zip dist/cloud-shuttle.zip.sha256 \
-              --title "云梭 CloudShuttle $TAG" --generate-notes
+              --title "PikPak 多账号下载器 $TAG" --generate-notes
           fi
