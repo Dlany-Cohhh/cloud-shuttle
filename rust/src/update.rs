@@ -1,5 +1,9 @@
-//! 版本信息：Rust 原生版是独立发行线（tag 前缀 rs-v），
-//! 不会把 Python 版 Release 误判成自己的升级包。
+//! 版本信息：Python / Docker 版与 Rust 原生版共用一个仓库、一个 Release。
+//!
+//! 统一 Release（tag `v3.xx`）里同时带 `cloud-shuttle.zip`（Python 版在线更新用）
+//! 和 `cloud-shuttle-rs-*.zip|tar.gz`（原生版安装包）。原生版按**资产名**识别
+//! 自己的安装包，不再依赖 `rs-v*` 标签，也就不会和 Python 版抢 `releases/latest`，
+//! NAS 上的在线更新永远不会读到一个没有 `cloud-shuttle.zip` 的 Release。
 //!
 //! 出站 HTTPS 交给系统自带的 curl（Windows 回退 PowerShell），
 //! 这样依赖树保持纯 Rust，交叉编译时不需要 C 工具链 / OpenSSL / cmake。
@@ -9,10 +13,17 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::process::Command;
 
+/// CI 构建时通过环境变量写入对应的统一 Release 标签；本地手工编译为空。
+fn build_release_tag() -> &'static str {
+    option_env!("CS_RELEASE_TAG").unwrap_or("")
+}
+
 pub fn state() -> Value {
     json!({
         "ok": true,
         "current": APP_VERSION,
+        "rustVersion": APP_VERSION,
+        "buildRelease": build_release_tag(),
         "runtime": "rust",
         "state": {
             "lastCheck": 0,
@@ -92,12 +103,20 @@ async fn fetch(url: &str) -> Result<String, String> {
     }
 }
 
+/// 统一 Release 里属于原生版的安装包。
+fn is_native_asset(name: &str) -> bool {
+    name.starts_with("cloud-shuttle-rs-")
+        && (name.ends_with(".zip") || name.ends_with(".tar.gz"))
+        && !name.ends_with(".sha256")
+}
+
 pub async fn check(repo: &str) -> Value {
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let mut base = json!({
-        "ok": false, "current": APP_VERSION, "latest": APP_VERSION,
-        "hasUpdate": false, "notes": "", "runtime": "rust",
-        "pythonLatest": "", "error": ""
+        "ok": false, "current": APP_VERSION, "rustVersion": APP_VERSION,
+        "buildRelease": build_release_tag(), "latest": "", "hasUpdate": false,
+        "notes": "", "runtime": "rust", "pythonLatest": "", "error": "",
+        "assets": []
     });
     let data: Value = match fetch(&url).await {
         Ok(s) => match serde_json::from_str::<Value>(&s) {
@@ -118,27 +137,37 @@ pub async fn check(repo: &str) -> Value {
         .unwrap_or("")
         .to_string();
     base["ok"] = json!(true);
+    base["latest"] = json!(tag);
     base["pythonLatest"] = json!(tag);
-    let notes: String = data
+    base["notes"] = json!(data
         .get("body")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .chars()
         .take(600)
+        .collect::<String>());
+
+    let assets: Vec<String> = data
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
+        .filter(|n| is_native_asset(n))
+        .map(str::to_string)
         .collect();
-    base["notes"] = json!(notes);
-    // 只认 rs-v* 标签；Python 版 v3.xx 只是并列参考，不触发升级。
-    if tag.starts_with("rs-v") {
-        base["latest"] = json!(tag);
-        base["hasUpdate"] = json!(tag != APP_VERSION);
-        if let Some(assets) = data.get("assets").and_then(|v| v.as_array()) {
-            base["assets"] = json!(assets
-                .iter()
-                .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
-                .collect::<Vec<_>>());
-        }
+    base["assets"] = json!(assets);
+
+    if assets.is_empty() {
+        base["notes"] = json!(
+            "这个 Release 尚未附带原生版安装包；可到 Releases 查看，或用 rust/scripts 自行编译。"
+        );
     } else {
-        base["notes"] = json!("原生版暂无独立 Release；Python 容器版可继续使用其在线更新。");
+        // 只有 CI 构建（写入了 CS_RELEASE_TAG）才能可靠判断「有更新」，
+        // 本地手工编译不猜版本，避免每次都误报升级。
+        let built = build_release_tag();
+        base["hasUpdate"] = json!(!built.is_empty() && tag != built);
     }
     base
 }

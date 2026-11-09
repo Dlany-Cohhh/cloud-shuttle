@@ -3,13 +3,14 @@
   云梭 CloudShuttle · Rust 原生版 Windows 构建脚本
   用法：
     powershell -ExecutionPolicy Bypass -File scripts\build.ps1
-    powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -StaticDir E:\A-MyProject\cloud-shuttle\static -OutDir dist\windows
+    powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -StaticDir ..\static -OutDir dist\windows
     powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -DebugBuild
 #>
 [CmdletBinding()]
 param(
     [string]$StaticDir = "",
     [string]$OutDir = "",
+    [string]$ReleaseTag = "",
     [switch]$DebugBuild,
     [switch]$NoStatic
 )
@@ -22,12 +23,16 @@ if (-not $OutDir) { $OutDir = Join-Path $Root 'dist\windows' }
 if (-not $StaticDir) {
     $candidates = @(
         (Join-Path $Root 'static'),
+        (Join-Path (Split-Path -Parent $Root) 'static'),
         (Join-Path (Split-Path -Parent $Root) 'cloud-shuttle\static')
     )
     foreach ($c in $candidates) { if (Test-Path (Join-Path $c 'index.html')) { $StaticDir = $c; break } }
 }
 
-Write-Host "==> cargo build ($(if ($DebugBuild) {'debug'} else {'release'}))"
+if (-not $ReleaseTag -and $env:CS_RELEASE_TAG) { $ReleaseTag = $env:CS_RELEASE_TAG }
+if ($ReleaseTag) { $env:CS_RELEASE_TAG = $ReleaseTag }
+else { Remove-Item Env:\CS_RELEASE_TAG -ErrorAction SilentlyContinue }
+Write-Host "==> cargo build ($(if ($DebugBuild) {'debug'} else {'release'})) / tag=$ReleaseTag"
 if ($DebugBuild) { & cargo build } else { & cargo build --release }
 if ($LASTEXITCODE -ne 0) { throw "cargo build 失败，退出码 $LASTEXITCODE" }
 

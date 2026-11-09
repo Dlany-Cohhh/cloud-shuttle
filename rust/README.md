@@ -2,20 +2,22 @@
 
 [PikPak 多账号下载器](https://github.com/Dlany-Cohhh/cloud-shuttle) 的 **Rust 版后端**：一个原生可执行文件，直接在本机跑起同一套 Web 控制台，用 `rclone` 编排多账号下载，不再依赖 Docker、Python 或常驻的 rclone RC 守护进程。
 
-> 与 Python / Docker 版是**并列的两条发行线**，不是替换关系：
+> 与 Python / Docker 版是**同一仓库里的两条发行线**，不是替换关系，也不是两个仓库：
 > - 想要 NAS 上完整的分享转存、回收站、云端解压、书签采集、在线热更新 → 继续用 Python / Docker 版。
 > - 想要 Windows / Linux 上「双击就能跑、一个进程管所有、开机自启、内存占用小」 → 用这一版。
 >
-> 两者共用**完全相同的前端**（`static/`）和兼容的 `settings.json` / `jobs.json` / `rclone.conf` 格式。
+> 两者共用**完全相同的前端**（仓库根目录 `static/`）、兼容的 `settings.json` / `jobs.json` / `rclone.conf` 格式，以及**同一个 Release**（tag `v3.xx`，按资产名区分安装包）。
 
 ---
 
 ## 〇、仓库与下载
 
-- 源码仓库：**https://github.com/Dlany-Cohhh/cloud-shuttle-rs**
-- Windows 现成可执行文件：到 [Releases](https://github.com/Dlany-Cohhh/cloud-shuttle-rs/releases) 下载 `cloud-shuttle-rs-windows-x86_64.zip`，解压后先跑 `--check`，再直接运行 exe（包内已含前端 `static/`）。
-- Linux：当前 Release 只带源码与 Windows 二进制；在 Linux 上执行 `bash scripts/build.sh` 即可编译，或启用 `docs/rust-release-workflow.yml` 的 CI 自动生成 Linux 包。
-- 升级：原生版不能在线替换自身，下载新压缩包覆盖 exe 后重启即可，`data/` 里的设置、任务与账号配置全部保留。
+本目录是主仓库 [Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle) 的 `rust/` 子目录，与 Python / Docker 版**同一个仓库、同一个 Release**。本文件里的命令默认在 `rust/` 目录下执行；从仓库根目录执行时请加 `rust/` 前缀（例如 `bash rust/scripts/build.sh`）。
+
+- 统一 Release：到 [Releases](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) 下载 `cloud-shuttle-rs-windows-x86_64.zip`（Windows）或 `cloud-shuttle-rs-linux-x86_64.tar.gz`（Linux，由 CI 构建）。同一个 Release 里还有 Python / Docker 版在线更新用的 `cloud-shuttle.zip` + `.sha256`，两者按资产名区分，不抢 `releases/latest`。
+- Windows 包解压后先跑 `cloud-shuttle-rs.exe --check`，再直接运行 exe（包内已含前端 `static/`）。
+- Linux 暂无预编译产物时，在 Linux 上执行 `bash scripts/build.sh` 自行编译；统一构建模板见 [`../docs/release-workflow.yml`](../docs/release-workflow.yml)。
+- 升级：原生版不能在线替换自身，下载新包覆盖可执行文件后重启即可，`data/` 里的设置、任务与账号配置全部保留。
 
 ---
 
@@ -99,7 +101,7 @@ Linux 默认 `auto` 会自动探测 `rclone-backend` 容器是否存在；Window
 | `CS_CONTAINER_DOWNLOAD_ROOT` | 容器内下载根路径 | `/data` |
 | `PROXY_URL` / `--proxy` | 默认代理地址，`off` 关闭 | `http://127.0.0.1:7890` |
 | `CONSOLE_PUBLIC_HOST` | 对外展示的主机名 | `localhost:5566` |
-| `UPDATE_REPO` | 检查更新用的 GitHub 仓库（只读） | `Dlany-Cohhh/cloud-shuttle-rs` |
+| `UPDATE_REPO` | 检查更新用的 GitHub 仓库（只读） | `Dlany-Cohhh/cloud-shuttle` |
 
 **自定义代理**：设置页「代理下载 → 自定义代理地址」优先级最高，其次 `.env` / 环境变量 `PROXY_URL`。支持 `http://`、`https://`、`socks5://`，填 `off` 表示彻底直连。代理只注入到 rclone 子进程的 `HTTP_PROXY` / `HTTPS_PROXY`；Windows 访问宿主机代理请填 `http://host.docker.internal:7890` 这类可达地址（本机直跑时通常是 `http://127.0.0.1:7890`）。
 
@@ -132,7 +134,7 @@ Linux 默认 `auto` 会自动探测 `rclone-backend` 容器是否存在；Window
 | 云盘浏览（列表、已下载标记）、账号列表 / 测试 / 添加 / 删除 / 改名 / 残留清理 | ✅ | 通过 `rclone listremotes` / `lsjson` / `config dump` |
 | 本地文件页：列目录、文件/文件夹**单项与批量重命名**、在线播放 | ✅ | 复用 Python 版安全规则：越界 / 重名 / 软链接 / 两阶段回滚；`/media/` 支持 Range |
 | 统计（速度曲线、24h 历史）、健康检查、容量查询、磁盘剩余空间保护 | ✅ | 速度历史存 `history.json`；磁盘剩余用 Win32 API / `df` 实测并缓存 60 秒。首页「存储空间」卡片的总容量沿用前端常量，本机显示的比例仅作参考 |
-| 检查更新（GitHub Releases） | ⚠️ 只读 | 默认查询本仓库的 `rs-v*` 标签，不会把 Python 版 `v3.xx` 误报为升级。需要系统 `curl`（Windows 自动回退 PowerShell） |
+| 检查更新（GitHub Releases） | ⚠️ 只读 | 查询主仓库统一 Release，按 `cloud-shuttle-rs-*` 资产名列出原生包；`hasUpdate` 只在 CI 构建（写入 `CS_RELEASE_TAG`）且标签变化时为真，本地手工编译不误报。需要系统 `curl`（Windows 自动回退 PowerShell） |
 | 在线一键替换程序文件 | ❌ | 原生进程不能安全覆盖自身；到 Releases 下载新 exe 覆盖后重启，数据目录不变 |
 | 分享转存、回收站、云端解压、书签采集、验证码登录、配额详情、测速、目录扫描 | ❌ | 接口明确返回 `unsupported: true` 并带中文提示，不会静默失败 |
 | HTTPS / TLS 终止 | ❌ | 默认只监听本机；需要公网访问请放在 Nginx / Caddy 反向代理后面 |
@@ -173,7 +175,7 @@ rustup target add x86_64-unknown-linux-gnu
 cargo check --target x86_64-unknown-linux-gnu
 ```
 
-`scripts/build.sh` / `scripts/build.ps1` 会把编译产物和 `static/` 一起放进 `dist/<平台>/`，可直接拷走运行。GitHub Actions 双平台构建模板见 `docs/rust-release-workflow.yml`，把它复制到 `.github/workflows/rust-release.yml` 即可启用；推送 `rs-v*` 标签会自动产出 Windows / Linux 两个压缩包并附到 Release。
+`scripts/build.sh` / `scripts/build.ps1` 会把编译产物和主仓库的 `static/` 一起放进 `dist/<平台>/`，可直接拷走运行。统一发布模板见 [`../docs/release-workflow.yml`](../docs/release-workflow.yml)：一个 workflow 同时产出 Python 发行包和 Windows / Linux 原生包，附到同一个 `v3.xx` Release。把它复制为 `.github/workflows/release.yml` 即可启用（需在 GitHub 网页端创建，或使用具备 workflow 权限的令牌推送）。
 
 仓库自带两个测试（仅 Python 标准库，Windows / Linux 通用）：
 
@@ -192,4 +194,4 @@ python scripts/e2e.py
 
 ## 七、许可
 
-MIT，见 [LICENSE](LICENSE)。前端与 Python / Docker 版后端同属 [Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)。
+MIT，见 [LICENSE](LICENSE)。与 Python / Docker 版同属 [Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle) 仓库。

@@ -3,6 +3,7 @@
 """本地一键发布 Release：构建发行包 → 校验 → 上传（或新建）GitHub Release。
 
 不依赖 GitHub Actions，也不需要 workflow 权限，只要本机 `gh auth login` 过即可。
+若 rust/dist/ 下已有 Rust 原生版安装包，会一并上传到同一个 Release。
 用法（仓库根目录）：
     python3 scripts/publish_release.py            # 用源码里的 APP_VERSION 作为 tag
     python3 scripts/publish_release.py --tag v3.55
@@ -19,6 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 ASSET = "cloud-shuttle.zip"
+RUST_DIST = ROOT / "rust" / "dist"
+RUST_ASSETS = ("cloud-shuttle-rs-windows-x86_64.zip", "cloud-shuttle-rs-linux-x86_64.tar.gz")
 
 
 def run(args, **kw):
@@ -63,12 +66,15 @@ def main():
     print("发行包校验通过：%s · %d 个文件" % (tag, len(mani["files"])))
 
     # 2. 已存在则覆盖资源，否则新建 Release
+    native = [RUST_DIST / n for n in RUST_ASSETS if (RUST_DIST / n).is_file()]
+    files = [str(z), str(sha_file)] + [str(p) for p in native]
+    print("本次上传资源：" + ", ".join(Path(f).name for f in files))
     exists = run(["gh", "release", "view", tag]).returncode == 0
     if exists:
-        cmd = ["gh", "release", "upload", tag, str(z), str(sha_file), "--clobber"]
+        cmd = ["gh", "release", "upload", tag] + files + ["--clobber"]
         action = "更新已有 Release 资源"
     else:
-        cmd = ["gh", "release", "create", tag, str(z), str(sha_file),
+        cmd = ["gh", "release", "create", tag] + files + [
                "--title", "云梭 CloudShuttle " + tag, "--generate-notes"]
         if opt.notes:
             cmd += ["--notes", opt.notes]

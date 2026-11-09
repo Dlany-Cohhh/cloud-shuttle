@@ -3,6 +3,15 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.56（补充）— 同一仓库发布 Rust 原生版（2026-11-10）
+
+> 程序文件与 v3.56 完全相同，`APP_VERSION` 未变，NAS 在线更新不会提示升级；本次只是仓库结构与 Release 资产调整。
+
+- Rust 原生版源码以 `rust/` 子目录并入本仓库（原独立仓库归档并指向这里），不再维护两套仓库 / 两套 `releases/latest`；
+- **统一 Release**：同一个 `v3.xx` 同时带 `cloud-shuttle.zip` + `.sha256` 与 `cloud-shuttle-rs-*.zip|tar.gz`；Python 后端按固定资产名取包，原生版按 `cloud-shuttle-rs-*` 资产名识别，互不干扰；
+- `scripts/publish_release.py` 自动附带 `rust/dist/` 里已有的原生包；`docs/release-workflow.yml` 改为单 workflow 同时构建 Python 包与 Windows / Linux 原生包；
+- Rust 构建脚本新增 `-ReleaseTag` / `--release-tag`，把统一 Release 标签写进可执行文件，检查更新不会误报。
+
 ## v3.56 — 本地文件单项重命名（2026-11-09）
 
 **新增：本地文件页可单独重命名文件夹 / 文件**

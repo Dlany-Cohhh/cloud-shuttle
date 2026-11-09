@@ -10,6 +10,7 @@ STATIC_DIR=""
 OUT_DIR="$ROOT/dist/linux"
 PROFILE="release"
 NO_STATIC=0
+RELEASE_TAG="${CS_RELEASE_TAG:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -17,18 +18,20 @@ while [[ $# -gt 0 ]]; do
     --out-dir)    OUT_DIR="$2"; shift 2 ;;
     --debug)      PROFILE="debug"; shift ;;
     --no-static)  NO_STATIC=1; shift ;;
-    -h|--help)    echo "用法: $0 [--static-dir PATH] [--out-dir PATH] [--debug] [--no-static]"; exit 0 ;;
+    --release-tag) RELEASE_TAG="$2"; shift 2 ;;
+    -h|--help)    echo "用法: $0 [--static-dir PATH] [--out-dir PATH] [--debug] [--no-static] [--release-tag v3.xx]"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
 done
 
 if [[ -z "$STATIC_DIR" ]]; then
-  for c in "$ROOT/static" "$(dirname "$ROOT")/cloud-shuttle/static"; do
+  for c in "$ROOT/static" "$(dirname "$ROOT")/static" "$(dirname "$ROOT")/cloud-shuttle/static"; do
     if [[ -f "$c/index.html" ]]; then STATIC_DIR="$c"; break; fi
   done
 fi
 
-echo "==> cargo build ($PROFILE)"
+if [[ -n "$RELEASE_TAG" ]]; then export CS_RELEASE_TAG="$RELEASE_TAG"; else unset CS_RELEASE_TAG; fi
+echo "==> cargo build ($PROFILE) / tag=${RELEASE_TAG:-<none>}"
 if [[ "$PROFILE" == "debug" ]]; then cargo build; else cargo build --release; fi
 
 BUILT="$ROOT/target/$PROFILE/cloud-shuttle-rs"

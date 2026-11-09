@@ -80,7 +80,11 @@ def main():
     exe = os.path.abspath(exe)
     static_dir = os.path.join(os.path.dirname(exe), "static")
     if not os.path.isdir(static_dir):
-        static_dir = os.path.join(ROOT, "static")
+        for cand in (os.path.join(ROOT, "static"),
+                     os.path.join(os.path.dirname(ROOT), "static")):
+            if os.path.isdir(cand):
+                static_dir = cand
+                break
 
     work = tempfile.mkdtemp(prefix="cs-rs-e2e-")
     fake_src = os.path.join(ROOT, "scripts", "fixtures", "fake_rclone.rs")

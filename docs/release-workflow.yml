@@ -1,9 +1,15 @@
-# PikPak 多账号下载器（云梭 CloudShuttle）· 可选的自动发布工作流模板
-# 复制本文件内容到 .github/workflows/release.yml 即可启用：
-#   - 在 GitHub 网页端 Add file → Create new file 粘贴（推荐，无需额外令牌权限）
-#   - 或本机执行 gh auth refresh -s workflow 后 git add / git push
-# 不启用也没关系：scripts/publish_release.py 能本地一键完成同样的事。
-name: Build Release Asset
+# PikPak 多账号下载器（云梭 CloudShuttle）· 统一发布工作流模板
+#
+# 一个 workflow 同时构建两条发行线，产物附到**同一个 v3.xx Release**：
+#   - cloud-shuttle.zip + .sha256            Python / Docker 版（NAS 在线更新固定找这两个名字）
+#   - cloud-shuttle-rs-windows-x86_64.zip    Rust 原生版 Windows
+#   - cloud-shuttle-rs-linux-x86_64.tar.gz   Rust 原生版 Linux
+#
+# 启用方式：在 GitHub 网页端 Add file → Create new file 建 .github/workflows/release.yml
+#          粘贴本文件；或用具备 workflow 权限的令牌直接 git push。
+# 不启用也行：scripts/publish_release.py 会本地构建 Python 包，并把 rust/dist/ 里
+#            已有的原生包一起上传到同一个 Release。
+name: Build Release Assets
 
 on:
   push:
@@ -12,53 +18,112 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要发布/重建资源的版本 tag，如 v3.54"
+        description: "要发布/重建资源的版本 tag，如 v3.56"
         required: true
 
 permissions:
   contents: write
 
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
 jobs:
-  build:
+  python-asset:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Build cloud-shuttle.zip
         run: python3 scripts/build_release.py
-
-      - name: Verify asset
+      - name: Verify package
         run: |
           python3 - <<'PY'
           import json, zipfile, hashlib
           from pathlib import Path
           z = Path("dist/cloud-shuttle.zip")
           want = Path("dist/cloud-shuttle.zip.sha256").read_text().split()[0]
-          got = hashlib.sha256(z.read_bytes()).hexdigest()
-          assert got == want, "整包 sha256 不一致"
+          assert hashlib.sha256(z.read_bytes()).hexdigest() == want, "整包 sha256 不一致"
           with zipfile.ZipFile(z) as f:
               m = json.loads(f.read("release-manifest.json"))
               assert m["version"] and m["files"], "清单不完整"
               for name, sha in m["files"].items():
                   assert hashlib.sha256(f.read(name)).hexdigest() == sha, name
-              print("发行包校验通过：", m["version"], len(m["files"]), "个文件")
+              print("Python 发行包校验通过：", m["version"], len(m["files"]), "个文件")
           PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-asset
+          path: |
+            dist/cloud-shuttle.zip
+            dist/cloud-shuttle.zip.sha256
 
-      - name: Create / update GitHub Release
+  rust-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Build and assemble Windows native
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File rust/scripts/build.ps1 -ReleaseTag $env:TAG
+          Compress-Archive -Path rust/dist/windows/* -DestinationPath cloud-shuttle-rs-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-windows
+          path: cloud-shuttle-rs-windows-x86_64.zip
+
+  rust-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+      - name: Build and assemble Linux native
+        run: |
+          bash rust/scripts/build.sh --release-tag "$TAG"
+          tar -czf cloud-shuttle-rs-linux-x86_64.tar.gz -C rust/dist/linux .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-linux
+          path: cloud-shuttle-rs-linux-x86_64.tar.gz
+
+  publish:
+    needs: [python-asset, rust-windows, rust-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble assets
+        run: |
+          mkdir -p assets
+          find artifacts -type f \( -name 'cloud-shuttle.zip' -o -name 'cloud-shuttle.zip.sha256' \
+            -o -name 'cloud-shuttle-rs-*.zip' -o -name 'cloud-shuttle-rs-*.tar.gz' \) \
+            -exec cp {} assets/ \;
+          test -f assets/cloud-shuttle.zip || { echo "缺少 Python 发行包，中止"; exit 1; }
+          ls -lh assets/
+      - name: Create / update unified Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/cloud-shuttle.zip dist/cloud-shuttle.zip.sha256 --clobber
+            gh release upload "$TAG" assets/* --clobber
           else
-            gh release create "$TAG" \
-              dist/cloud-shuttle.zip dist/cloud-shuttle.zip.sha256 \
+            gh release create "$TAG" assets/* \
               --title "PikPak 多账号下载器 $TAG" --generate-notes
           fi

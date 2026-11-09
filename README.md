@@ -2,13 +2,13 @@
 
 > **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
-![version](https://img.shields.io/badge/version-v3.56-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
+![version](https://img.shields.io/badge/version-v3.56-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![rust](https://img.shields.io/badge/rust-%E5%8E%9F%E7%94%9F%E7%89%88-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
-**当前版本 v3.56** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
+**当前版本 v3.56** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT · 同一 Release 另附 Rust 原生版 `rs-v0.1.0`
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 
-**关键词**：PikPak 下载器 · PikPak 多账号 · PikPak 批量下载 · PikPak 网盘 · NAS 下载器 · rclone pikpak · pikpak downloader · multi-account downloader · 云梭 CloudShuttle · Docker 一键部署
+**关键词**：PikPak 下载器 · PikPak 多账号 · PikPak 批量下载 · PikPak 网盘 · NAS 下载器 · rclone pikpak · pikpak downloader · multi-account downloader · 云梭 CloudShuttle · Docker 一键部署 · Rust 原生版 · Windows / Linux 单进程
 
 > [!WARNING]
 > 这是**内网自用的无鉴权工具**：Web 界面与 `/api` 都没有登录校验。请把 5566 端口限制在局域网内，不要直接暴露到公网；使用第三方网盘服务时请自行遵守其服务条款。详见 [SECURITY.md](SECURITY.md)。
@@ -27,6 +27,7 @@
 - [工作原理](#工作原理)
 - [技术栈](#技术栈)
 - [一键部署](#一键部署)
+- [Rust 原生版（Windows / Linux）](#rust-原生版windows--linux)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [目录结构](#目录结构)
@@ -115,7 +116,7 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 
 ![设置页「版本与更新」卡片](docs/screenshots/09-update.png)
 
-完整流程见 [docs/UPDATE.md](docs/UPDATE.md)。
+完整流程见 [docs/UPDATE.md](docs/UPDATE.md)。v3.56 起每个 Release 同时带 `cloud-shuttle.zip`（本功能用）与 `cloud-shuttle-rs-*` 原生包，后端只认前者，两者互不干扰。
 
 ---
 
@@ -202,6 +203,34 @@ Linux 版用 host 网络（直接占用 5566）；Windows 版自动叠加 `docke
 
 ---
 
+## Rust 原生版（Windows / Linux）
+
+同一个 **PikPak 多账号下载器**，还有一条不依赖 Docker / Python 的发行线：源码在 [`rust/`](rust/)，完整说明见 [rust/README.md](rust/README.md)。它是**单个原生可执行文件 + 同目录 `static/`**，直接复用本仓库前端与 `POST /api` 协议，下载时每个任务启动一个 `rclone copy` 子进程，不再需要常驻 rclone RC 守护进程。
+
+| | Python / Docker 版（主线） | Rust 原生版 |
+| --- | --- | --- |
+| 运行方式 | Docker Compose（host 网络 + docker.sock） | 单个进程，Windows / Linux 均可 |
+| 前端 | 仓库根目录 `static/` | **同一份**，未改动一行 |
+| 高级功能 | 分享转存、回收站、云端解压、书签采集、在线热更新 | 未实现的 action 明确返回中文提示，不静默失败 |
+| 更新方式 | 控制台「版本与更新」一键下载升级 | Releases 下载新包覆盖可执行文件，`data/` 数据保留 |
+| Release 资产 | `cloud-shuttle.zip` + `.sha256` | `cloud-shuttle-rs-windows-x86_64.zip` / `cloud-shuttle-rs-linux-x86_64.tar.gz` |
+
+**两条发行线共用一个 Release**（tag `v3.xx`）：Python 后端固定按名字找 `cloud-shuttle.zip`，原生版按资产名找 `cloud-shuttle-rs-*`，所以不会出现两条线争抢 `releases/latest`、把 NAS 的在线更新指向一个没有 Python 包的 Release。统一构建模板见 [docs/release-workflow.yml](docs/release-workflow.yml)，本地 `scripts/publish_release.py` 也会把 `rust/dist/` 里已有的原生包一起上传。
+
+在仓库根目录构建（加 `-ReleaseTag` / `--release-tag` 让原生版知道它属于哪个 Release）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File rust\scripts\build.ps1 -ReleaseTag v3.56
+```
+
+```bash
+bash rust/scripts/build.sh --release-tag v3.56     # Linux 上执行，产物 rust/dist/linux/
+```
+
+产物目录自带前端 `static/`、`.env.example`，可直接拷到目标机器运行。原生版目前不含在线热更新，也不覆盖分享转存等高级功能；要这些能力请用主线 Docker 版。
+
+---
+
 ## 快速开始
 
 **想自己控制每一步就按本节配置；推荐直接用上一节的一键部署脚本。**
@@ -278,13 +307,18 @@ docker compose -f docker-compose.example.yml up -d --build
 │   ├── screenshots/             # 本文使用的 9 张界面截图（全部为虚拟示例数据）
 │   ├── DEPLOYMENT.md            # 详细部署、账号配置与故障排查
 │   ├── UPDATE.md                # 在线检查更新、发版与回滚
-│   ├── release-workflow.yml     # 可选的 CI 模板（复制到 .github/workflows/ 启用）
+│   ├── release-workflow.yml     # 统一 CI 模板：Python 发行包 + Rust 双平台原生包
 │   └── API.md                   # 接口速查与全部 action 清单
 ├── scripts/
 │   ├── build_release.py         # 构建发行包 cloud-shuttle.zip + sha256
 │   ├── publish_release.py       # 本地一键构建并发布 Release（不依赖 CI）
 │   ├── deploy.sh  deploy.ps1  deploy.bat   # Linux / Windows Docker 一键部署
 │   └── refresh-pikpak-token.sh  # PikPak refresh_token 定时续期（建议每小时）
+├── rust/                        # Rust 原生版（Windows / Linux 单进程，与主线共用 Release）
+│   ├── src/  Cargo.toml         # axum / tokio 后端，纯 Rust 依赖
+│   ├── scripts/                 # build.ps1 / build.sh / smoke.py / e2e.py
+│   ├── packaging/               # systemd unit / Windows 计划任务
+│   └── README.md                # 原生版完整说明与能力边界
 ├── examples/
 │   └── settings.example.json    # 完整设置示例（由源码 DEFAULTS 生成）
 ├── Dockerfile                   # python:3.12-alpine + docker-cli

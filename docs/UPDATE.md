@@ -83,7 +83,9 @@ collector.ps1      login-collector.ps1
 
 5. 用户端进入「设置 → 版本与更新」点「检查更新」，即可看到 `v3.55` 并一键升级。
 
-> 本仓库首次推送时使用的 OAuth 令牌没有 `workflow` 权限，因此 CI 文件以模板形式放在 `docs/`，没有直接放进 `.github/workflows/`；文件本身是可用的，复制过去即可生效。
+> CI 文件以模板形式放在 `docs/`，没有直接放进 `.github/workflows/`；在 GitHub 网页端新建同名文件粘贴内容即可生效。
+
+> **统一 Release 约定**：一个 `v3.xx` Release 里同时放 Python 发行包和 Rust 原生版安装包。后端只按名字找 `cloud-shuttle.zip`，原生版只按名字找 `cloud-shuttle-rs-*`，因此无论附了多少个资产，`releases/latest` 始终能满足本功能的检查更新；反过来也**不要**为原生版单独发一个不含 `cloud-shuttle.zip` 的 Release，否则所有已部署实例的「检查更新」都会报「发行版缺少 cloud-shuttle.zip」。
 
 > 发行包的**固定文件名**很重要：后端总是从最新 Release 里找 `cloud-shuttle.zip`，不要改成带版本号的名字；版本号放在 tag 与包内清单里。
 
@@ -104,5 +106,6 @@ collector.ps1      login-collector.ps1
 - 后端实现：`download-console.py` → `update_check` / `update_apply` / `update_rollback` / `update_state`
 - 前端界面：`static/index.html` 设置页「版本与更新」卡片、`static/app.js` 的 `checkUpdate` / `applyUpdate` / `rollbackUpdate`
 - 打包脚本：`scripts/build_release.py`
-- 本地发布：`scripts/publish_release.py` · 可选 CI 模板：`docs/release-workflow.yml`
+- Rust 原生版：`rust/README.md`、`rust/scripts/build.ps1` / `build.sh`（`-ReleaseTag` / `--release-tag`）
+- 本地发布：`scripts/publish_release.py`（自动附带 `rust/dist/` 原生包）· 统一 CI 模板：`docs/release-workflow.yml`
 - API 说明：`docs/API.md`

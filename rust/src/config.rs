@@ -6,11 +6,11 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// 与 GitHub Release 的 tag 保持一致（`rs-v*` 系列），避免 updatecheck 误报升级。
+/// 原生版自身版本号；统一 Release 的 tag 由构建时 CS_RELEASE_TAG 注入。
 pub const APP_VERSION: &str = "rs-v0.1.0";
 pub const DEFAULT_PORT: u16 = 5566;
 pub const DEFAULT_PROXY: &str = "http://127.0.0.1:7890";
-pub const DEFAULT_UPDATE_REPO: &str = "Dlany-Cohhh/cloud-shuttle-rs";
+pub const DEFAULT_UPDATE_REPO: &str = "Dlany-Cohhh/cloud-shuttle";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
