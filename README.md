@@ -33,7 +33,6 @@
 - [安全与隐私](#安全与隐私)
 - [使用注意与常见问题](#使用注意与常见问题)
 - [第三方组件](#第三方组件)
-- [与 NAS 运行实例的差异](#与-nas-运行实例的差异)
 - [版本、变更与许可](#版本变更与许可)
 
 ---
@@ -324,19 +323,6 @@ curl -s http://localhost:5566/api -H 'Content-Type: application/json' \
 | rclone | 镜像 `rclone/rclone:latest` | MIT |
 
 这些文件原样放在 `static/` 下以便离线运行，未做修改。
-
----
-
-## 与 NAS 运行实例的差异
-
-本仓库是从一台正在运行的 NAS 实例整理出来的**发布版**，对外代号「云梭 CloudShuttle」，页面与项目介绍均保留「PikPak 下载器」字样，为了能公开上传做了 4 处脱敏，**NAS 上正在运行的文件没有被改动**（线上仍是 v3.53、旧品牌，且没有本仓库新增的在线更新功能）：
-
-1. rclone RC 的用户名 / 密码由源码字面量改为读取 `RCLONE_RC_USER` / `RCLONE_RC_PASS` 环境变量，采集脚本的兜底主机地址改为 `CONSOLE_PUBLIC_HOST`（现网实例仍用源码内的字面量）；
-2. 「NAS 主页地址」的默认示例值改为 `http://127.0.0.1:8080/`（现网 `settings.json` 已保存真实地址，不受影响）；
-3. 代码注释 / 文档字符串里的示例账号名与邮箱泛化；
-4. 未包含：真实 `docker-compose.yml`、私有运维文档、历史备份、`tls/` 私钥、`rclone.conf` 与所有运行时 JSON。
-
-**如果以后要用仓库版源码覆盖线上实例**，请先在 compose 的 `download-console.environment` 里设置 `RCLONE_RC_USER` / `RCLONE_RC_PASS`（与 `rclone-backend` 的 `--rc-user` / `--rc-pass` 一致），否则所有下载任务会认证失败。
 
 ---
 
