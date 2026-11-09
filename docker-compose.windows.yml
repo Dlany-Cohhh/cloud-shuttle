@@ -1,0 +1,21 @@
+# PikPak 多账号下载器 · Windows Docker Desktop 覆盖文件
+# 由 scripts/deploy.ps1 / deploy.bat 自动叠加使用，Linux 请勿使用本文件：
+#
+#   docker compose -f docker-compose.example.yml -f docker-compose.windows.yml --env-file .env up -d --build
+#
+# 原因：示例 compose 用 host 网络（NAS 环境需要），而 Docker Desktop 跑在 Linux VM 里，
+# host 网络与宿主机端口行为不同。这里改成 bridge + 端口映射；
+# 控制台仍通过 /var/run/docker.sock 用 docker exec 指挥 rclone-backend，
+# 所以两个 rcd（5572 直连 / 5573 代理）不需要对外暴露端口。
+services:
+  download-console:
+    network_mode: bridge
+    ports:
+      - "${WEB_PORT:-5566}:5566"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  rclone-backend:
+    network_mode: bridge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

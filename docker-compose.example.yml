@@ -1,12 +1,13 @@
 # PikPak 多账号下载器（云梭 CloudShuttle）· 最小可运行部署示例（所有敏感值都来自 .env，本文件可安全提交）
 #
-#   cp .env.example .env      # 然后修改路径与凭据
-#   # 在 RCLONE_CONFIG_DIR 放好 rclone.conf，见 docs/DEPLOYMENT.md
-#   docker compose -f docker-compose.example.yml up -d --build
+#   一键部署：Linux  bash scripts/deploy.sh   /  Windows  双击 scripts\deploy.bat
+#   手动部署：cp .env.example .env 改好路径与凭据，
+#             在 RCLONE_CONFIG_DIR 放好 rclone.conf（见 docs/DEPLOYMENT.md），
+#             docker compose -f docker-compose.example.yml up -d --build
 #
 # 网络说明：示例沿用线上部署的 host 网络（飞牛 fnOS 的 bridge 端口映射不可达），
-# 控制台直接占用 5566 端口。普通 Docker 环境可删掉 network_mode 并改用
-# ports: - "5566:5566"，但要注意控制台仍需通过 docker.sock 访问 rclone-backend。
+# 控制台直接占用 5566 端口。Windows Docker Desktop 请叠加 docker-compose.windows.yml
+# 改用 bridge + 端口映射；无论哪种模式，控制台都需通过 docker.sock 访问 rclone-backend。
 services:
   download-console:
     build: .
@@ -18,6 +19,10 @@ services:
       RCLONE_RC_USER: ${RCLONE_RC_USER:?请在 .env 中设置 RCLONE_RC_USER}
       RCLONE_RC_PASS: ${RCLONE_RC_PASS:?请在 .env 中设置 RCLONE_RC_PASS}
       CONSOLE_DATA_DIR: /app
+      # 代理地址：设置页「自定义代理地址」优先于它；off = 不走代理
+      PROXY_URL: ${PROXY_URL:-http://127.0.0.1:7890}
+      # 采集脚本回推地址；不设时按浏览器 Host 头自动判断
+      CONSOLE_PUBLIC_HOST: ${CONSOLE_PUBLIC_HOST:-localhost:5566}
       # 在线检查更新（可选，见 docs/UPDATE.md）
       UPDATE_REPO: ${UPDATE_REPO:-Dlany-Cohhh/cloud-shuttle}
       UPDATE_CONTAINER: download-console
@@ -51,8 +56,10 @@ services:
       --log-level INFO
 
   # ── 可选：代理下载 ────────────────────────────────────────────────
-  # 开启后，控制台会按需拉起 127.0.0.1:5573 的第二个 rcd 进程，
-  # 并把它的 HTTP(S)_PROXY 指向下面的 7890 端口（见 download-console.py 的 PROXY_RCD）。
+  # 控制台会按需拉起 127.0.0.1:5573 的第二个 rcd 进程，并注入 PROXY_URL
+  # 作为它的 HTTP(S)_PROXY（见 download-console.py 的 proxy_url / proxy_rcd_cmd）。
+  # PROXY_URL 可以是任意 http(s)/socks5 地址，不一定要跑下面这个 mihomo 容器；
+  # Windows Docker Desktop 里访问宿主机代理请用 http://host.docker.internal:7890。
   # mihomo:
   #   image: metacubex/mihomo:latest
   #   container_name: mihomo

@@ -2,13 +2,13 @@
 
 > **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
-![version](https://img.shields.io/badge/version-v3.54-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
+![version](https://img.shields.io/badge/version-v3.55-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
-**当前版本 v3.54** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
+**当前版本 v3.55** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 
-**关键词**：PikPak 下载器 · PikPak 多账号 · PikPak 批量下载 · PikPak 网盘 · NAS 下载器 · rclone pikpak · pikpak downloader · multi-account downloader · 云梭 CloudShuttle
+**关键词**：PikPak 下载器 · PikPak 多账号 · PikPak 批量下载 · PikPak 网盘 · NAS 下载器 · rclone pikpak · pikpak downloader · multi-account downloader · 云梭 CloudShuttle · Docker 一键部署
 
 > [!WARNING]
 > 这是**内网自用的无鉴权工具**：Web 界面与 `/api` 都没有登录校验。请把 5566 端口限制在局域网内，不要直接暴露到公网；使用第三方网盘服务时请自行遵守其服务条款。详见 [SECURITY.md](SECURITY.md)。
@@ -26,6 +26,7 @@
 - [核心能力](#核心能力)
 - [工作原理](#工作原理)
 - [技术栈](#技术栈)
+- [一键部署](#一键部署)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [目录结构](#目录结构)
@@ -128,7 +129,7 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 | 本地文件 | 浏览 / 播放 / 下载、M3U 与 CSV 导出、批量解压、**批量重命名**（含文件夹，整批预检 + 失败回滚）、一致性校验 |
 | 统计 | 实时速度、24 小时曲线、14 天下载量、账号容量、已完成传输、rclone 健康指标 |
 | 下载扩展 | OpenList 聚合网盘、aria2 BT / 磁力、yt-dlp 视频站（均为可选服务） |
-| 设置 | 传输参数、限速、日志、代理开关、NAS 主页地址等，全部持久化 |
+| 设置 | 传输参数、限速、日志、代理开关、**自定义代理地址**、NAS 主页地址等，全部持久化 |
 | 界面与维护 | 32 套主题 + 跟随昼夜、侧栏折叠、版本与更新检查、一键下载升级 / 回滚、发行包校验与自动重启 |
 
 几个实现上值得一提的点：
@@ -167,7 +168,43 @@ flowchart LR
 
 ---
 
+## 一键部署
+
+**Linux / macOS / NAS**（需先装好 Docker 与 Compose 插件）：
+
+```bash
+git clone https://github.com/Dlany-Cohhh/cloud-shuttle.git
+cd cloud-shuttle
+bash scripts/deploy.sh
+```
+
+**Windows**（Docker Desktop）：下载仓库后**双击 `scripts\deploy.bat`**，或在项目目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1
+```
+
+向导只问三件事：**下载保存目录**、**rclone 配置目录**、**代理地址**，然后自动完成：生成随机 RC 凭据 → 写 `.env` → 建空的 `rclone.conf` → 构建并启动容器 → 健康检查 → 打印访问地址。
+
+代理地址可以自由选择：
+
+| 选择 | 填什么 | 说明 |
+| --- | --- | --- |
+| 默认代理 | 直接回车 | Linux `http://127.0.0.1:7890`；Windows `http://host.docker.internal:7890` |
+| 自定义地址 | `http(s)://host:port` 或 `socks5://host:port` | 任意代理客户端 / 旁路网关，不要求一定跑 mihomo 容器 |
+| 不走代理 | `off` | 两条下载路径都直连 |
+
+非交互用法：`bash scripts/deploy.sh --yes --proxy http://192.168.1.10:7890 --downloads /mnt/nas/downloads`；`--dry-run` 只生成配置不启动；`status | logs | stop | restart` 管理已部署的容器。Windows 对应 `-Yes -Proxy ... -DryRun -Command status`。
+
+Linux 版用 host 网络（直接占用 5566）；Windows 版自动叠加 `docker-compose.windows.yml` 改成 bridge 端口映射，可用 `-Port` 改对外端口。两者都通过 `docker.sock` 让控制台指挥 rclone-backend，账号配置与下载数据全部留在宿主机目录，停掉容器不会丢数据。
+
+部署后进「账号」页导入 PikPak 账号即可用。代理地址随时能在「设置 → 代理下载」里改，优先级高于 `.env` 的 `PROXY_URL`，保存即生效；细节见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
+---
+
 ## 快速开始
+
+**想自己控制每一步就按本节配置；推荐直接用上一节的一键部署脚本。**
 
 **前置条件**：一台能跑 Docker Compose 的 NAS / 主机、一个可用的 PikPak 账号、含 `type = pikpak` remote 的 `rclone.conf`。
 
@@ -202,6 +239,8 @@ docker compose -f docker-compose.example.yml up -d --build
 | --- | --- | --- |
 | `RCLONE_RC_USER` / `RCLONE_RC_PASS` | 控制台 + rclone-backend | RC 接口凭据，两边必须一致；**仓库源码不含默认值** |
 | `CONSOLE_DATA_DIR` | 控制台 | 运行时 JSON 的存放目录，默认与脚本同目录（容器内 `/app`） |
+| `PROXY_URL` | 控制台 | 自定义代理地址（http(s)/socks5），`off` = 不走代理；设置页的值优先于它 |
+| `WEB_PORT` | compose（Windows） | bridge 模式对外端口，默认 5566；Linux host 网络下固定 5566 |
 | `CONSOLE_PUBLIC_HOST` | 控制台 | 生成 Windows 采集脚本时的兜底回推地址（默认 `localhost:5566`）；正常请求按 `Host` 头自动判断，反代场景可显式指定 |
 | `RCLONE_CONF` / `TOKEN_LOG` | 续期脚本 | `rclone.conf` 路径与日志路径 |
 | `PROJECT_ROOT` / `DOWNLOAD_ROOT` / `RCLONE_CONFIG_DIR` | compose | 挂载路径，见 `.env.example` |
@@ -244,11 +283,13 @@ docker compose -f docker-compose.example.yml up -d --build
 ├── scripts/
 │   ├── build_release.py         # 构建发行包 cloud-shuttle.zip + sha256
 │   ├── publish_release.py       # 本地一键构建并发布 Release（不依赖 CI）
+│   ├── deploy.sh  deploy.ps1  deploy.bat   # Linux / Windows Docker 一键部署
 │   └── refresh-pikpak-token.sh  # PikPak refresh_token 定时续期（建议每小时）
 ├── examples/
 │   └── settings.example.json    # 完整设置示例（由源码 DEFAULTS 生成）
 ├── Dockerfile                   # python:3.12-alpine + docker-cli
 ├── docker-compose.example.yml   # 脱敏后的最小可运行编排
+├── docker-compose.windows.yml   # Windows Docker Desktop：bridge + 端口映射覆盖
 ├── .env.example                 # 需要自己填的路径与凭据
 └── .gitignore / .gitattributes / .dockerignore / .editorconfig
 ```
@@ -292,6 +333,7 @@ curl -s http://localhost:5566/api -H 'Content-Type: application/json' \
 - **HTTPS**：在项目目录放 `tls/cert.pem` + `tls/key.pem`（自签即可）后，同一端口会同时提供 HTTPS，用于浏览器在安全上下文里播放在线视频。
 - **报错脱敏**：后端 `mask_secret()` 会把超长 token / `os.` 开头的 refresh_token 打码后再回显，避免凭证出现在页面或日志里。
 - **演示截图**：`docs/screenshots/` 里的图片由本地 mock 数据渲染，账号、邮箱、文件名、容量、速度均为构造值。
+- **一键部署产物**：脚本生成的 `.env`（含随机 RC 密码）与 `rclone.conf`（含 refresh_token）都在仓库目录里，已被 `.gitignore` 忽略，不要提交或转发。
 - **在线更新**：校验与白名单规则见 [docs/UPDATE.md](docs/UPDATE.md)；更新状态 `update-state.json` 与备份 `update-backups/` 已被 `.gitignore` 忽略。
 
 更多说明见 [SECURITY.md](SECURITY.md)。
@@ -307,6 +349,7 @@ curl -s http://localhost:5566/api -H 'Content-Type: application/json' \
 | 本地「批量改名」 | 改的是 NAS 上真实文件名，旧播放 / 下载 / 外链地址会失效；执行后弹窗保留，预览按新名字刷新 |
 | 账号显示红字 / 旧名复活 | rclone 的 `captcha_token` 回写会留下无 `type` 的空壳配置段；v3.51 起列表自动忽略，并可在「更多」里一键清理 |
 | 任务莫名变慢 | 检查设置里的并发数、限速、`downloadProxy` 以及非会员每日下行额度是否已用尽 |
+| 换了代理地址暂时没生效 | 5573 守护进程仍用旧地址，且可能有代理任务在跑 | 等任务结束或重启 `rclone-backend`；设置页会提示生效时机，也可在 `.env` 里改 `PROXY_URL` |
 | 两个 rcd 的配置不一致 | 5572 / 5573 各持一份内存配置，清理残留段时会两边一起处理 |
 
 ---

@@ -1267,7 +1267,7 @@
               <!-- 代理与测速 -->
               <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:120ms">
                 <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
-                  <i class="ti ti-shield-lock text-info"></i>mihomo 代理
+                  <i class="ti ti-shield-lock text-info"></i>代理下载 · 可自定义代理地址
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sDownloadProxy">下载任务走 mihomo 代理</label>
@@ -1279,8 +1279,14 @@
                   <input id="sProxy" type="checkbox" class="toggle toggle-primary" :checked="form.proxy" @change="toggleProxy($event.target.checked)">
                   <span class="text-xs tabular-nums text-base-content/50">当前：{{form.proxy ? '分享：代理优先（直连兜底）' : '分享：直连优先（代理兜底）'}}</span>
                 </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxyUrl">自定义代理地址</label>
+                  <input id="sProxyUrl" type="text" class="input input-sm input-bordered w-80 font-mono text-xs" v-model.trim="form.proxyUrl" placeholder="留空用部署默认值；可填 http://、socks5:// 或 off">
+                  <button class="btn-sm" :disabled="saving" @click="saveSettings()"><i class="ti ti-device-floppy"></i>保存</button>
+                  <span class="text-xs text-base-content/50">当前生效：<b class="font-mono">{{effectiveProxyUrl || '读取中…'}}</b></span>
+                </div>
                 <div class="text-xs leading-relaxed text-base-content/50">
-                  <strong class="text-base-content/70">下载开关按任务生效</strong>：切换后只影响之后提交的任务，已有任务保持不变；想给某一条任务换路径，点它的「详情」→ 切换路径重试（会停掉旧任务并重新下载）。代理由一个独立的 rclone 守护进程（127.0.0.1:5573）承担，按需自动拉起，<strong class="text-base-content/70">不用改 compose、不用重建容器，也不会中断直连任务</strong>；具体路由规则在 mihomo 面板控制。<br>
+                  <strong class="text-base-content/70">下载开关按任务生效</strong>：切换后只影响之后提交的任务，已有任务保持不变；想给某一条任务换路径，点它的「详情」→ 切换路径重试（会停掉旧任务并重新下载）。代理由一个独立的 rclone 守护进程（127.0.0.1:5573）承担，按需自动拉起，<strong class="text-base-content/70">不用改 compose、不用重建容器，也不会中断直连任务</strong>；代理地址可在上方自定义，也可部署时用 <code>PROXY_URL</code> 指定（填 <code>off</code> = 不走代理，<code>socks5://</code> 仅对下载生效），具体路由规则在代理客户端里控制。<br>
                   分享开关<strong class="text-base-content/70">只影响「分享链接」</strong>的尝试顺序，切换即自动保存。<br>
                   「云盘预览」文件行的仪表盘图标 = 直连 / 经 mihomo 代理各下载 5 秒（共约 10 秒）对比速度，<strong class="text-base-content/70">固定两条路都跑</strong>，不受以上两个开关影响；进度与结果显示在目录浏览器顶部，结果仅供参考，且会真实下载文件、消耗云盘下游流量。
                 </div>

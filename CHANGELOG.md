@@ -3,6 +3,24 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.55 — Docker 一键部署 + 自定义代理地址（2026-11-09）
+
+**新增：Linux / Windows 一键部署**
+
+- `scripts/deploy.sh`（Linux / macOS / NAS）、`scripts/deploy.ps1` + `scripts/deploy.bat`（Windows Docker Desktop 双击即可）；
+- 交互式询问下载目录、rclone 配置目录与代理地址，自动生成随机 RC 凭据、`.env`、空的 `rclone.conf`，构建启动并做健康检查，打印访问地址；
+- 支持非交互参数、`--dry-run` 只生成配置，以及 `status | logs | stop | restart` 管理已部署容器；
+- Windows 用 `docker-compose.windows.yml` 覆盖为 bridge + 端口映射（不依赖 host 网络），Linux 仍用 host 网络；`.gitignore` 补上脚本默认生成的目录，避免误提交 `rclone.conf`。
+
+**新增：代理地址可自定义**
+
+- 后端移除写死的 `MIHOMO_PROXY`，改为 `proxy_url()`：设置页 `proxyUrl` > 环境变量 `PROXY_URL` > 默认 `http://127.0.0.1:7890`；支持 http(s)/socks5，填 `off` 关闭代理；
+- 设置页「代理下载」卡片新增自定义地址输入框与「当前生效」显示，保存即生效；`savesettings` 白名单与 `_norm_settings` 校验非法地址；
+- 地址变化且 5573 空闲时自动按新地址重启代理守护进程，有任务在跑则等任务结束，避免中断下载；`socks5` 仅用于 rclone 下载，Python 侧请求自动直连兜底；
+- 代理地址同时作用于下载任务、分享链接、对比测速与 PikPak 接口请求，不再要求一定运行 mihomo 容器。
+
+**文档**：README 新增「一键部署」章节，`docs/DEPLOYMENT.md` 补一键部署与代理地址优先级，`docs/API.md` / `.env.example` / `examples/settings.example.json` 同步。
+
 ## v3.54 — 在线检查更新 + 项目命名（2026-11-09）
 
 **新增：检查更新与一键升级**（设置 → 版本与更新）

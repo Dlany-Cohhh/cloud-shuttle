@@ -9,7 +9,7 @@
 | download-console | `:5566` | 同一端口按 TLS 首字节自动区分 HTTP / HTTPS |
 | rclone-backend rcd（主） | `127.0.0.1:5572` | 直连下载，只绑回环 |
 | rclone rcd（代理） | `127.0.0.1:5573` | 控制台按需拉起，走 `HTTP(S)_PROXY` |
-| mihomo（可选） | `127.0.0.1:7890` | 代理下载用 |
+| 代理（可选） | 任意 `http(s)://` / `socks5://` 地址 | 见第 4 节；Windows 常用 `http://host.docker.internal:7890` |
 | 下载目录 | 宿主机同一个目录 | 同时挂到控制台 `/vol2/download` 与 rclone `/data` |
 
 示例 compose 使用 **host 网络**（某些 NAS 系统的 bridge 端口映射不可达）。普通 Docker 环境可以改成 `ports: - "5566:5566"`，但控制台仍然需要 `/var/run/docker.sock` 才能指挥 rclone 容器。
@@ -39,20 +39,44 @@ token = {"access_token":"<占位>","token_type":"Bearer","refresh_token":"os.<�
 
 ## 3. 配置并启动
 
+### 3.1 一键部署（推荐）
+
+```bash
+# Linux / macOS / NAS
+git clone https://github.com/Dlany-Cohhh/cloud-shuttle.git && cd cloud-shuttle
+bash scripts/deploy.sh
+```
+
+Windows Docker Desktop 双击 `scripts\deploy.bat`（或 `powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1`）。脚本会问下载目录、rclone 配置目录与**代理地址**（可填任意 `http(s)://` / `socks5://` 地址，或 `off` 关闭），自动生成随机 RC 凭据与 `.env`、创建空的 `rclone.conf`、构建启动并做健康检查。
+
+| 常用参数 | Linux | Windows |
+| --- | --- | --- |
+| 非交互 | `--yes` | `-Yes` |
+| 自定义代理 | `--proxy http://192.168.1.10:7890` | `-Proxy http://192.168.1.10:7890` |
+| 不走代理 | `--no-proxy` | `-NoProxy` |
+| 只生成配置 | `--dry-run` | `-DryRun` |
+| 查看 / 跟随日志 / 停止 / 重启 | `bash scripts/deploy.sh status\|logs\|stop\|restart` | `powershell -File scripts\deploy.ps1 -Command status\|logs\|stop\|restart` |
+
+Linux 用 `docker-compose.example.yml`（host 网络，固定 5566）；Windows 自动叠加 `docker-compose.windows.yml`（bridge + `${WEB_PORT:-5566}:5566` 映射），所以 Windows 可以换对外端口。
+
+### 3.2 手动配置
+
 ```bash
 cp .env.example .env
 # 修改：PROJECT_ROOT / DOWNLOAD_ROOT / RCLONE_CONFIG_DIR
 # 修改：RCLONE_RC_USER / RCLONE_RC_PASS（自己生成随机值）
+# 修改：PROXY_URL（自定义代理地址，或填 off 关闭）
 
 docker compose -f docker-compose.example.yml up -d --build
+# Windows 额外加： -f docker-compose.windows.yml
 docker compose -f docker-compose.example.yml logs -f download-console
-# 看到「PikPak 多账号下载器（云梭 CloudShuttle）v3.54」启动横幅即正常
+# 看到「PikPak 多账号下载器（云梭 CloudShuttle）v3.55」启动横幅即正常
 
 curl -s -X POST http://127.0.0.1:5566/api \
   -H 'Content-Type: application/json' -d '{"action":"version"}'
 ```
 
-浏览器打开 `http://<NAS 地址>:5566/`，按 **Ctrl+F5** 强制刷新一次（静态资源有浏览器缓存）。
+浏览器打开 `http://<NAS 地址>:5566/`（Windows bridge 模式用 `-Port` 指定的端口），按 **Ctrl+F5** 强制刷新一次（静态资源有浏览器缓存）。
 
 RC 凭据必须两边一致：控制台容器的 `RCLONE_RC_USER/PASS` 环境变量 = `rclone-backend` 的 `--rc-user/--rc-pass`。不一致时所有任务会静默认证失败。
 
@@ -60,10 +84,27 @@ RC 凭据必须两边一致：控制台容器的 `RCLONE_RC_USER/PASS` 环境变
 
 ## 4. 可选服务
 
-把下面片段按需加进 compose（密码用 `.env` 变量，不要写死）。启用后控制台「下载任务」页会多出对应入口，账号页也能看到 `openlist` 这类 WebDAV remote。
+### 4.1 自定义代理地址（v3.55）
+
+代理下载由独立的 rclone 守护进程（127.0.0.1:5573）承担，它启动时注入 `HTTP_PROXY` / `HTTPS_PROXY`。地址有三个来源，**优先级从高到低**：
+
+1. 页面「设置 → 代理下载 → 自定义代理地址」（写进 `settings.json` 的 `proxyUrl`，保存后立即生效，不用重启控制台）；
+2. 部署时 `.env` 的 `PROXY_URL`（由一键部署脚本写入，并作为环境变量传进 `download-console`）；
+3. 内置默认 `http://127.0.0.1:7890`。
+
+允许填 `http://`、`https://`、`socks5://`、`socks5h://` 的任意地址；填 `off` / `none` / `direct` 表示**完全不走代理**。注意 `socks5` 只对 rclone 下载生效，控制台自身访问 PikPak 接口的 Python 请求只支持 http(s) 代理，遇到 socks5 会自动走直连兜底。
+
+- 宿主机上的 Clash / mihomo / 旁路由：Linux 填 `http://127.0.0.1:7890`（host 网络），Windows Docker Desktop 填 `http://host.docker.internal:7890`（容器在 Linux VM 里，`127.0.0.1` 指的是容器自己）。
+- 独立代理机 / 网关：直接填 `http://192.168.x.x:7890` 或 `socks5://192.168.x.x:1080`。
+- 换地址后，若 5573 上还有任务在传输，控制台会等任务结束再按新地址重启守护进程；设置页会返回一条 `proxyNote` 说明生效时机。
+- 不需要在本项目里跑 mihomo 容器；下面只是可选片段。
+
+### 4.2 其它可选服务
+
+把下面片段按需加进 compose（密码用 `.env` 变量，不要写死）。启用后控制台「下载任务」页会多出对应入口，账号页也能看到 `openlist` 这类 WebDAV remote。`PROXY_URL` 可以指向任意代理，不一定要跑下面的 mihomo 容器。
 
 ```yaml
-  mihomo:                       # 代理下载
+  mihomo:                       # 可选：本机代理客户端容器（PROXY_URL 指向它）
     image: metacubex/mihomo:latest
     network_mode: host
     restart: unless-stopped
@@ -147,6 +188,7 @@ docker restart download-console
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | `didn't find section in config file ("xxx")` | 配置段只有 `captcha_token`、缺 `type`，rclone 无法实例化 | 账号页「清理 N 个无效残留」，或调用 `acctpurge`；用 `rclone listremotes` 分辨 |
+| 代理任务连不上 / 分享链接失败 | `PROXY_URL` 指向了容器里不可达的地址 | Windows 用 `host.docker.internal`，Linux host 网络用 `127.0.0.1`；也可在设置页填 `off` 先直连验证 |
 | 账号改名 / 删除后，一点测试旧名字又出现 | 两个 rcd 各持一份内存配置，PikPak 后端把 `captcha_token` 回写给旧段并落盘 | v3.51 起 `accounts` 会过滤空壳，`acctrename` / `acctdel` 会自动清两个进程；旧版本需分别 `config/delete` |
 | 所有任务一提交就失败、日志显示认证错误 | RC 凭据不一致或没设环境变量 | 核对第 3 节，两边用同一组 `RCLONE_RC_USER/PASS` |
 | 在线播放报 `MEDIA_ELEMENT_ERROR` | 非安全上下文 | 配第 6 节的自签证书，用 https 打开 |

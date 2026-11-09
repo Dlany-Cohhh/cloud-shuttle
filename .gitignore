@@ -23,6 +23,13 @@ _databak*/
 Thumbs.db
 *.fileterm-part
 
+# ── 一键部署脚本默认创建的目录（内含 rclone.conf 与下载文件）──────
+/downloads/
+/rclone-config/
+/mihomo/
+/openlist/
+/aria2/
+
 # ── 在线更新：状态、旧版本备份与本地打包产物 ──────────────────────
 update-state.json
 update-backups/

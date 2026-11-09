@@ -99,6 +99,16 @@ curl -s -X POST http://<控制台地址>/api \
 grep -n 'action ==' download-console.py
 ```
 
+### 自定义代理地址（v3.55+）
+
+| 接口 | 字段 | 说明 |
+| --- | --- | --- |
+| `settings` / `jobs` | `effectiveProxyUrl` | 当前实际生效的代理地址；未启用代理时为「直连（未启用代理）」 |
+| `savesettings` | `proxyUrl` | 自定义地址（http(s)/socks5，或 `off` 关闭），空串 = 用 `PROXY_URL` / 默认值；非法值会被丢弃 |
+| `savesettings` 返回 | `proxyNote` | 地址变化后 5573 守护进程的重启结果 / 生效时机 |
+
+优先级：设置页 `proxyUrl` > 环境变量 `PROXY_URL` > 默认 `http://127.0.0.1:7890`。
+
 ### 在线更新（v3.54+）
 
 | action | 参数 | 返回要点 |

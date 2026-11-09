@@ -52,7 +52,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.54"
+APP_VERSION = "v3.55"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -146,7 +146,9 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             "logFile": "",                  # --log-file：rcd 启动参数，仅作配置记录
             "transfersClearedAt": 0,        # 「清空已完成传输记录」的时间水位
             "shareAutoCancel": False,       # v3.42 提取次数到上限自动取消分享（总开关）
-            "nasHomeUrl": "http://127.0.0.1:8080/"}  # v3.49 「返回 NAS 主页」跳转地址，可在设置页修改
+            "nasHomeUrl": "http://127.0.0.1:8080/",  # v3.49 「返回 NAS 主页」跳转地址
+            # v3.55 自定义代理地址：空 = 用部署时 PROXY_URL / 默认 mihomo；off = 不走代理
+            "proxyUrl": ""}
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
 ORDER_BY_OPTIONS = ("", "size,descending", "size,ascending", "name,ascending",
@@ -189,8 +191,36 @@ def rc(method, _timeout=120, _strict=False, _proxy=False, **kv):
         raise RuntimeError("rc %s: %s" % (method, str(d["error"])[:200]))
     return d
 
-MIHOMO_PROXY = "http://127.0.0.1:7890"  # mihomo 与 rclone-backend 同为 host 网络
+DEFAULT_PROXY_URL = "http://127.0.0.1:7890"  # 默认 mihomo（与 rclone-backend 同为 host 网络）
+# v3.55：代理地址可在「设置 → 代理」自定义，或部署时用环境变量 PROXY_URL 指定；
+# 填 off / none / direct 表示完全不走代理（两条路都直连）。
+PROXY_URL_RE = re.compile(r"^(?:https?|socks5h?)://[^\s\"'<>]+$", re.I)
+PROXY_OFF_WORDS = ("off", "none", "direct", "disabled", "no")
 SPEEDTEST_SECONDS = 5                   # 单条路径测速窗口；容器内硬超时 = 该值 + 3s
+
+
+def proxy_url():
+    """当前生效的代理地址：设置页 > 环境变量 PROXY_URL > 默认 mihomo 地址。
+    返回空串表示「不走代理」，调用方据此决定是否注入 HTTP(S)_PROXY。
+    每次读取 settings.json（文件很小），这样在设置页改地址后无需重启控制台。"""
+    raw = str(load_settings().get("proxyUrl") or "").strip()
+    raw = raw or str(os.environ.get("PROXY_URL") or "").strip() or DEFAULT_PROXY_URL
+    if raw.lower() in PROXY_OFF_WORDS:
+        return ""
+    return raw if PROXY_URL_RE.match(raw) else DEFAULT_PROXY_URL
+
+
+def proxy_env_args():
+    """docker exec 的代理环境变量参数；禁用代理时返回空列表。"""
+    p = proxy_url()
+    return ["-e", "HTTPS_PROXY=" + p, "-e", "HTTP_PROXY=" + p] if p else []
+
+
+def proxy_http_url():
+    """Python urllib 只认 http(s) 代理；socks5 仅用于 rclone 下载，这里退回直连。"""
+    p = proxy_url()
+    return p if p.lower().startswith(("http://", "https://")) else ""
+
 
 # ── 隔离的「代理下载」守护进程 ─────────────────────────────────────
 # 主守护进程 5572 直连；5573 启动时注入 HTTP(S)_PROXY。两个进程各有
@@ -198,41 +228,93 @@ SPEEDTEST_SECONDS = 5                   # 单条路径测速窗口；容器内�
 # 不必改 compose、不必重建容器，也不会影响已运行的直连任务。
 RC_PROXY = ["docker", "exec", "rclone-backend", "rclone", "rc",
             "--rc-addr", "127.0.0.1:5573", "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS]
-PROXY_RCD = ["docker", "exec", "-d",
-             "-e", "HTTPS_PROXY=" + MIHOMO_PROXY, "-e", "HTTP_PROXY=" + MIHOMO_PROXY,
-             "rclone-backend", "rclone", "rcd", "--rc-addr", "127.0.0.1:5573",
-             "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS, "--log-level", "INFO"]
-PROXY_RC_STATE = {"ok": False, "ts": 0.0}
+PROXY_RC_STATE = {"ok": False, "ts": 0.0, "url": ""}
+
+
+def proxy_rcd_cmd():
+    """按当前配置的代理地址拼出 5573 的启动命令（docker exec -d）。"""
+    return ["docker", "exec", "-d"] + proxy_env_args() + [
+        "rclone-backend", "rclone", "rcd", "--rc-addr", "127.0.0.1:5573",
+        "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS, "--log-level", "INFO"]
+
+
+def _proxy_rc_ping():
+    try:
+        p = subprocess.run(RC_PROXY + ["core/version"], capture_output=True,
+                           text=True, timeout=6)
+        return p.returncode == 0 and "version" in (p.stdout or "")
+    except Exception:
+        return False
+
+
+def _stop_proxy_rc():
+    """只停 5573，不碰主守护进程。[r] 技巧避免 pkill 匹配到执行它的 shell 自身。"""
+    try:
+        subprocess.run(["docker", "exec", "rclone-backend", "sh", "-c",
+                        "pkill -f '[r]clone rcd --rc-addr 127.0.0.1:5573' || true"],
+                       capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+    PROXY_RC_STATE.update(ok=False, ts=0.0, url="")
 
 
 def ensure_proxy_rc(force=False):
-    """确认 5573 可用；rclone-backend 容器重启后按需自动拉起。"""
+    """确认 5573 可用；rclone-backend 容器重启或代理地址变化后按需重新拉起。"""
     now = time.time()
-    if not force and PROXY_RC_STATE["ok"] and now - PROXY_RC_STATE["ts"] < 30:
+    wanted = proxy_url()
+    if (not force and PROXY_RC_STATE["ok"] and PROXY_RC_STATE.get("url") == wanted
+            and now - PROXY_RC_STATE["ts"] < 30):
         return True
-
-    def ping():
+    if not force and PROXY_RC_STATE["ok"] and PROXY_RC_STATE.get("url") != wanted:
+        # 地址变了：有传输在跑就沿用旧进程，等任务结束再换，避免中断下载
         try:
-            p = subprocess.run(RC_PROXY + ["core/version"], capture_output=True,
-                               text=True, timeout=6)
-            return p.returncode == 0 and "version" in (p.stdout or "")
+            d = rc("core/stats", _timeout=6, _proxy=True)
+            if (d or {}).get("transferring"):
+                PROXY_RC_STATE["ts"] = now
+                return True
         except Exception:
-            return False
+            pass
+        _stop_proxy_rc()
 
-    if ping():
-        PROXY_RC_STATE.update(ok=True, ts=now)
+    if _proxy_rc_ping():
+        PROXY_RC_STATE.update(ok=True, ts=now, url=PROXY_RC_STATE.get("url") or wanted)
         return True
     try:
-        subprocess.run(PROXY_RCD, capture_output=True, text=True, timeout=10)
+        subprocess.run(proxy_rcd_cmd(), capture_output=True, text=True, timeout=10)
     except Exception:
         pass
     for _ in range(10):
         time.sleep(0.6)
-        if ping():
-            PROXY_RC_STATE.update(ok=True, ts=now)
+        if _proxy_rc_ping():
+            PROXY_RC_STATE.update(ok=True, ts=now, url=wanted)
             return True
     PROXY_RC_STATE["ok"] = False
     return False
+
+
+def refresh_proxy_rc():
+    """设置页改了代理地址后调用：空闲时按新地址重启 5573，返回 (ok, 提示文字)。"""
+    if not _proxy_rc_ping():
+        PROXY_RC_STATE.update(ok=False, ts=0.0, url="")
+        return True, "代理地址已保存，首次代理下载时按新地址自动拉起"
+    try:
+        d = rc("core/stats", _timeout=6, _proxy=True)
+        if (d or {}).get("transferring"):
+            return True, "地址已保存；有代理任务在跑，等任务结束或重启容器后生效"
+    except Exception:
+        pass
+    _stop_proxy_rc()
+    time.sleep(0.4)
+    try:
+        subprocess.run(proxy_rcd_cmd(), capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+    for _ in range(5):
+        time.sleep(0.5)
+        if _proxy_rc_ping():
+            PROXY_RC_STATE.update(ok=True, ts=time.time(), url=proxy_url())
+            return True, "代理地址已生效（5573 已按新地址重启）"
+    return False, "地址已保存，但代理守护进程未就绪，首次代理下载时会自动重试"
 
 
 def merged_stats(_timeout=8):
@@ -942,7 +1024,7 @@ def rclone_cli(args, proxy=False, timeout=120):
     """一次性 rclone CLI 进程（可带代理环境变量），与 rc 守护进程共用同一份配置"""
     cmd = ["docker", "exec"]
     if proxy:
-        cmd += ["-e", "HTTPS_PROXY=" + MIHOMO_PROXY, "-e", "HTTP_PROXY=" + MIHOMO_PROXY]
+        cmd += proxy_env_args()
     cmd += ["rclone-backend", "rclone"] + args
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
@@ -1009,6 +1091,12 @@ def _norm_settings(raw):
     if not re.match(r"^https?://[^\s<>\x22\x27]+$", v, re.I):
         v = DEFAULTS["nasHomeUrl"]
     d["nasHomeUrl"] = v
+    # v3.55：代理地址会拼进 docker exec 的 -e 参数，只放行 http(s)/socks5 绝对地址；
+    # 空串或 off 表示交给环境变量 / 直连，非法值一律清空，不写进命令行。
+    v = str(d.get("proxyUrl") or "").strip()[:200]
+    if v and not (v.lower() in PROXY_OFF_WORDS or PROXY_URL_RE.match(v)):
+        v = ""
+    d["proxyUrl"] = v
     return d
 
 
@@ -1315,9 +1403,9 @@ def _pk_http(url, body=None, headers=None, method="GET", timeout=45, proxy=True)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     handlers = []
-    if proxy:
-        handlers.append(urllib.request.ProxyHandler({"http": MIHOMO_PROXY,
-                                                     "https": MIHOMO_PROXY}))
+    p = proxy_http_url() if proxy else ""
+    if p:
+        handlers.append(urllib.request.ProxyHandler({"http": p, "https": p}))
     else:
         handlers.append(urllib.request.ProxyHandler({}))
     try:
@@ -1535,7 +1623,8 @@ def _thumb_fetch(url):
         "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"})
     for use_proxy in (True, False):
         try:
-            ph = {"http": MIHOMO_PROXY, "https": MIHOMO_PROXY} if use_proxy else {}
+            p = proxy_http_url() if use_proxy else ""
+            ph = {"http": p, "https": p} if p else {}
             with urllib.request.build_opener(urllib.request.ProxyHandler(ph)).open(req, timeout=15) as r:
                 ct = str(r.headers.get("Content-Type") or "image/jpeg")
                 data = r.read(2 * 1024 * 1024)
@@ -2336,7 +2425,7 @@ def _xfer_cmd(job, argv):
     """docker exec 进 rclone-backend 执行；代理用环境变量注入，不动全局配置。"""
     cmd = ["docker", "exec"]
     if job.get("proxy"):
-        cmd += ["-e", "HTTPS_PROXY=" + MIHOMO_PROXY, "-e", "HTTP_PROXY=" + MIHOMO_PROXY]
+        cmd += proxy_env_args()
     return cmd + ["rclone-backend", "rclone"] + list(argv)
 
 
@@ -4567,7 +4656,8 @@ def api(action, body):
             if before is None or after is None or before != after:
                 save_jobs(jobs)
         return {"jobs": jobs, "settings": load_settings(),
-                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"]}}
+                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"]},
+                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "stop":
         with LOCK:
@@ -4666,16 +4756,18 @@ def api(action, body):
 
     if action == "settings":
         return {"settings": load_settings(),
-                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"]}}
+                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"]},
+                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "savesettings":
         with LOCK:
-            s = load_settings()
+            old = load_settings()
+            s = dict(old)
             for k in ("maxConcurrent", "diskMinGB", "transfers", "checkers",
                       "multiThreadStreams", "multiThreadCutoffMB", "retries",
                       "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
                       "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
-                      "transfersClearedAt", "nasHomeUrl"):
+                      "transfersClearedAt", "nasHomeUrl", "proxyUrl"):
                 if k in body:
                     s[k] = body[k]
             s["proxy"] = bool(body.get("proxy", s["proxy"]))
@@ -4686,7 +4778,11 @@ def api(action, body):
             save_settings(s)
             STATE["firedStart"] = None
             STATE["firedPause"] = None
-        return {"ok": True, "settings": s}
+            changed = (old.get("proxyUrl") or "") != (s.get("proxyUrl") or "")
+        # 只在地址真的变了时重启 5573，且避开正在传输的任务
+        _, proxy_note = refresh_proxy_rc() if changed else (True, "")
+        return {"ok": True, "settings": s,
+                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）", "proxyNote": proxy_note}
 
     if action == "resetsettings":
         with LOCK:
@@ -4696,7 +4792,8 @@ def api(action, body):
             save_settings(s)
             STATE["firedStart"] = None
             STATE["firedPause"] = None
-        return {"ok": True, "settings": s}
+        return {"ok": True, "settings": s,
+                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "cleartransfers":
         # 「本次运行已完成传输」来自 rclone 容器日志；清空 = 把日志读取起点推到当前时刻，
@@ -5567,8 +5664,7 @@ def api(action, body):
                 except OSError:
                     pass
                 cmd = ["docker", "exec"] + (
-                    ["-e", "HTTPS_PROXY=" + MIHOMO_PROXY,
-                     "-e", "HTTP_PROXY=" + MIHOMO_PROXY] if pv else []
+                    proxy_env_args() if pv else []
                 ) + ["rclone-backend"] + cont_cmd
                 t0 = time.time()
                 p = None

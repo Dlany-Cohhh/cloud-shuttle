@@ -37,6 +37,7 @@ Vue.createApp({
       /* 数据 */
       jobs: [],
       settings: {},
+      effectiveProxyUrl: "",
       state: { diskLow: false, diskFree: null },
       stats: { speed: 0, bytes: 0, transferring: [] },
       hist: [],
@@ -183,7 +184,7 @@ Vue.createApp({
       /* 设置页 */
       defaultNasHomeUrl: DEFAULT_NAS_HOME,
       form: { maxConcurrent: 2, autoStart: "", autoPause: "", diskMinGB: 20,
-              nasHomeUrl: DEFAULT_NAS_HOME,
+              nasHomeUrl: DEFAULT_NAS_HOME, proxyUrl: "",
               transfers: 6, checkers: 8, proxy: false, downloadProxy: true,
               advancedMode: false,
               multiThreadStreams: 8, multiThreadCutoffMB: 64, orderBy: "size,descending",
@@ -807,6 +808,7 @@ Vue.createApp({
         const d = await this.api("jobs", {}, 8000);
         this.jobs = d.jobs || [];
         this.settings = d.settings || {};
+        this.effectiveProxyUrl = d.effectiveProxyUrl || "";
         this.state = d.state || this.state;
         this.apiErr = "";
       } catch (e) {
@@ -2349,6 +2351,7 @@ Vue.createApp({
         autoPause: s.autoPause || "",
         diskMinGB: s.diskMinGB ?? 20,
         nasHomeUrl: s.nasHomeUrl || DEFAULT_NAS_HOME,
+        proxyUrl: s.proxyUrl || "",
         transfers: s.transfers ?? 6,
         checkers: s.checkers ?? 8,
         proxy: !!s.proxy,
@@ -2374,6 +2377,7 @@ Vue.createApp({
         const d = await this.api("resetsettings");
         if (!d.ok) { this.toast("恢复失败", "error"); return; }
         this.settings = d.settings;
+        this.effectiveProxyUrl = d.effectiveProxyUrl || "";
         this.fillForm();
         this.toast("已恢复全部默认设置", "ok");
       } catch (e) { this.toast("恢复失败：" + e.message, "error"); }
@@ -2406,12 +2410,18 @@ Vue.createApp({
         this.toast("NAS 主页地址须以 http:// 或 https:// 开头，且不能含空格", "error");
         return;
       }
+      const pu = String(this.form.proxyUrl || "").trim();
+      if (pu && !/^(?:(?:https?|socks5h?):\/\/\S+|off|none|direct|disabled)$/i.test(pu)) {
+        this.toast("代理地址须以 http(s):// 或 socks5:// 开头，或填 off 关闭代理", "error");
+        return;
+      }
       this.saving = true;
       try {
         const d = await this.api("savesettings", { ...this.form });
         if (d.ok) {
-          this.toast("已保存 ✓（定时状态已重新武装）", "ok");
+          this.toast("已保存 ✓（定时状态已重新武装）" + (d.proxyNote ? " · " + d.proxyNote : ""), "ok");
           this.settings = d.settings;
+          this.effectiveProxyUrl = d.effectiveProxyUrl || "";
         } else this.toast("保存失败", "error");
       } catch (e) { this.toast("保存失败：" + e.message, "error"); }
       this.saving = false;
