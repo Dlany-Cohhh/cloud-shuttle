@@ -4021,11 +4021,11 @@ def _ver_tuple(v):
     return tuple(int(x) for x in nums[:4]) or (0,)
 
 
-def _update_http(url, timeout=None):
+def _update_http(url, timeout=None, accept=None):
     if not str(url).lower().startswith(("https://", "http://")):
         raise ValueError("不支持的下载地址协议")
     hdr = {"User-Agent": "CloudShuttle/" + APP_VERSION.lstrip("v"),
-           "Accept": "application/vnd.github+json"}
+           "Accept": accept or "application/vnd.github+json"}
     if UPDATE_TOKEN and str(url).startswith(UPDATE_API):
         hdr["Authorization"] = "Bearer " + UPDATE_TOKEN
     req = urllib.request.Request(url, headers=hdr)
@@ -4088,14 +4088,17 @@ def update_check(force=False):
             "repo": UPDATE_REPO, "assetName": UPDATE_ASSET,
             "assetSize": int(z.get("size") or 0),
             "assetUrl": str(z.get("browser_download_url") or ""),
+            "apiAssetUrl": str(z.get("url") or ""),
             "shaUrl": str((s or {}).get("browser_download_url") or ""),
+            "apiShaUrl": str((s or {}).get("url") or ""),
             "checkedAt": _update_stamp(),
         }
-        if not info["assetUrl"]:
+        if not info["assetUrl"] and not info["apiAssetUrl"]:
             raise ValueError("发行版资源缺少下载地址")
         UPDATE_CACHE.update(at=now, data=info)
         out = dict(info)
-        out.pop("assetUrl", None)   # 下载地址只留在服务端缓存里
+        for k in ("assetUrl", "apiAssetUrl", "shaUrl", "apiShaUrl"):
+            out.pop(k, None)        # 下载地址只留在服务端缓存里
         return out
     except Exception as e:
         return {"ok": False, "error": mask_secret(str(e))[:200], "current": APP_VERSION}
@@ -4130,15 +4133,31 @@ def update_apply():
             return {"error": "请先成功执行一次「检查更新」"}
         if not info.get("hasUpdate"):
             return {"error": "当前已是最新版 " + APP_VERSION}
+        def fetch(candidates, timeout, accept=None):
+            """API asset 端点优先（与 API 同主机，某些网络只放行 api.github.com），
+            失败再回退 Release 直链；两个都失败才报错。"""
+            err = None
+            for u in candidates:
+                if not u:
+                    continue
+                try:
+                    return _update_http(u, timeout=timeout, accept=accept)
+                except Exception as e:
+                    err = e
+            raise err or ValueError("没有可用的下载地址")
+
         try:
-            zbytes = _update_http(info["assetUrl"], timeout=max(UPDATE_TIMEOUT, 90))
+            zbytes = fetch([info.get("apiAssetUrl"), info.get("assetUrl")],
+                           max(UPDATE_TIMEOUT, 90), "application/octet-stream")
         except Exception as e:
             return {"error": "下载更新包失败：" + mask_secret(str(e))[:160]}
         if not zbytes or len(zbytes) > UPDATE_MAX_BYTES:
             return {"error": "更新包为空或超过 24MB 上限"}
-        if info.get("shaUrl"):
+        if info.get("shaUrl") or info.get("apiShaUrl"):
             try:
-                first = _update_http(info["shaUrl"]).decode("utf-8", "ignore").strip().split()
+                raw_sha = fetch([info.get("apiShaUrl"), info.get("shaUrl")],
+                                UPDATE_TIMEOUT, "application/octet-stream")
+                first = raw_sha.decode("utf-8", "ignore").strip().split()
                 want = (first[0] if first else "").lower()
                 if not re.fullmatch(r"[0-9a-f]{64}", want):
                     raise ValueError("sha256 文件格式不正确")
