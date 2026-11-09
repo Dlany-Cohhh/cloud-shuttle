@@ -93,7 +93,8 @@ collector.ps1      login-collector.ps1
 | --- | --- |
 | 检查更新提示网络错误 | NAS 访问 `api.github.com` 不通；给容器配置 `HTTPS_PROXY`，或把 `UPDATE_API` 指向可访问的镜像 |
 | 提示 SSL 证书校验失败 | 镜像缺 CA 根证书；`Dockerfile` 已装 `ca-certificates`，自建镜像请确保包含该包 |
-| 提示「发行版缺少 cloud-shuttle.zip」 | 该 Release 没有上传资源包；用 Actions 重新构建，或手动上传两个 `dist/` 文件 |
+| 提示「发行版缺少 cloud-shuttle.zip」 | 该 Release 没有上传资源包；重跑 `python3 scripts/publish_release.py`，或手动上传两个 `dist/` 文件 |
+| 检查更新正常但下载失败 | 后端会优先走 `api.github.com` 的 asset 端点，再回退 Release 直链；两个域名都不通时给容器配 `HTTPS_PROXY` |
 | 提示校验失败 | 资源包与 `.sha256` 不是同一次构建；重新跑打包脚本并一起上传 |
 | 更新完成后页面版本没变 | 自动重启未触发（裸机或 docker.sock 未挂载）；手动 `docker restart download-console` 后 Ctrl+F5 |
 | 想回到旧版本 | 卡片里「回滚上一版」；也可手工从 `update-backups/update-*/` 复制旧文件回去 |

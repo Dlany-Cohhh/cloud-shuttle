@@ -13,7 +13,7 @@
 - 只替换程序文件，设置 / 任务 / 账号 / `rclone.conf` / 下载数据均不受影响；
 - 新增 `scripts/build_release.py` / `scripts/publish_release.py`（本地一键构建并发布 Release）、可选 CI 模板 `docs/release-workflow.yml`、`docs/UPDATE.md`；
 - 前端设置页新增「版本与更新」卡片（检查结果、发行说明、下载并更新、回滚、上次更新记录），侧栏版本旁显示「有新版本」提示；
-- 版本号升至 `v3.54`，4 个更新 action 的超时单独配置。
+- 版本号升至 `v3.54`，4 个更新 action 的超时单独配置；下载优先走 GitHub API 的 asset 端点（`api.github.com`），失败再回退 Release 直链，兼顾只放行 API 域名或走代理的网络。
 
 **项目命名**：对外统一为「云梭 · CloudShuttle」，仓库 `cloud-shuttle`；页面标题 / 侧栏品牌、启动横幅、README、部署与 API 文档、示例配置同步改名。技术标识（容器名、入口文件名、服务名）保持不变。
 
