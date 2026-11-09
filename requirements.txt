@@ -1,0 +1,8 @@
+# 后端只使用 Python 3.10+ 标准库，没有 pip 依赖，无需 pip install。
+#
+# 运行时还需要：
+#   - docker CLI：控制台通过 `docker exec rclone-backend rclone rc ...` 指挥下载引擎（见 Dockerfile）
+#   - rclone-backend 容器：运行 `rclone rcd`，账号与 RC 凭据见 .env.example
+#
+# 前端依赖（Vue 3 / Tailwind / DaisyUI / Tabler Icons / ECharts）已自托管在 static/，
+# 不需要 npm install，也没有构建步骤。

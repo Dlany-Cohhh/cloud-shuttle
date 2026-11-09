@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PikPak 一键导入 · 云梭 CloudShuttle</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #f4f6fb; color: #1f2937; padding: 24px;
+    font: 14px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  .card { width: 100%; max-width: 560px; background: #fff; border: 1px solid #e5e7eb;
+    border-radius: 16px; box-shadow: 0 18px 50px rgba(30,41,59,.12); overflow: hidden; }
+  .hd { padding: 20px 24px 16px; border-bottom: 1px solid #eef0f4; }
+  .hd h1 { margin: 0; font-size: 17px; font-weight: 700; }
+  .hd p { margin: 4px 0 0; color: #6b7280; font-size: 12px; }
+  .bd { padding: 20px 24px; }
+  .state { display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 600; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #6366f1; flex: none; }
+  .dot.ok { background: #16a34a; } .dot.bad { background: #dc2626; }
+  .spin { width: 15px; height: 15px; border: 2px solid #c7d2fe; border-top-color: #4f46e5;
+    border-radius: 50%; animation: r .8s linear infinite; }
+  @keyframes r { to { transform: rotate(360deg); } }
+  .list { margin: 16px 0 0; padding: 0; list-style: none; }
+  .list li { padding: 10px 12px; border-radius: 10px; background: #f8fafc; margin-top: 8px;
+    border-left: 3px solid #cbd5e1; font-size: 13px; word-break: break-all; }
+  .list li.ok { border-left-color: #16a34a; } .list li.bad { border-left-color: #dc2626; }
+  .list b { display: block; margin-bottom: 2px; }
+  .list span { color: #6b7280; }
+  .hint { margin-top: 16px; color: #6b7280; font-size: 12px; line-height: 1.7; }
+  .ft { padding: 14px 24px 18px; border-top: 1px solid #eef0f4; display: flex; gap: 10px; }
+  button, .link { padding: 9px 16px; border-radius: 9px; font-size: 13px; cursor: pointer;
+    text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+  button { border: 1px solid #d1d5db; background: #fff; color: #374151; }
+  button.primary { border-color: #4f46e5; background: #4f46e5; color: #fff; font-weight: 600; }
+  code { background: #eef2ff; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="hd">
+    <h1>PikPak 一键导入</h1>
+    <p>由书签发起 · 凭证只在本窗口与控制台之间传递</p>
+  </div>
+  <div class="bd">
+    <div class="state" id="state"><span class="spin"></span><span>正在换发并写入账号…</span></div>
+    <ul class="list" id="list"></ul>
+    <div class="hint" id="hint"></div>
+  </div>
+  <div class="ft">
+    <button class="primary" id="close">关闭窗口</button>
+    <a class="link" id="back" href="/">返回控制台</a>
+  </div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var state = $("state"), list = $("list"), hint = $("hint");
+  function setState(kind, text) {
+    state.innerHTML = "";
+    var d = document.createElement("span");
+    d.className = "dot " + (kind || "");
+    state.appendChild(d);
+    var t = document.createElement("span"); t.textContent = text; state.appendChild(t);
+  }
+  function addRow(title, detail, ok) {
+    var li = document.createElement("li"); li.className = ok ? "ok" : "bad";
+    var b = document.createElement("b"); b.textContent = title; li.appendChild(b);
+    var s = document.createElement("span"); s.textContent = detail || ""; li.appendChild(s);
+    list.appendChild(li);
+  }
+  $("close").onclick = function () { window.close(); };
+  $("back").href = "/";
+
+  var payload = null;
+  try {
+    var h = location.hash.slice(1);
+    if (h) payload = JSON.parse(decodeURIComponent(h));
+  } catch (e) { payload = null; }
+  // fragment 不发送到服务器，但会留在地址栏/历史里 —— 读到后立刻抹掉
+  if (location.hash) { try { history.replaceState(null, "", location.pathname); } catch (e) {} }
+
+  if (!payload || !payload.items || !payload.items.length) {
+    setState("bad", "没有收到凭证");
+    hint.textContent = "请先在 https://mypikpak.com/drive/login 登录，然后在该页面点击「PikPak 一键导入」书签。不要直接打开本页。";
+    return;
+  }
+
+  hint.textContent = "正在连接控制台并换发 token、实测连接；首次可能需要 10–30 秒，请稍候。";
+  var countdown = null;
+  fetch("/api", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "acctimport", create: true, items: payload.items })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d && d.error) { setState("bad", "导入失败"); addRow("服务端返回错误", d.error, false); return; }
+    var rows = (d && d.results) || [], ok = d && d.okCount || 0;
+    setState(ok ? "ok" : "bad", ok ? ("✓ 成功写入 " + ok + " / " + rows.length + " 个账号") : "写入失败，未新增账号");
+    rows.forEach(function (r) {
+      addRow((r.ok ? "✓ " : "× ") + (r.target || r.env || "未命名") + " · " + (r.action || ""),
+        (r.msg || "") + (r.rtUpdated ? "（token 已更新）" : ""), !!r.ok);
+    });
+    hint.textContent = "账号列表会自动刷新。窗口将在 8 秒后关闭，也可以现在手动关闭。";
+    // 通知同源的控制台页面刷新账号列表（storage 事件跨标签生效）
+    try { localStorage.setItem("__pk_bm_done__", String(Date.now())); } catch (e) {}
+    var left = 8;
+    countdown = setInterval(function () {
+      left--;
+      if (left <= 0) { clearInterval(countdown); try { window.close(); } catch (e) {} }
+      else hint.textContent = "账号列表会自动刷新。窗口将在 " + left + " 秒后关闭，也可以现在手动关闭。";
+    }, 1000);
+  })["catch"](function (e) {
+    setState("bad", "无法连接控制台");
+    addRow("请求失败", e && e.message ? e.message : String(e), false);
+    hint.textContent = "请确认控制台仍在运行、书签是在同一台 NAS 地址下生成的。";
+  });
+})();
+</script>
+</body>
+</html>

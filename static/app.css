@@ -1,0 +1,421 @@
+/* ============================================================
+   PikPak 下载控制台 v3.0 · metacubexd 设计系统 —— 本地实现层
+   令牌来源：MetaCubeXD DESIGN.md / main.css（§17 附录 A 速查表）
+   ============================================================ */
+
+:root {
+  /* —— 缓动（§9.1）—— */
+  --ease-spring:      cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-spring-soft: cubic-bezier(0.5,  1.25, 0.5,  1);
+  --ease-snappy:      cubic-bezier(0.16, 1,    0.3,  1);
+  --ease-soft:        cubic-bezier(0.4,  0,    0.2,  1);
+  --ease-press:       cubic-bezier(0.4,  0,    0.6,  1);
+  /* —— 时长（§9.2）—— */
+  --dur-instant: 80ms; --dur-fast: 160ms; --dur-base: 220ms;
+  --dur-slow: 320ms;   --dur-page: 380ms;
+  /* —— 海拔（§8.1，从 base-content 经 oklab 混色派生）—— */
+  --lift-1: 0 2px 6px  color-mix(in oklab, var(--color-base-content) 8%,  transparent),
+            0 1px 2px  color-mix(in oklab, var(--color-base-content) 4%,  transparent);
+  --lift-2: 0 6px 18px color-mix(in oklab, var(--color-base-content) 12%, transparent),
+            0 2px 6px  color-mix(in oklab, var(--color-base-content) 6%,  transparent);
+  --lift-3: 0 14px 32px color-mix(in oklab, var(--color-base-content) 16%, transparent),
+            0 4px 10px  color-mix(in oklab, var(--color-base-content) 8%,  transparent);
+  --inner-highlight: inset 0 1px 0 0 color-mix(in oklab, var(--color-base-content) 6%, transparent);
+  /* —— 侧边栏 —— */
+  --sidebar-border: color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  --sidebar-hover:  color-mix(in oklab, var(--color-base-content) 5%,  transparent);
+  /* —— 字体（§6.1 全站唯一字族）—— */
+  --font-ui: 'Ubuntu', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+             'Noto Sans CJK SC', system-ui, sans-serif;
+}
+
+html { height: 100%; overflow: hidden; overscroll-behavior-y: none; }
+body { margin: 0; height: 100%; font-family: var(--font-ui); font-variant-numeric: tabular-nums; }
+#app { height: 100%; }
+[v-cloak] { display: none; }
+
+::selection { background: color-mix(in oklab, var(--color-primary) 25%, transparent); }
+
+/* 焦点环（§14）：指针用户看不到，键盘必达 */
+:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+
+/* 滚动条（§11.19）：桌面 6px、thumb = primary、≤640px 隐藏 */
+* { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-primary); border-radius: 9999px; }
+::-webkit-scrollbar-track { background: transparent; }
+@media (max-width: 640px) { ::-webkit-scrollbar { width: 0; height: 0; } }
+
+.font-ui { font-family: var(--font-ui); }
+
+/* ============================================================
+   动效（§9.3 清单）
+   ============================================================ */
+@keyframes spring-up     { from { opacity: 0; transform: translateY(14px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes fade-slide-in { from { opacity: 0; transform: translateY(8px);  } to { opacity: 1; transform: none; } }
+@keyframes nav-slide-in  { from { opacity: 0; transform: translateX(-12px); } to { opacity: 1; transform: none; } }
+@keyframes pop-in        { from { opacity: 0; transform: scale(.92) translateY(8px); } 60% { opacity: 1; } to { opacity: 1; transform: none; } }
+@keyframes toast-in      { from { opacity: 0; transform: translateY(-8px) scale(.95); } to { opacity: 1; transform: none; } }
+@keyframes shake-soft    { 0%,100% { transform: translateX(0); } 20% { transform: translateX(-2px); } 40% { transform: translateX(3px); } 60% { transform: translateX(-2px); } 80% { transform: translateX(1px); } }
+/* 实时流量读数：呼吸脉冲（mihomo 面板风格） */
+@keyframes live-pulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in oklab, var(--color-info) 60%, transparent); }
+  70%  { box-shadow: 0 0 0 7px color-mix(in oklab, var(--color-info) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in oklab, var(--color-info) 0%, transparent); }
+}
+
+/* 页面容器 spring-up + 列表 50ms 步进 stagger */
+.stagger > * { animation: spring-up var(--dur-page) var(--ease-snappy) backwards; }
+.fade-slide-in { animation: fade-slide-in var(--dur-slow) var(--ease-snappy) backwards; }
+.pop-in { animation: pop-in var(--dur-slow) var(--ease-spring) backwards; }
+
+/* 曲线卡右上角的「在传」指示灯 */
+.live-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 999px;
+  background: var(--color-info);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--color-info) 70%, transparent);
+  animation: live-pulse 1.9s var(--ease-soft) infinite;
+  transition: background-color var(--dur-base) var(--ease-soft), opacity var(--dur-base) var(--ease-soft);
+}
+/* 速度为 0 时熄灭，不要闪一个假的「正在传输」 */
+.live-dot.is-idle { background: var(--color-base-content); opacity: .3; box-shadow: none; animation: none; }
+
+/* 页面切换：纯 cross-fade（§9.3） */
+.page-enter-active, .page-leave-active { transition: opacity var(--dur-base) var(--ease-soft); }
+.page-enter-from, .page-leave-to { opacity: 0; }
+
+/* 按钮按压三态（§11.1）：hover -1px / active 0.96 / focus-visible 环 */
+.btn-press { transition: transform var(--dur-base) var(--ease-spring), filter var(--dur-fast) var(--ease-soft), opacity var(--dur-fast) var(--ease-soft); }
+.btn-press:hover  { transform: translateY(-1px); }
+.btn-press:active { transform: scale(.96); transition-duration: var(--dur-instant); transition-timing-function: var(--ease-press); }
+.btn-press:disabled { transform: none; opacity: .45; cursor: not-allowed; }
+.press-tactile { transition: transform var(--dur-instant) var(--ease-press); }
+.press-tactile:active { transform: scale(.94); }
+
+/* 可交互卡片悬停抬升（§11.3 lift-hover） */
+.lift-hover { transition: transform var(--dur-base) var(--ease-spring), box-shadow var(--dur-base) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft); }
+.lift-hover:hover { transform: translateY(-2px); box-shadow: var(--lift-2); }
+
+/* ============================================================
+   侧边栏（§10.2）
+   ============================================================ */
+.sidebar-shell {
+  background: linear-gradient(180deg, color-mix(in oklab, var(--color-base-200) 98%, transparent) 0%, var(--color-base-200) 100%);
+  backdrop-filter: blur(12px);
+  border-right: 1px solid var(--sidebar-border);
+}
+.nav-item {
+  position: relative; display: flex; width: 100%; align-items: center; gap: .75rem;
+  overflow: hidden; border-radius: .5rem; padding: .625rem .75rem;
+  font-size: .8125rem; font-weight: 500; text-align: left; cursor: pointer;
+  color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
+  animation: nav-slide-in 360ms var(--ease-spring) backwards;
+  transition: transform var(--dur-base) var(--ease-spring), color var(--dur-fast) var(--ease-soft);
+}
+.nav-item:hover  { transform: translateX(2px); color: var(--color-base-content); }
+.nav-item:active { transform: translateX(2px) scale(.98); }
+.nav-item.nav-collapsed { justify-content: center; padding-left: 0; padding-right: 0; }
+.nav-item.nav-collapsed .nav-label, .nav-item.nav-collapsed .nav-count { display: none; }
+
+.nav-glow { position: absolute; inset: 0; border-radius: inherit; opacity: 0; transform: scale(.96);
+            transition: opacity var(--dur-base) var(--ease-soft), transform var(--dur-base) var(--ease-soft), background var(--dur-base) var(--ease-soft); }
+.nav-item:hover .nav-glow { opacity: 1; transform: none; background: var(--sidebar-hover); }
+.nav-item.is-active .nav-glow {
+  opacity: 1; transform: none;
+  background: linear-gradient(90deg, color-mix(in oklab, var(--color-primary) 18%, transparent),
+                                     color-mix(in oklab, var(--color-primary) 8%,  transparent));
+}
+.nav-item.is-active:hover .nav-glow {
+  background: linear-gradient(90deg, color-mix(in oklab, var(--color-primary) 24%, transparent),
+                                     color-mix(in oklab, var(--color-primary) 12%, transparent));
+}
+.nav-indicator {
+  position: absolute; left: 0; top: 50%; translate: 0 -50%;
+  width: 3px; height: 60%; border-radius: 0 9999px 9999px 0;
+  background: var(--color-primary); opacity: 0;
+  box-shadow: 0 0 8px color-mix(in oklab, var(--color-primary) 60%, transparent),
+              0 0 2px color-mix(in oklab, var(--color-primary) 80%, transparent);
+  transition: opacity var(--dur-base) var(--ease-soft);
+}
+.nav-item.is-active { color: var(--color-primary); }
+.nav-item.is-active .nav-indicator { opacity: 1; }
+.nav-icon { font-size: 1.25rem; line-height: 1; transition: transform var(--dur-base) var(--ease-spring); }
+.nav-item:hover  .nav-icon { transform: scale(1.1) rotate(-2deg); }
+.nav-item.is-active .nav-icon { transform: scale(1.05); }
+.nav-label { white-space: nowrap; }
+
+/* ============================================================
+   组件
+   ============================================================ */
+
+/* 面板卡片（§11.3）：bg-base-200 抬一档、1px 边、静态零阴影 */
+.card-p { border-radius: .75rem; border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent); background: var(--color-base-200); }
+
+/* 统计卡（§11.4） */
+.stat-card {
+  display: flex; min-width: 0; align-items: center; gap: .75rem; overflow: hidden;
+  border-radius: .75rem; border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  background: var(--color-base-200); padding: 1rem;
+  transition: transform var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft), box-shadow var(--dur-base) var(--ease-soft);
+  animation: spring-up var(--dur-page) var(--ease-snappy) backwards;
+}
+.stat-card:hover { z-index: 10; transform: translateY(-2px); border-color: color-mix(in oklab, var(--color-base-content) 20%, transparent); }
+
+/* 分段控制器（§10.2 着色胶囊选中态） */
+.seg { display: flex; gap: .25rem; border-radius: .5rem; border: 1px solid var(--sidebar-border); background: var(--sidebar-hover); padding: .25rem; }
+.seg-btn { border: none; border-radius: .375rem; padding: .375rem .625rem; font-size: .75rem; font-weight: 500;
+           background: transparent; color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
+           cursor: pointer; transition: all var(--dur-fast) var(--ease-soft); }
+.seg-btn:hover { color: var(--color-base-content); }
+.seg-btn.on { background: color-mix(in oklab, var(--color-primary) 15%, transparent); color: var(--color-primary); }
+
+/* 表单控件（§11.11）：field 圆角 8px、bg-base-100、focus 单环 */
+.fld { height: 2.25rem; border-radius: .5rem; border: 1px solid color-mix(in oklab, var(--color-base-content) 20%, transparent);
+       background: var(--color-base-100); padding: 0 .75rem; font-size: .875rem; color: var(--color-base-content);
+       font-family: inherit; outline: none;
+       transition: border-color var(--dur-fast) var(--ease-soft), box-shadow var(--dur-fast) var(--ease-soft); }
+.fld:focus { border-color: color-mix(in oklab, var(--color-primary) 40%, transparent);
+             box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-primary) 10%, transparent); }
+.fld option { font-family: system-ui; background: var(--color-base-200); color: var(--color-base-content); }
+
+/* 小按钮（§10.2 内核操作按钮配方） */
+.btn-sm { display: inline-flex; height: 2rem; align-items: center; gap: .375rem; border-radius: .5rem;
+          border: 1px solid color-mix(in oklab, var(--color-base-content) 15%, transparent);
+          padding: 0 .75rem; font-size: .75rem; font-weight: 500;
+          color: color-mix(in oklab, var(--color-base-content) 80%, transparent);
+          background: transparent; cursor: pointer; white-space: nowrap;
+          transition: all var(--dur-fast) var(--ease-soft); }
+.btn-sm:hover { background: color-mix(in oklab, var(--color-base-content) 8%, transparent); }
+.btn-sm:active { transform: scale(.96); }
+.btn-sm.warn:hover   { border-color: color-mix(in oklab, var(--color-warning) 40%, transparent);
+                       background: color-mix(in oklab, var(--color-warning) 12%, transparent); color: var(--color-warning); }
+.btn-sm.danger:hover { border-color: color-mix(in oklab, var(--color-error) 40%, transparent);
+                       background: color-mix(in oklab, var(--color-error) 12%, transparent); color: var(--color-error); }
+.btn-sm.primary { background: var(--color-primary); border-color: transparent; color: var(--color-primary-content); font-weight: 600; }
+.btn-sm.primary:hover { background: var(--color-primary); filter: brightness(1.08); }
+.btn-sm:disabled { opacity: .45; cursor: not-allowed; }
+.btn-sm i { font-size: .875rem; line-height: 1; }
+/* v3.43：过滤开启时常亮（类比 seg-btn.on），避免用户忘了自己加过规则 */
+.btn-sm.filter-on { border-color: color-mix(in oklab, var(--color-warning) 45%, transparent);
+                    background: color-mix(in oklab, var(--color-warning) 12%, transparent);
+                    color: var(--color-warning); }
+
+/* v3.43：下拉菜单项（导出 / 查重、本地导出共用） */
+.menu-item { display: flex; width: 100%; align-items: center; gap: .5rem; border-radius: .5rem;
+             padding: .5rem .625rem; font-size: .8125rem; text-align: left; color: var(--color-base-content);
+             background: transparent; cursor: pointer; transition: background var(--dur-fast) var(--ease-soft); }
+.menu-item:hover { background: color-mix(in oklab, var(--color-base-content) 8%, transparent); }
+.menu-item:disabled { opacity: .5; cursor: progress; }
+.menu-item i { font-size: .9375rem; line-height: 1; }
+
+/* 主按钮（大，唯一信号） */
+.btn-primary { display: inline-flex; height: 2.25rem; align-items: center; gap: .5rem; border-radius: .5rem;
+               border: none; background: var(--color-primary); padding: 0 1rem;
+               font-size: .875rem; font-weight: 600; color: var(--color-primary-content); cursor: pointer; }
+.btn-primary i { font-size: 1rem; line-height: 1; }
+.btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+.btn-primary:active { transform: scale(.96); }
+
+/* 任务卡（面板卡片 + 受压顶缘内高光） */
+.job-card { border-radius: .75rem; border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+            background: var(--color-base-200); padding: 1rem; display: flex; flex-direction: column; gap: .625rem; }
+.job-card::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; opacity: .7;
+                    background: linear-gradient(180deg, color-mix(in oklab, white 14%, transparent) 0%, transparent 30%);
+                    mix-blend-mode: overlay; }
+.job-card { position: relative; }
+
+/* 徽章（§11.20 计数徽章 + 状态着色胶囊） */
+.badge-pill { display: inline-flex; align-items: center; gap: .25rem; border-radius: 9999px;
+              padding: .125rem .5rem; font-size: .6875rem; font-weight: 600; white-space: nowrap; }
+.b-running { background: color-mix(in oklab, var(--color-info) 12%, transparent);    color: var(--color-info); }
+.b-done    { background: color-mix(in oklab, var(--color-success) 12%, transparent); color: var(--color-success); }
+.b-stopped { background: color-mix(in oklab, var(--color-warning) 12%, transparent); color: var(--color-warning); }
+.b-error   { background: color-mix(in oklab, var(--color-error) 12%, transparent);   color: var(--color-error); }
+.b-queued  { background: color-mix(in oklab, var(--color-accent) 12%, transparent);  color: var(--color-accent); }
+
+/* 行内图标小钮（云端文件操作等） */
+.btn-icon { display: inline-flex; height: 2rem; width: 2rem; flex: none; align-items: center; justify-content: center;
+            border-radius: .5rem; border: 1px solid transparent; background: transparent;
+            color: color-mix(in oklab, var(--color-base-content) 50%, transparent);
+            cursor: pointer; opacity: 0; transition: all var(--dur-fast) var(--ease-soft); }
+.group:hover .btn-icon, .btn-icon:focus-visible { opacity: 1; }
+.btn-icon.always { opacity: 1; }  /* 工具条里的常驻图标钮，不依赖行 hover */
+/* 普通图标按钮 hover 用主色；红色只留给 .danger（删除），避免所有按钮看起来都像危险操作 */
+.btn-icon:hover { border-color: color-mix(in oklab, var(--color-primary) 35%, transparent);
+                  background: color-mix(in oklab, var(--color-primary) 12%, transparent); color: var(--color-primary); }
+.btn-icon.danger:hover { border-color: color-mix(in oklab, var(--color-error) 40%, transparent);
+                         background: color-mix(in oklab, var(--color-error) 12%, transparent); color: var(--color-error); }
+.btn-icon:active { transform: scale(.94); }
+@media (hover: none) { .btn-icon { opacity: 1; } }  /* 触屏常显 */
+
+/* 目录选择弹窗（§11.9 浮层配方） */
+.picker-panel { border-radius: .75rem; border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+                background: color-mix(in oklab, var(--color-base-300) 98%, transparent);
+                backdrop-filter: blur(12px);
+                box-shadow: 0 10px 40px color-mix(in oklab, var(--color-base-content) 20%, transparent); }
+.picker-head { border-bottom: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+               background: color-mix(in oklab, var(--color-base-200) 60%, transparent);
+               padding: .625rem .75rem;
+               font-size: .6875rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+               color: color-mix(in oklab, var(--color-base-content) 40%, transparent); }
+
+/* 过滤 chips（§12.3 快速过滤：激活过滤 bg-{role}/10~15 text-{role}） */
+.chip { display: inline-flex; align-items: center; gap: .375rem; border-radius: 9999px;
+        padding: .25rem .75rem; font-size: .75rem; font-weight: 600;
+        border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent);
+        color: color-mix(in oklab, var(--color-base-content) 60%, transparent);
+        background: transparent; cursor: pointer; white-space: nowrap;
+        transition: all var(--dur-fast) var(--ease-soft); }
+.chip:hover { background: color-mix(in oklab, var(--color-base-content) 8%, transparent); }
+.chip-on { border-color: transparent; }
+
+/* 空状态（§11.18） */
+.empty-state { padding: 3rem 1rem; text-align: center; color: color-mix(in oklab, var(--color-base-content) 40%, transparent); }
+.empty-state i { display: block; margin: 0 auto .5rem; font-size: 1.75rem; }
+
+/* 面包屑 */
+.crumb-link { border: none; background: none; padding: 0; font: inherit; color: inherit; cursor: pointer;
+              border-radius: .25rem; transition: color var(--dur-fast) var(--ease-soft); }
+.crumb-link:hover { color: var(--color-primary); }
+
+/* Toast（§11.17 分工：结果性消息） */
+.toast-host { position: fixed; top: 1rem; right: 1rem; z-index: 90; display: flex; flex-direction: column; gap: .5rem; pointer-events: none; }
+.toast-item { display: flex; align-items: center; gap: .5rem; max-width: 24rem;
+              border-radius: .75rem; border: 1px solid var(--sidebar-border); background: var(--color-base-200);
+              padding: .75rem 1rem; font-size: .875rem; box-shadow: var(--lift-3);
+              animation: toast-in var(--dur-slow) var(--ease-spring) backwards; }
+
+/* 主题面板色块（§11.12 预览三方块） */
+.sw { width: .875rem; height: .875rem; border-radius: .25rem; flex: none;
+      border: 1px solid color-mix(in oklab, var(--color-base-content) 10%, transparent); }
+
+/* 移动底导指示 */
+.mnav-dot { transition: transform 200ms var(--ease-spring); }
+
+/* Modal 关闭钮（§9.3：hover 旋转 90° + error 着色） */
+.modal-x { transition: transform var(--dur-base) var(--ease-spring), color var(--dur-fast) var(--ease-soft),
+           background var(--dur-fast) var(--ease-soft), border-color var(--dur-fast) var(--ease-soft); }
+.modal-x:hover { transform: rotate(90deg); color: var(--color-error);
+                 border-color: color-mix(in oklab, var(--color-error) 40%, transparent);
+                 background: color-mix(in oklab, var(--color-error) 12%, transparent); }
+.modal-x:active { transform: rotate(90deg) scale(.88); }
+
+/* ── 侧栏底部「返回 NAS 主页」按钮（v3.12）──────────────────────── */
+.home-entry {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 2.5rem;
+  align-items: center;
+  gap: .6rem;
+  padding: 0 .75rem;
+  overflow: hidden;
+  border: 1px solid color-mix(in oklab, var(--color-primary) 34%, transparent);
+  border-radius: .8rem;
+  background: color-mix(in oklab, var(--color-primary) 9%, transparent);
+  color: var(--color-primary);
+  font-size: .8125rem;
+  font-weight: 600;
+  letter-spacing: .01em;
+  text-decoration: none;
+  white-space: nowrap;
+  isolation: isolate;
+  box-shadow: 0 2px 10px color-mix(in oklab, var(--color-primary) 10%, transparent),
+              inset 0 1px 0 color-mix(in oklab, white 10%, transparent);
+  transition: transform .24s var(--ease-spring, ease), border-color .2s, box-shadow .24s, background .2s;
+}
+.home-entry::before {                 /* 主色渐变底 */
+  content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none;
+  background: linear-gradient(100deg,
+    color-mix(in oklab, var(--color-primary) 24%, transparent),
+    color-mix(in oklab, var(--color-primary) 5%, transparent) 65%, transparent);
+  opacity: .8; transition: opacity .25s;
+}
+.home-entry::after {                  /* 左侧强调条 */
+  content: ""; position: absolute; left: 0; top: 22%; bottom: 22%; z-index: 2; pointer-events: none;
+  width: 3px; border-radius: 0 3px 3px 0;
+  background: var(--color-primary);
+  box-shadow: 0 0 10px color-mix(in oklab, var(--color-primary) 60%, transparent);
+}
+.home-entry .he-shine {               /* hover 扫光 */
+  position: absolute; inset: 0; z-index: 1; pointer-events: none;
+  background: linear-gradient(105deg, transparent 34%,
+    color-mix(in oklab, white 16%, transparent) 50%, transparent 66%);
+  transform: translateX(-130%);
+  transition: transform .65s var(--ease-soft, ease);
+}
+.home-entry > i, .home-entry > .he-label { position: relative; z-index: 2; }
+.home-entry .he-icon { flex: none; font-size: 1.15rem; line-height: 1;
+  transition: transform .3s var(--ease-spring, ease); }
+.home-entry .he-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.home-entry .he-arrow { flex: none; font-size: .9rem; opacity: .55;
+  transition: transform .25s var(--ease-soft, ease), opacity .25s; }
+.home-entry:hover {
+  color: var(--color-primary); text-decoration: none;
+  transform: translateY(-2px);
+  border-color: color-mix(in oklab, var(--color-primary) 70%, transparent);
+  background: color-mix(in oklab, var(--color-primary) 14%, transparent);
+  box-shadow: 0 8px 20px color-mix(in oklab, var(--color-primary) 24%, transparent);
+}
+.home-entry:hover::before { opacity: 1; }
+.home-entry:hover .he-shine { transform: translateX(130%); }
+.home-entry:hover .he-icon { transform: scale(1.14) rotate(-7deg); }
+.home-entry:hover .he-arrow { transform: translate(2px, -2px); opacity: .95; }
+.home-entry:active { transform: translateY(0) scale(.97); }
+.home-entry:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+/* 折叠侧栏 / 移动端顶栏：只留图标 */
+.home-entry.is-icon { width: 2.5rem; height: 2.5rem; flex: none; padding: 0;
+  justify-content: center; align-self: center; }
+.home-entry.is-icon::after { top: 28%; bottom: 28%; width: 2px; }
+.home-entry.is-compact { width: 2.25rem; height: 2.25rem; }
+.home-entry.is-compact .he-icon { font-size: 1.05rem; }
+
+/* ── 本地文件页（v3.15）：目录/文件行与面包屑 ─────────────────── */
+.lf-row { display: flex; align-items: center; gap: .75rem; padding: .625rem 1rem;
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 8%, transparent);
+  transition: background-color 160ms ease; }
+.lf-row:nth-child(2) { border-top: 0; }
+.lf-row:hover { background: color-mix(in oklab, var(--color-base-content) 6%, transparent); }
+.lf-crumb { max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: .25rem .5rem; border-radius: .5rem; font-size: .8125rem; font-weight: 500;
+  opacity: .6; transition: opacity 160ms ease, background-color 160ms ease; }
+.lf-crumb:hover { opacity: 1; background: color-mix(in oklab, var(--color-base-content) 8%, transparent); }
+.lf-crumb.is-current { opacity: 1; color: var(--color-primary); }
+
+/* ── 一致性校验（v3.16）：结果表格与状态色 ───────────────────── */
+/* 弹窗体是 flex-col + overflow-y-auto：子项必须禁止收缩，
+   否则内容一多，结果表格容器会被压扁并裁掉所有数据行。 */
+.vf-body > * { flex-shrink: 0; }
+.vf-row { display: grid; grid-template-columns: 5rem minmax(0, 1fr) 5.5rem 5.5rem minmax(0, 13rem);
+  gap: .75rem; align-items: center; padding: .5rem .875rem;
+  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 8%, transparent);
+  transition: background-color 160ms ease; }
+.vf-row:first-child { border-top: 0; }
+.vf-row:not(.vf-head):hover { background: color-mix(in oklab, var(--color-base-content) 6%, transparent); }
+.vf-head { font-size: .6875rem; font-weight: 600; letter-spacing: .02em;
+  color: color-mix(in oklab, var(--color-base-content) 55%, transparent);
+  background: color-mix(in oklab, var(--color-base-content) 4%, transparent); }
+.vf-pill { display: inline-flex; justify-content: center; border-radius: .375rem;
+  padding: .125rem .4rem; font-size: .6875rem; font-weight: 600; white-space: nowrap; }
+.vf-match { background: color-mix(in oklab, var(--color-success) 16%, transparent); color: var(--color-success); }
+.vf-missing, .vf-content { background: color-mix(in oklab, var(--color-error) 16%, transparent); color: var(--color-error); }
+.vf-extra, .vf-size { background: color-mix(in oklab, var(--color-warning) 16%, transparent); color: var(--color-warning); }
+.vf-unknown { background: color-mix(in oklab, var(--color-base-content) 10%, transparent); color: var(--color-base-content); }
+.vf-text-match { color: var(--color-success); }
+.vf-text-missing, .vf-text-content { color: var(--color-error); }
+.vf-text-extra, .vf-text-size { color: var(--color-warning); }
+.vf-text-unknown { color: var(--color-base-content); }
+@media (max-width: 640px) {
+  .vf-row { grid-template-columns: 4.25rem minmax(0, 1fr) 4.5rem; gap: .5rem; }
+  .vf-local, .vf-note { display: none; }
+}
+
+/* Reduced Motion（§9.4） */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,0 +1,34 @@
+# ── 运行时数据：含账号凭据、任务与历史，绝对不要提交 ──────────────────
+jobs.json
+history.json
+settings.json
+accounts_meta.json
+share_limits.json
+rclone.conf
+*.log
+tls/
+*.pem
+*.key
+
+# ── 本机私密配置（示例文件除外）─────────────────────────────────────
+.env
+!.env.example
+
+# ── 历史备份 / 缓存：线上目录里有大量 *.bak-v* ─────────────────────
+*.bak*
+__pycache__/
+*.py[cod]
+_databak*/
+.DS_Store
+Thumbs.db
+*.fileterm-part
+
+# ── 在线更新：状态、旧版本备份与本地打包产物 ──────────────────────
+update-state.json
+update-backups/
+dist/
+
+# ── 本机私有运维笔记 ────────────────────────────────────────────────
+SUMMARY.md
+PikPak-NAS下载环境总结v2.md
+private-notes/

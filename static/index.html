@@ -1,0 +1,2597 @@
+<!doctype html>
+<html lang="zh" data-theme="sunset">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>云梭 CloudShuttle · 下载控制台</title>
+<script>
+/* 主题预上色：在 CSS 加载前落好 data-theme，避免闪白 */
+(function(){try{
+  var t=localStorage.getItem("pk.theme")||"sunset";
+  if(localStorage.getItem("pk.themeAuto")==="1")
+    t=window.matchMedia("(prefers-color-scheme: light)").matches?"nord":"sunset";
+  document.documentElement.dataset.theme=t;
+  document.documentElement.style.colorScheme = ["light","lofi","cupcake","corporate","bumblebee","cmyk","pastel","garden","lemonade","autumn","valentine","winter","wireframe","emerald"].indexOf(t)>=0?"light":"dark";
+}catch(e){}})();
+</script>
+<link rel="stylesheet" href="/static/daisyui.css">
+<link rel="stylesheet" href="/static/tabler/tabler-icons.min.css">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/tailwind.js"></script>
+</head>
+<body>
+<div id="app" v-cloak>
+
+  <!-- 主题取色探针（隐藏，getComputedStyle 用） -->
+  <div aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden;visibility:hidden">
+    <div v-for="t in themes" :key="'probe-'+t" :data-probe="t" :data-theme="t">
+      <span class="bg-base-100"></span><span class="bg-primary"></span><span class="bg-base-content"></span>
+    </div>
+  </div>
+
+  <div class="relative flex h-full flex-col overflow-hidden bg-base-100 font-ui text-base-content antialiased">
+
+    <!-- ══ 移动端顶栏（<lg）══ -->
+    <header class="relative z-30 flex h-14 shrink-0 items-center justify-between border-b border-base-content/10 bg-base-300/95 px-3 shadow-[0_4px_20px_color-mix(in_oklab,var(--color-base-content)_5%,transparent)] backdrop-blur-[12px] lg:hidden">
+      <div class="flex items-center gap-2 text-primary">
+        <i class="ti ti-download text-xl leading-none"></i>
+        <span class="text-sm font-bold tracking-tight">云梭 CloudShuttle</span>
+      </div>
+      <div class="relative flex items-center">
+        <!-- 移动端也保留返回入口（窄屏没有左侧栏） -->
+        <a :href="nasHomeUrl" target="_blank" rel="noopener noreferrer"
+           class="home-entry is-icon is-compact mr-2" title="返回 NAS 主页" aria-label="返回 NAS 主页">
+          <span class="he-shine"></span>
+          <i class="ti ti-home he-icon"></i>
+        </a>
+        <button class="press-tactile flex h-9 w-9 items-center justify-center rounded-lg border border-base-content/10 text-base-content/80 transition-colors hover:bg-base-content/8" @click="themeOpen=!themeOpen" aria-label="切换主题">
+          <i class="ti ti-palette text-lg"></i>
+        </button>
+        <!-- 移动端主题面板 -->
+        <div v-if="themeOpen" class="pop-in absolute right-0 top-11 z-50 w-72 rounded-xl border border-base-content/10 bg-base-300/98 shadow-[0_10px_40px_color-mix(in_oklab,var(--color-base-content)_20%,transparent)] backdrop-blur-[12px]">
+          <div class="flex items-center justify-between border-b border-base-content/10 bg-base-200/60 px-3 py-2.5">
+            <span class="text-[0.6875rem] font-semibold uppercase tracking-[0.05em] text-base-content/40">主题</span>
+            <label class="flex items-center gap-1.5 text-xs text-base-content/70">
+              <input type="checkbox" class="toggle toggle-xs toggle-primary" :checked="themeAuto" @change="setAuto($event.target.checked)">跟随昼夜
+            </label>
+          </div>
+          <div class="max-h-72 overflow-y-auto p-2">
+            <div v-for="t in themes" :key="t">
+              <button class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[0.8125rem] font-medium transition-colors hover:bg-base-content/10" :class="theme===t?'bg-primary/15 text-primary':'text-base-content/80'" @click="applyTheme(t)">
+                <span class="sw" :style="{background:sw(t,0)}"></span>
+                <span class="sw" :style="{background:sw(t,1)}"></span>
+                <span class="sw" :style="{background:sw(t,2)}"></span>
+                <span class="flex-1 text-left">{{t}}</span>
+                <i v-if="theme===t" class="ti ti-check text-base"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <div class="flex min-h-0 flex-1">
+
+      <!-- ══ 桌面侧边栏（lg+）══ -->
+      <aside class="sidebar-shell hidden shrink-0 flex-col transition-[width] duration-300 ease-[var(--ease-spring-soft)] lg:flex"
+             :class="collapsed ? 'w-16' : 'w-52'">
+
+        <!-- 头部：Logo + 折叠钮 -->
+        <div class="flex flex-col gap-2 border-b border-base-content/10 p-3">
+          <div class="flex min-h-7 items-center gap-2.5 px-1" v-show="!collapsed">
+            <i class="ti ti-download text-xl leading-none text-primary"></i>
+            <span class="text-[15px] font-bold tracking-tight">云梭 CloudShuttle</span>
+          </div>
+          <button class="press-tactile flex h-9 items-center justify-center rounded-lg border border-base-content/10 text-base-content/80 transition-colors hover:border-base-content/20 hover:bg-base-content/5"
+                  :class="collapsed ? 'aspect-square w-9 self-center' : 'w-full'"
+                  @click="toggleSide" :title="collapsed?'展开侧边栏':'收起侧边栏'" :aria-label="collapsed?'展开侧边栏':'收起侧边栏'">
+            <i class="ti text-lg leading-none" :class="collapsed?'ti-chevrons-right':'ti-chevrons-left'"></i>
+            <span v-if="!collapsed" class="ml-1.5 text-xs font-medium">收起</span>
+          </button>
+        </div>
+
+        <!-- 导航 -->
+        <nav class="flex flex-1 flex-col gap-1 overflow-y-auto p-2" aria-label="主导航">
+          <button v-for="(n,i) in navs" :key="n.id" class="nav-item" :class="{'is-active':page===n.id,'nav-collapsed':collapsed}"
+                  :style="{animationDelay:(i*45)+'ms'}" @click="go(n.id)" :title="collapsed?n.label:null" :aria-current="page===n.id?'page':null">
+            <span class="nav-glow"></span><span class="nav-indicator"></span>
+            <i class="ti nav-icon" :class="n.icon"></i>
+            <span class="nav-label">{{n.label}}</span>
+            <span v-if="n.id==='tasks' && runningCount" class="ml-auto rounded-full bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-primary">{{runningCount}}</span>
+          </button>
+        </nav>
+
+        <!-- 底部：主题 + 版本 -->
+        <div class="flex flex-col gap-2 border-t border-base-content/10 p-2">
+          <div class="relative" :class="collapsed?'self-center':'w-full'">
+            <button class="press-tactile flex h-9 items-center rounded-lg border border-base-content/10 text-xs font-medium text-base-content/80 transition-colors hover:border-base-content/20 hover:bg-base-content/5"
+                    :class="collapsed?'w-9 justify-center':'w-full px-2.5'" @click="themeOpen=!themeOpen">
+              <i class="ti ti-palette text-base leading-none"></i>
+              <span v-if="!collapsed" class="ml-2 flex-1 truncate text-left">主题 · {{theme}}</span>
+            </button>
+            <!-- 桌面主题面板 -->
+            <div v-if="themeOpen" class="pop-in absolute bottom-11 z-50 w-72 rounded-xl border border-base-content/10 bg-base-300/98 shadow-[0_10px_40px_color-mix(in_oklab,var(--color-base-content)_20%,transparent)] backdrop-blur-[12px]"
+                 :class="collapsed?'left-0':'left-0'">
+              <div class="flex items-center justify-between border-b border-base-content/10 bg-base-200/60 px-3 py-2.5">
+                <span class="text-[0.6875rem] font-semibold uppercase tracking-[0.05em] text-base-content/40">主题</span>
+                <label class="flex items-center gap-1.5 text-xs text-base-content/70">
+                  <input type="checkbox" class="toggle toggle-xs toggle-primary" :checked="themeAuto" @change="setAuto($event.target.checked)">跟随昼夜
+                </label>
+              </div>
+              <div class="max-h-72 overflow-y-auto p-2">
+                <div v-for="t in themes" :key="'dt-'+t">
+                  <button class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[0.8125rem] font-medium transition-colors hover:bg-base-content/10" :class="theme===t?'bg-primary/15 text-primary':'text-base-content/80'" @click="applyTheme(t)">
+                    <span class="sw" :style="{background:sw(t,0)}"></span>
+                    <span class="sw" :style="{background:sw(t,1)}"></span>
+                    <span class="sw" :style="{background:sw(t,2)}"></span>
+                    <span class="flex-1 text-left">{{t}}</span>
+                    <i v-if="theme===t" class="ti ti-check text-base"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <!-- 返回 NAS 主页：原先只是一行 11px 小字链接，折叠后还会消失；现为主色按钮，常显 -->
+          <a :href="nasHomeUrl" target="_blank" rel="noopener noreferrer"
+             class="home-entry" :class="collapsed ? 'is-icon' : ''"
+             :title="collapsed ? '返回 NAS 主页' : '在新标签页打开 NAS 主页'"
+             aria-label="返回 NAS 主页">
+            <span class="he-shine"></span>
+            <i class="ti ti-home he-icon"></i>
+            <span v-if="!collapsed" class="he-label">返回 NAS 主页</span>
+            <i v-if="!collapsed" class="ti ti-external-link he-arrow"></i>
+          </a>
+          <div v-show="!collapsed" class="flex items-center justify-center gap-1.5 px-1 text-[10px] tabular-nums text-base-content/45"
+               :title="rcloneVer ? 'rclone ' + rcloneVer : ''">
+            <span class="inline-block h-1.5 w-1.5 rounded-full bg-success/80"></span>
+            <span>{{consoleVer || 'v3.54'}}{{rcloneVer ? ' · rclone ' + rcloneVer : ''}}</span>
+            <span v-if="updInfo && updInfo.hasUpdate" class="text-warning" title="有新版本可用，请到「设置 → 版本与更新」">· 有新版本</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- ══ 内容区 ══ -->
+      <main class="flex min-h-0 min-w-0 flex-1 flex-col p-2 sm:p-4">
+        <transition :css="false" mode="out-in" @enter="pageEnter" @leave="pageLeave">
+          <section :key="page" class="flex h-full flex-col gap-4 overflow-x-hidden overflow-y-auto p-1 pb-24 sm:p-2 lg:pb-2">
+
+            <!-- 目录选择弹窗的关闭遮罩 -->
+            <div v-if="pickerTarget" class="fixed inset-0 z-40" @click="pickerTarget=''"></div>
+
+            <!-- 磁盘保护横幅 -->
+            <div v-if="state.diskLow" class="pop-in flex items-start gap-3 rounded-xl border border-error/30 bg-error/10 px-4 py-3 text-sm text-error">
+              <i class="ti ti-alert-triangle mt-0.5 text-lg leading-none"></i>
+              <div>磁盘空间保护已触发 —— 存储空间 2 剩余 <b class="tabular-nums">{{state.diskFree ?? '--'}} GB</b>，低于阈值 {{settings.diskMinGB}} GB，任务已全部暂停。清理空间后到「设置」调低阈值或点继续。</div>
+            </div>
+            <!-- 后端不可达横幅 -->
+            <div v-if="apiErr" class="flex items-start gap-3 rounded-xl border border-warning/30 bg-warning/10 px-4 py-3 text-sm text-warning">
+              <i class="ti ti-plug-connected mt-0.5 text-lg leading-none"></i>
+              <div>后端服务连接失败：{{apiErr}} —— 每 2 秒自动重试</div>
+            </div>
+
+            <!-- ════ 概览 ════ -->
+            <div v-if="page==='overview'" class="flex flex-col gap-4">
+              <!-- 六统计卡 -->
+              <div class="stagger grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+                <div v-for="(s,i) in statCards" :key="s.label" class="stat-card"
+                     :style="{animationDelay:(i*50)+'ms'}">
+                  <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-[0.625rem] text-lg" :class="s.brick">
+                    <i class="ti leading-none" :class="s.icon"></i>
+                  </div>
+                  <div class="min-w-0">
+                    <div class="break-words text-xs text-base-content/60">{{s.label}}</div>
+                    <div class="whitespace-nowrap text-base font-semibold tabular-nums">{{s.value}}</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 图表网格 -->
+              <div class="stagger grid grid-cols-1 gap-4 lg:grid-cols-3">
+                <div class="card-p flex flex-col p-2 lg:col-span-2 h-72 lg:h-80" style="animation-delay:350ms">
+                  <div class="mb-1 flex items-start justify-between gap-2 px-2 pt-1">
+                    <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                      <i class="ti ti-chart-line text-info"></i>实时速度
+                    </div>
+                    <div class="flex items-baseline gap-1.5">
+                      <span class="live-dot -translate-y-0.5" :class="{'is-idle': !(stats.speed > 0)}"></span>
+                      <span ref="speedNum" class="text-xl font-semibold leading-none tabular-nums text-info">0</span>
+                      <span class="text-[11px] font-medium text-base-content/50">{{liveUnit}}</span>
+                    </div>
+                  </div>
+                  <div class="relative min-h-0 flex-1"><div ref="chart" class="absolute inset-0"></div></div>
+                  <div class="flex items-center justify-center gap-3 pb-1 pt-1 text-xs tabular-nums text-base-content/60">
+                    <span>本次累计 {{fmt(stats.bytes)}}</span>
+                    <span class="text-base-content/20">·</span>
+                    <span>60 秒均速 {{liveAvg}}</span>
+                  </div>
+                </div>
+
+                <div class="card-p flex flex-col p-4" style="animation-delay:400ms">
+                  <div class="mb-3 flex items-center gap-2 text-sm font-medium text-base-content/80">
+                    <i class="ti ti-hard-drive text-secondary"></i>存储空间 2
+                  </div>
+                  <div class="flex h-2 overflow-hidden rounded-full bg-base-300">
+                    <div class="h-full rounded-full transition-[width] duration-500 ease-[var(--ease-soft)]" :class="state.diskLow?'bg-error':'bg-success'" :style="{width:diskPct+'%'}"></div>
+                  </div>
+                  <div class="mt-2 text-center text-xs tabular-nums text-base-content/60">
+                    剩余 {{state.diskFree ?? '--'}} GB / 共 {{DISK_TOTAL}} GB · 已用 {{diskPct}}%
+                  </div>
+                </div>
+
+                <div class="card-p flex flex-col p-4" style="animation-delay:450ms">
+                  <div class="mb-3 flex items-center gap-2 text-sm font-medium text-base-content/80">
+                    <i class="ti ti-clock-bolt text-warning"></i>定时启停
+                  </div>
+                  <div v-if="settings.autoStart && settings.autoPause" class="text-center text-sm tabular-nums">
+                    <span class="text-base-content/80">{{settings.autoStart}}</span>
+                    <i class="ti ti-arrow-right mx-1.5 text-base-content/40"></i>
+                    <span class="text-base-content/80">{{settings.autoPause}}</span>
+                    <div class="mt-1 text-xs text-base-content/50">每天各触发一次 · 改设置即时生效</div>
+                  </div>
+                  <div v-else class="py-3 text-center text-xs text-base-content/40">未启用 —— 到「设置」里配置每天自动开始 / 暂停的时间</div>
+                </div>
+
+                <div class="card-p flex flex-col p-4 lg:col-span-2" style="animation-delay:500ms">
+                  <div class="mb-1 flex items-center gap-2 text-sm font-medium text-base-content/80">
+                    <i class="ti ti-transfer text-accent"></i>当前传输中的文件
+                    <span v-if="stats.transferring.length" class="rounded-full bg-accent/10 px-2 py-0.5 text-xs font-semibold tabular-nums text-accent">{{stats.transferring.length}}</span>
+                    <button class="btn-icon always ml-auto" :title="hideNames ? '显示文件名' : '隐藏文件名（云盘与统计页同时生效）'" @click="toggleHideNames">
+                      <i class="ti" :class="hideNames ? 'ti-eye-off' : 'ti-eye'"></i>
+                    </button>
+                  </div>
+                  <div v-if="stats.transferring.length" class="min-h-0 flex-1 overflow-y-auto">
+                    <div v-for="(t,i) in stats.transferring" :key="i" class="flex items-center gap-3 border-t border-base-content/8 py-2 text-xs first:border-t-0">
+                      <span class="min-w-0 flex-1 truncate" :title="hideNames ? '' : t.name">{{hideNames ? '••••••••' : t.name}}</span>
+                      <span class="shrink-0 tabular-nums text-base-content/60">{{fmt(t.bytes)}} / {{fmt(t.total)}}</span>
+                      <span class="w-20 shrink-0 text-right font-semibold tabular-nums text-info">{{fmtSpeed(t.speed)}}</span>
+                    </div>
+                  </div>
+                  <div v-else class="empty-state flex-1 py-8"><i class="ti ti-moon"></i>没有正在传输的文件</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- ════ 云盘预览（v3.14 解耦：只浏览云端 / 挑文件，不显示任务列表）════ -->
+            <div v-else-if="page==='browse'" class="flex flex-col gap-4">
+              <div class="fade-slide-in flex flex-wrap items-center gap-3">
+                <h1 class="text-2xl font-bold tracking-tight">云盘预览</h1>
+                <span class="text-xs text-base-content/50">浏览云端目录并挑文件下载 · 任务进度请到「下载任务」查看</span>
+                <div class="ml-auto flex flex-wrap items-center gap-2">
+                  <div class="seg">
+                    <button class="seg-btn" :class="{on:mode==='move'}" @click="setMode('move')">move · 下完删云端</button>
+                    <button class="seg-btn" :class="{on:mode==='copy'}" @click="setMode('copy')">copy · 保留云端</button>
+                  </div>
+                  <!-- v3.37 账号列表：可搜索下拉，一次看清邮箱 / 凭证状态 / 今日配额 -->
+                  <div class="relative" data-acct-drop>
+                    <button class="flex h-9 w-56 items-center gap-2 rounded-lg border border-base-content/20 bg-base-100 px-2.5 text-left transition-colors hover:border-primary/40"
+                            :title="'当前账号：' + (curRemote || '未选择') + (curAcctItem.email ? '（' + curAcctItem.email + '）' : '')"
+                            @click="toggleAcctMenu" aria-label="选择账号">
+                      <i class="ti ti-cloud shrink-0 text-base leading-none text-info"></i>
+                      <span class="min-w-0 flex-1">
+                        <span class="block truncate text-xs font-semibold leading-tight">{{curRemote || '选择账号'}}</span>
+                        <span class="block truncate text-[10px] leading-tight text-base-content/50">{{curAcctItem.email || '未登记邮箱'}}</span>
+                      </span>
+                      <span class="badge-pill bg-base-content/8 text-base-content/50 tabular-nums">{{remotes.length}}</span>
+                      <i class="ti ti-chevron-down shrink-0 text-xs text-base-content/40"></i>
+                    </button>
+                    <div v-if="acctMenuOpen" class="picker-panel pop-in absolute right-0 top-11 z-50 w-80">
+                      <div class="picker-head flex items-center justify-between">
+                        <span>账号列表 · 共 {{remotes.length}} 个</span>
+                        <button class="btn-icon always" title="到账号页管理" @click="acctMenuOpen=false; go('accounts')"><i class="ti ti-settings"></i></button>
+                      </div>
+                      <div class="p-2">
+                        <input v-if="remotes.length>5" class="fld w-full px-2.5" v-model.trim="acctQuery" placeholder="搜索账号名 / 邮箱" aria-label="搜索账号">
+                        <div class="mt-1 flex max-h-80 flex-col gap-1 overflow-y-auto">
+                          <button v-for="a in acctItemsFiltered" :key="a.name"
+                                  class="w-full rounded-lg border px-2.5 py-2 text-left transition-colors"
+                                  :class="a.name===curRemote ? 'border-primary/40 bg-primary/10' : 'border-transparent hover:bg-base-content/8'"
+                                  @click="pickAcct(a.name)">
+                            <div class="flex items-center gap-2">
+                              <i class="ti ti-cloud shrink-0 text-base leading-none text-base-content/35"></i>
+                              <span class="min-w-0 flex-1 truncate text-sm font-semibold" :title="a.name">{{a.name}}</span>
+                              <span v-if="a.type" class="badge-pill bg-base-content/8 text-base-content/55">{{a.type}}</span>
+                              <i v-if="a.name===curRemote" class="ti ti-check shrink-0 text-primary"></i>
+                            </div>
+                            <div class="mt-0.5 flex items-center gap-2 pl-6">
+                              <span class="min-w-0 flex-1 truncate text-xs text-base-content/50" :title="a.email">{{a.email || '未登记邮箱'}}</span>
+                              <span v-if="a.cred" class="badge-pill shrink-0" :class="credClass(a.cred)">{{credLabel(a.cred)}}</span>
+                            </div>
+                            <div v-if="a.daily" class="mt-1.5 flex items-center gap-2 pl-6">
+                              <div class="h-1 flex-1 overflow-hidden rounded-full bg-base-300">
+                                <div class="h-full rounded-full" :class="quotaBar(a.daily)" :style="{width:quotaPct(a.daily)+'%'}"></div>
+                              </div>
+                              <span class="shrink-0 text-[10px] tabular-nums text-base-content/50">今日 {{fmtQ(a.daily.used)}} / {{fmtQ(a.daily.total)}}</span>
+                            </div>
+                            <div v-else-if="a.vip===true" class="mt-1 pl-6 text-[10px] text-base-content/40">会员 · 无每日限额</div>
+                            <div v-else-if="a.quotaErr" class="mt-1 truncate pl-6 text-[10px] text-warning" :title="a.quotaErr">配额读取失败</div>
+                          </button>
+                          <div v-if="!acctItemsFiltered.length" class="py-6 text-center text-xs text-base-content/40">没有匹配的账号</div>
+                        </div>
+                      </div>
+                      <div class="border-t border-base-content/10 px-3 py-2 text-xs text-base-content/40">点账号即切到该网盘根目录 · 配额每 5 分钟缓存一次</div>
+                    </div>
+                  </div>
+                  <button class="btn-sm" @click="reloadDirs"><i class="ti ti-refresh"></i>刷新列表</button>
+                  <button class="btn-sm" :disabled="dirsLoading || (!curPath && !dirs.length)"
+                          :title="picked.length ? '把主列表勾选的 ' + picked.length + ' 项批量原生转存到另一个账号' : (curPath ? '把当前文件夹原生转存到另一个账号；先在列表勾选可批量' : '从当前目录挑文件夹或文件，原生转存到另一个账号')"
+                          @click="openXfer(curPath, false, true)"><i class="ti ti-switch-horizontal"></i>跨账号转移<span v-if="picked.length" class="ml-1 tabular-nums">（{{picked.length}}）</span></button>
+                  <button class="btn-sm" @click="openShareSave"
+                          title="粘贴 PikPak 分享链接，先预览内容再转存到任意账号目录（服务端搬运，不消耗下载配额）"><i class="ti ti-link"></i>分享转存</button>
+                  <button class="btn-sm" @click="openMyShares" title="管理所有账号的分享链接：查看提取次数、设上限、自动取消"><i class="ti ti-list-details"></i>我的分享</button>
+                  <!-- v3.44：批量改名（模板 / 正则 / 序号）+ 回收站（仅 PikPak） -->
+                  <button class="btn-sm" :disabled="!dirFiles.length" @click="openRename"
+                          title="批量重命名当前目录的文件：模板 / 正则替换 / 序号，先预览再执行"><i class="ti ti-abc"></i>批量改名</button>
+                  <button class="btn-sm" :disabled="!trashSupported()" @click="openTrash"
+                          :title="trashSupported() ? '当前账号的 PikPak 回收站：恢复 / 彻底删除 / 清空' : '只有 PikPak 账号有回收站'"><i class="ti ti-trash-x"></i>回收站</button>
+                  <!-- v3.43：导出清单 / 目录树 / 查重（当前目录纯前端即时导出，含子目录走服务端递归） -->
+                  <div class="relative">
+                    <button class="btn-sm" :class="expOpen ? 'primary' : ''" @click="expOpen=!expOpen"
+                            title="导出当前目录清单（CSV / 目录树），或做重名重份查重"><i class="ti ti-file-export"></i>导出 / 查重</button>
+                    <div v-if="expOpen" class="fixed inset-0 z-20" @click="expOpen=false"></div>
+                    <div v-if="expOpen" class="pop-in absolute right-0 top-full z-30 mt-1 w-80 rounded-xl border border-base-content/10 bg-base-100 p-1 shadow-lg">
+                      <div class="px-2.5 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-base-content/40">当前目录 · {{dirs.length}} 项（即时）</div>
+                      <button class="menu-item" @click="expOpen=false; exportCloudCsv(false)">
+                        <i class="ti ti-file-spreadsheet text-success"></i><span class="flex-1 text-left">导出 CSV 清单</span>
+                      </button>
+                      <button class="menu-item" @click="expOpen=false; exportCloudTree(false)">
+                        <i class="ti ti-binary-tree text-info"></i><span class="flex-1 text-left">导出目录树</span>
+                      </button>
+                      <div class="my-1 border-t border-base-content/10"></div>
+                      <div class="px-2.5 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-base-content/40">含子目录 · 服务端递归（≤6 层 / 6000 文件）</div>
+                      <button class="menu-item" :disabled="!!scanBusy" @click="expOpen=false; exportCloudCsv(true)">
+                        <i class="ti ti-file-spreadsheet text-success"></i><span class="flex-1 text-left">导出完整 CSV</span>
+                        <i v-if="scanBusy==='csv'" class="ti ti-loader-2 animate-spin text-base-content/50"></i>
+                      </button>
+                      <button class="menu-item" :disabled="!!scanBusy" @click="expOpen=false; exportCloudTree(true)">
+                        <i class="ti ti-binary-tree text-info"></i><span class="flex-1 text-left">导出完整目录树</span>
+                        <i v-if="scanBusy==='tree'" class="ti ti-loader-2 animate-spin text-base-content/50"></i>
+                      </button>
+                      <button class="menu-item" @click="expOpen=false; openDup()">
+                        <i class="ti ti-copy-check text-warning"></i><span class="flex-1 text-left">查重（同名 / 同大小）</span>
+                      </button>
+                      <div class="border-t border-base-content/10 px-2.5 py-2 text-[11px] leading-relaxed text-base-content/45">
+                        只读扫描，不下载也不删文件；查重结果可导出 CSV，按路径回列表里逐项处理。
+                      </div>
+                    </div>
+                  </div>
+                  <button class="btn-sm primary" @click="go('tasks')"><i class="ti ti-list"></i>查看下载任务<span v-if="runningCount" class="ml-1 tabular-nums">{{runningCount}}</span></button>
+                </div>
+              </div>
+
+              <!-- 传输配额条（v3.36）：当前账号四档配额，小图标 + 文字常驻顶部 -->
+              <div class="card-p flex flex-wrap items-center gap-x-4 gap-y-1.5 px-3 py-2 text-xs fade-slide-in" style="animation-delay:40ms">
+                <div class="flex items-center gap-1.5 font-medium text-base-content/70">
+                  <i class="ti ti-chart-donut text-info"></i>{{curRemote}} 传输配额
+                  <i v-if="quotaLoading" class="ti ti-loader-2 animate-spin text-base-content/40"></i>
+                </div>
+                <template v-if="curQuota && !curQuota.error">
+                  <span class="flex items-center gap-1 tabular-nums" title="云下载流量：把离线任务下载到网盘">
+                    <i class="ti ti-cloud-download text-base-content/45"></i>云下载 <b>{{fmtQ(curQuota.offline.used)}}</b><span class="text-base-content/40">/ {{fmtQ(curQuota.offline.total)}}</span>
+                  </span>
+                  <span class="flex items-center gap-1 tabular-nums" title="下行流量：包括在线播放、查看和下载">
+                    <i class="ti ti-download text-base-content/45"></i>下行 <b>{{fmtQ(curQuota.download.used)}}</b><span class="text-base-content/40">/ {{fmtQ(curQuota.download.total)}}</span>
+                  </span>
+                  <span class="flex items-center gap-1 tabular-nums" title="上传流量">
+                    <i class="ti ti-upload text-base-content/45"></i>上传 <b>{{fmtQ(curQuota.upload.used)}}</b><span class="text-base-content/40">/ {{fmtQ(curQuota.upload.total)}}</span>
+                  </span>
+                  <span class="flex items-center gap-1 tabular-nums" :class="quotaPct(curQuota.daily) >= 90 ? 'text-error' : ''" title="非会员每日下行限额（每天重置）">
+                    <i class="ti ti-clock text-base-content/45"></i>每日 <b>{{fmtQ(curQuota.daily.used)}}</b><span class="text-base-content/40">/ {{fmtQ(curQuota.daily.total)}}</span>
+                  </span>
+                  <span class="badge-pill" :class="curQuota.vip ? 'bg-success/15 text-success' : 'bg-base-content/8 text-base-content/60'">{{curQuota.vip ? '会员' : '非会员'}}</span>
+                  <span v-if="quotaPct(curQuota.daily) >= 100" class="badge-pill bg-error/15 text-error" title="非会员每日下行额度已用尽，下载会被降速">今日额度已用尽</span>
+                </template>
+                <span v-else-if="curQuota && curQuota.unsupported" class="flex items-center gap-1 text-base-content/45">
+                  <i class="ti ti-info-circle"></i>{{curQuota.error}}
+                </span>
+                <span v-else-if="curQuota && curQuota.error" class="flex items-center gap-1 text-warning">
+                  <i class="ti ti-alert-triangle"></i>配额读取失败：{{curQuota.error}}
+                </span>
+                <span v-else class="text-base-content/40">读取中…</span>
+                <div class="ml-auto flex items-center gap-1">
+                  <button class="btn-icon always" title="重新读取配额（忽略缓存）" @click="loadQuota(true)"><i class="ti ti-refresh"></i></button>
+                  <button class="btn-sm" @click="openQuota"><i class="ti ti-list-details"></i>配额详情</button>
+                </div>
+              </div>
+
+              <!-- 目录浏览器 -->
+              <div class="card-p p-4 fade-slide-in" style="animation-delay:60ms">
+                <!-- 面包屑 + 模式切换 -->
+                <div class="mb-2 flex flex-wrap items-center gap-2">
+                  <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1 text-xs text-base-content/50">
+                    <button class="crumb-link" @click="loadDirs('')">{{curRemote}}:</button>
+                    <template v-for="(seg,i) in pathSegs" :key="i">
+                      <span class="text-base-content/30">/</span>
+                      <button class="crumb-link" @click="loadDirs(pathSegs.slice(0,i+1).join('/'))">{{seg}}</button>
+                    </template>
+                  </div>
+                  <div class="seg" title="文件显示方式（本机浏览器记住选择）">
+                    <button class="seg-btn flex items-center gap-1" :class="{on:viewMode==='list'}" @click="setView('list')"><i class="ti ti-list"></i>列表</button>
+                    <button class="seg-btn flex items-center gap-1" :class="{on:viewMode==='grid'}" @click="setView('grid')"><i class="ti ti-layout-grid"></i>缩略图</button>
+                  </div>
+                  <div class="seg">
+                    <button class="seg-btn" :class="{on:!cleanupMode}" @click="cleanupMode=false">浏览</button>
+                    <button class="seg-btn" :class="{on:cleanupMode}" @click="cleanupMode=true;cleanupPicked=[]">清理</button>
+                  </div>
+                  <button class="btn-icon always" :title="hideNames ? '显示文件名' : '隐藏文件名（云盘与统计页同时生效）'" @click="toggleHideNames">
+                    <i class="ti" :class="hideNames ? 'ti-eye-off' : 'ti-eye'"></i>
+                  </button>
+                </div>
+
+                <!-- 测速进度 / 结果：常驻显示，不再只靠 3.2 秒就消失的 toast -->
+                <div v-if="speedTesting || speedResult"
+                     class="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-base-content/10 bg-base-content/5 px-3 py-2 text-xs">
+                  <template v-if="speedTesting">
+                    <i class="ti ti-loader-2 animate-spin text-info"></i>
+                    <span class="font-medium">正在测速 · {{speedStage}}</span>
+                    <span class="text-base-content/50">每路 {{speedSeconds}} 秒，共约 {{speedSeconds*2}} 秒 · 会真实消耗云盘流量</span>
+                  </template>
+                  <template v-else-if="speedResult">
+                    <i class="ti" :class="speedResult.error ? 'ti-alert-triangle text-error' : 'ti-gauge text-success'"></i>
+                    <template v-if="speedResult.error">
+                      <span class="w-full leading-relaxed text-error">{{speedResult.error}}</span>
+                      <span class="max-w-[28rem] truncate text-base-content/50" :title="speedResult.name">文件：{{speedResult.name}}</span>
+                    </template>
+                    <template v-else>
+                      <span class="max-w-[16rem] truncate font-medium" :title="speedResult.name">{{speedResult.name}}</span>
+                      <span class="tabular-nums">直连 <b>{{speedResult.direct}}</b> MiB/s</span>
+                      <span class="tabular-nums">代理 <b>{{speedResult.proxy}}</b> MiB/s</span>
+                      <span class="badge-pill bg-base-content/8 text-base-content/70">{{speedResult.better}}</span>
+                      <span class="text-base-content/50">每路 {{speedResult.seconds}} 秒</span>
+                    </template>
+                    <button class="btn-icon always ml-auto" title="关闭测速结果" @click="speedResult=null"><i class="ti ti-x"></i></button>
+                  </template>
+                </div>
+
+                <!-- 加载骨架 -->
+                <div v-if="dirsLoading" class="flex flex-col gap-1">
+                  <div v-for="i in 5" :key="i" class="h-9 animate-pulse rounded-lg bg-base-content/5"></div>
+                </div>
+
+                <!-- 目录行：列表视图（v3.40 之前唯一形态，保持零改动） -->
+                <div v-else-if="viewMode==='list'" class="flex flex-col gap-0.5">
+                  <button v-if="curPath" class="flex items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-base-content/70 transition-colors hover:bg-base-content/8 hover:text-base-content"
+                          @click="loadDirs(pathSegs.length > 1 ? pathSegs.slice(0,-1).join('/') : '')">
+                    <i class="ti ti-arrow-back-up text-base"></i>返回上一级<span v-if="pathSegs.length <= 1" class="text-xs text-base-content/40">（根目录）</span>
+                  </button>
+                  <!-- 文件夹 -->
+                  <div v-for="d in dirFolders" :key="'d-'+d.name" class="group flex items-center gap-3 rounded-lg px-3 py-2 transition-colors hover:bg-base-content/8">
+                    <input v-if="!cleanupMode" type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="d.name" v-model="picked">
+                    <input v-else type="checkbox" class="checkbox checkbox-sm checkbox-error" :value="d.name" v-model="cleanupPicked">
+                    <button class="flex min-w-0 flex-1 items-center gap-2.5 text-left" @click="loadDirs(curPath ? curPath + '/' + d.name : d.name)">
+                      <i class="ti ti-folder text-base leading-none text-base-content/40 transition-transform duration-200 ease-[var(--ease-spring)] group-hover:scale-110"></i>
+                      <span class="truncate text-sm" :title="hideNames ? '' : d.name">{{hideNames ? '••••••••' : d.name}}</span>
+                    </button>
+                    <template v-if="!cleanupMode">
+                      <button class="btn-icon danger" title="删除云端文件夹（含全部内容，不可恢复）" @click="cloudRm(d.name, false)"><i class="ti ti-trash"></i></button>
+                      <button class="btn-icon" title="把这个文件夹转存到另一个账号" @click="openXfer(curPath ? curPath + '/' + d.name : d.name)"><i class="ti ti-switch-horizontal"></i></button>
+                      <button class="btn-sm shrink-0" @click="startJob(d.name)"><i class="ti ti-download"></i>下载</button>
+                    </template>
+                  </div>
+                  <!-- 文件 -->
+                  <template v-if="dirFiles.length">
+                    <!-- 表头：全选复选框（浏览模式进 picked / 清理模式进 cleanupPicked），右侧显示文件数 -->
+                    <div class="flex items-center gap-2 px-3 pb-1 pt-3 text-[0.6875rem] font-semibold uppercase tracking-[0.05em] text-base-content/40">
+                      <input type="checkbox" class="checkbox checkbox-xs" :class="cleanupMode ? 'checkbox-error' : 'checkbox-primary'"
+                             :checked="allPicked" @change="toggleAll($event.target.checked)" title="全选 / 取消本页文件">
+                      <span>文件 · 测速 / 重命名 / 删除</span>
+                      <span class="ml-auto font-normal normal-case tracking-normal tabular-nums">{{dirFiles.length}} 个<span v-if="downloadedCount"> · 已下载 {{downloadedCount}}</span></span>
+                    </div>
+                    <div v-for="f in dirFiles" :key="'f-'+f.name" class="group flex items-center gap-3 rounded-lg px-3 py-2 transition-colors hover:bg-base-content/8">
+                      <!-- 浏览模式也要能勾文件：早期版本这里只渲染文件图标，导致「下载选中」永远勾不到文件 -->
+                      <input v-if="!cleanupMode" type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="f.name" v-model="picked">
+                      <input v-else type="checkbox" class="checkbox checkbox-sm checkbox-error" :value="f.name" v-model="cleanupPicked">
+                      <i class="ti text-base leading-none" :class="f.mediaKind==='video' ? 'ti-movie text-primary' : f.mediaKind==='audio' ? 'ti-music text-secondary' : f.archive ? 'ti-file-zip text-warning' : 'ti-file text-base-content/40'"></i>
+                      <div class="flex min-w-0 flex-1 items-center gap-2">
+                        <span class="min-w-0 truncate text-sm" :title="hideNames ? '' : f.name">{{hideNames ? '••••••••' : f.name}}</span>
+                        <span v-if="f.downloaded" class="badge-pill b-done shrink-0"
+                              title="NAS 的 /vol2/download 下已有同名且大小一致的文件">
+                          <i class="ti ti-check"></i>已下载
+                        </span>
+                      </div>
+                      <span class="shrink-0 text-xs tabular-nums text-base-content/50">{{fmt(f.size)}}</span>
+                      <template v-if="!cleanupMode">
+                        <!-- v3.45：在线播放。直连 CDN 拿签名直链，NAS 不中转 -->
+                        <button v-if="f.playable" class="btn-sm primary" :disabled="cloudPlayBusy===f.name"
+                                :title="playBtnTitle()" @click="cloudPlay(f)">
+                          <i class="ti" :class="cloudPlayBusy===f.name ? 'ti-loader-2 animate-spin' : 'ti-player-play'"></i>
+                        </button>
+                        <button class="btn-icon" title="把这个文件转存到另一个账号（原生转存，不消耗下载配额）" @click="openXfer(curPath ? curPath + '/' + f.name : f.name, true)"><i class="ti ti-switch-horizontal"></i></button>
+                        <button class="btn-sm" title="下载这个文件到 NAS" @click="startFileJob(f.name)"><i class="ti ti-download"></i></button>
+                        <button class="btn-icon" title="对比测速：直连 / 经 mihomo 代理各下载 5 秒（共约 10 秒，会真实下载文件并消耗云盘流量）" @click="cloudSpeedTest(f.name)"><i class="ti" :class="speedTesting===f.name ? 'ti-loader-2 animate-spin' : 'ti-gauge'"></i></button>
+                        <!-- ti-link-share 在 Tabler 中不存在（无字形 → 空方块），必须用真实存在的图标类 -->
+                        <button class="btn-icon" title="获取分享链接（自动尝试代理）" @click="cloudShare(f.name)"><i class="ti ti-link"></i></button>
+                        <button v-if="f.archive" class="btn-icon" title="预览压缩包内容 / 云端解压（云端解压需 PikPak 会员）" @click="openUnzip(f.name)"><i class="ti ti-file-zip"></i></button>
+                        <button class="btn-icon" title="重命名云端文件" @click="cloudRename(f.name)"><i class="ti ti-pencil"></i></button>
+                        <button class="btn-icon danger" title="删除云端文件" @click="cloudRm(f.name, true)"><i class="ti ti-trash"></i></button>
+                      </template>
+                    </div>
+                  </template>
+                  <div v-if="dirsError" class="empty-state py-8">
+                    <i class="ti ti-alert-triangle"></i>
+                    <span>目录列表加载失败：{{dirsError}}</span>
+                    <button class="btn-sm mt-2" @click="reloadDirs"><i class="ti ti-refresh"></i>重新加载</button>
+                  </div>
+                  <div v-else-if="!dirs.length" class="empty-state py-8">
+                    <i class="ti ti-folder-off"></i>{{curPath?'这个云端目录确实是空的':'选择账号后自动列出文件夹'}}
+                  </div>
+                </div>
+
+                <!-- 缩略图 / 网格视图（v3.40）：真实封面优先，失败回退文件类型大图标 -->
+                <div v-else class="flex flex-col gap-3">
+                  <div class="flex flex-wrap items-center gap-2 px-1">
+                    <button v-if="curPath" class="btn-sm" @click="loadDirs(pathSegs.length > 1 ? pathSegs.slice(0,-1).join('/') : '')"><i class="ti ti-arrow-back-up"></i>返回上一级</button>
+                    <label class="flex items-center gap-1.5 text-xs text-base-content/50">
+                      <input type="checkbox" class="checkbox checkbox-xs" :class="cleanupMode ? 'checkbox-error' : 'checkbox-primary'"
+                             :checked="allPicked" @change="toggleAll($event.target.checked)" title="全选 / 取消本页文件">
+                      全选本页文件
+                    </label>
+                    <span class="ml-auto text-xs tabular-nums text-base-content/40">{{dirFolders.length}} 个文件夹 · {{dirFiles.length}} 个文件<span v-if="downloadedCount"> · 已下载 {{downloadedCount}}</span></span>
+                  </div>
+                  <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+                    <div v-for="it in gridItems" :key="(it.isdir?'gd-':'gf-')+it.name"
+                         class="group overflow-hidden rounded-xl border border-base-content/10 bg-base-100 transition-colors hover:border-primary/40">
+                      <div class="relative overflow-hidden bg-base-content/5" style="aspect-ratio:4/3"
+                           :class="it.isdir ? 'cursor-pointer' : ''"
+                           @click="it.isdir && loadDirs(fullPath(it.name))">
+                        <img v-if="it.thumb && !thumbFailed[it.name]" :src="thumbUrl(it.thumb)" loading="lazy"
+                             class="h-full w-full object-cover" @error="onThumbError(it.name)">
+                        <div v-else class="flex h-full w-full items-center justify-center" :class="fileIconCls(it)">
+                          <i class="ti text-4xl leading-none" :class="fileIcon(it)"></i>
+                        </div>
+                        <input v-if="!cleanupMode" type="checkbox" class="checkbox checkbox-sm checkbox-primary absolute left-2 top-2 z-10" :value="it.name" v-model="picked" @click.stop>
+                        <input v-else type="checkbox" class="checkbox checkbox-sm checkbox-error absolute left-2 top-2 z-10" :value="it.name" v-model="cleanupPicked" @click.stop>
+                        <span v-if="it.downloaded" class="badge-pill b-done absolute right-2 top-2 z-10"><i class="ti ti-check"></i>已下载</span>
+                        <span v-if="it.isdir" class="badge-pill absolute bottom-2 left-2 z-10 bg-base-content/10 text-base-content/65"><i class="ti ti-folder"></i>文件夹</span>
+                      </div>
+                      <div class="p-2.5">
+                        <div class="truncate text-xs font-medium" :title="hideNames ? '' : it.name">{{hideNames ? '••••••••' : it.name}}</div>
+                        <div class="mt-1 flex items-center justify-between gap-1 text-[11px] text-base-content/45">
+                          <span class="tabular-nums">{{it.isdir ? '文件夹' : fmt(it.size)}}</span>
+                          <span v-if="it.mime" class="truncate">{{shortMime(it.mime)}}</span>
+                        </div>
+                        <div v-if="!cleanupMode" class="mt-2 flex flex-wrap items-center gap-1">
+                          <button class="btn-icon always" title="下载到 NAS" @click="it.isdir ? startJob(it.name) : startFileJob(it.name)"><i class="ti ti-download"></i></button>
+                          <button class="btn-icon always" title="跨账号转移" @click="openXfer(fullPath(it.name), !it.isdir)"><i class="ti ti-switch-horizontal"></i></button>
+                          <template v-if="!it.isdir">
+                            <button v-if="it.playable" class="btn-icon always primary" :disabled="cloudPlayBusy===it.name"
+                                    :title="playBtnTitle()" @click="cloudPlay(it)">
+                              <i class="ti" :class="cloudPlayBusy===it.name ? 'ti-loader-2 animate-spin' : 'ti-player-play'"></i>
+                            </button>
+                            <button class="btn-icon always" title="对比测速" @click="cloudSpeedTest(it.name)"><i class="ti ti-gauge"></i></button>
+                            <button class="btn-icon always" title="获取分享链接" @click="cloudShare(it.name)"><i class="ti ti-link"></i></button>
+                            <button v-if="it.archive" class="btn-icon always" title="预览 / 解压压缩包" @click="openUnzip(it.name)"><i class="ti ti-file-zip"></i></button>
+                            <button class="btn-icon always" title="重命名云端文件" @click="cloudRename(it.name)"><i class="ti ti-pencil"></i></button>
+                          </template>
+                          <button class="btn-icon always danger" title="删除云端文件/文件夹" @click="cloudRm(it.name, !it.isdir)"><i class="ti ti-trash"></i></button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-if="dirsError" class="empty-state py-8">
+                    <i class="ti ti-alert-triangle"></i>
+                    <span>目录列表加载失败：{{dirsError}}</span>
+                    <button class="btn-sm mt-2" @click="reloadDirs"><i class="ti ti-refresh"></i>重新加载</button>
+                  </div>
+                  <div v-else-if="!dirs.length" class="empty-state py-8">
+                    <i class="ti ti-folder-off"></i>{{curPath?'这个云端目录确实是空的':'选择账号后自动列出文件夹'}}
+                  </div>
+                </div>
+
+                <!-- 批量操作（随模式切换） -->
+                <div class="mt-3 flex flex-wrap items-center gap-3 border-t border-base-content/10 pt-3">
+                  <template v-if="!cleanupMode">
+                    <div class="relative min-w-52 flex-1 sm:flex-none">
+                      <input class="fld w-full sm:w-52" v-model.trim="dlFolder" placeholder="保存目录（点击选择 / 输入）" @focus="openPicker('dl')" @click="openPicker('dl')">
+                      <div v-if="pickerTarget==='dl'" class="picker-panel pop-in absolute left-0 top-11 z-50 w-64">
+                        <div class="picker-head">选择已有目录</div>
+                        <div class="max-h-60 overflow-y-auto p-2">
+                          <button v-for="d in pickerFiltered" :key="d" class="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-base-content/10" :class="dlFolder===d ? 'bg-primary/15 text-primary' : 'text-base-content/80'" @mousedown.prevent="pickDir(d)">
+                            <i class="ti ti-folder"></i><span class="flex-1 truncate text-left">{{d}}</span>
+                            <i v-if="dlFolder===d" class="ti ti-check"></i>
+                          </button>
+                          <div v-if="!pickerFiltered.length" class="py-3 text-center text-xs text-base-content/40">无匹配目录，可直接输入新名字</div>
+                        </div>
+                        <div class="border-t border-base-content/10 px-3 py-2 text-xs text-base-content/40">也可直接输入新目录名（自动创建）</div>
+                      </div>
+                    </div>
+                    <button class="btn-primary btn-press" :disabled="!picked.length" @click="batchStart">
+                      <i class="ti ti-download"></i>下载选中（{{picked.length}}）
+                    </button>
+                    <!-- v3.43 下载过滤：规则随任务下发给 rclone（--min-size / --exclude） -->
+                    <button class="btn-sm" :class="dlFilterOn ? 'filter-on' : ''" @click="openDlFilter"
+                            :title="dlFilterOn ? '当前过滤：' + dlFilterText() + '（点此修改）' : '设置下载过滤：跳过 0 字节 / 大小区间 / 扩展名 / 关键词'">
+                      <i class="ti ti-filter"></i>过滤<span v-if="dlFilterCount" class="tabular-nums">{{dlFilterCount}}</span>
+                    </button>
+                    <span class="text-xs text-base-content/50">落盘到 /vol2/download/保存目录</span>
+                    <span v-if="dlFilterOn" class="text-xs text-warning/90"
+                          :title="'按当前规则，本目录 ' + dirFiles.length + ' 个文件中 ' + dlFilterPreview.skip + ' 个会被跳过'">
+                      过滤中：预计下载 {{dlFilterPreview.pass}} / {{dirFiles.length}} 个 · {{fmt(dlFilterPreview.bytes)}}
+                    </span>
+                  </template>
+                  <template v-else>
+                    <button class="btn-press inline-flex h-9 items-center gap-2 rounded-lg bg-error px-4 text-sm font-semibold text-error-content disabled:cursor-not-allowed disabled:opacity-45" :disabled="!cleanupPicked.length" @click="batchCleanup">
+                      <i class="ti ti-trash"></i>删除选中（{{cleanupPicked.length}}）
+                    </button>
+                    <!-- v3.44：PikPak 普通删除只是进回收站；勾这里才是不进回收站的彻底删除 -->
+                    <label v-if="trashSupported()" class="flex cursor-pointer items-center gap-1.5 text-xs"
+                           :class="hardDelete ? 'text-error' : 'text-base-content/60'"
+                           title="勾上后走 PikPak 的 batchDelete：不经过回收站，删除后无法恢复">
+                      <input type="checkbox" class="checkbox checkbox-xs checkbox-error" v-model="hardDelete">
+                      彻底删除（不进回收站）
+                    </label>
+                    <button v-if="trashSupported()" class="btn-sm" @click="openTrash"><i class="ti ti-trash-x"></i>回收站</button>
+                    <span class="text-xs text-base-content/50">
+                      {{trashSupported() ? (hardDelete ? '彻底删除：文件夹连同全部内容直接销毁，无法恢复' : '默认进 PikPak 回收站，可在「回收站」里恢复或彻底删除') : '云端删除不可恢复 —— 文件夹连同全部内容一并删除'}}
+                    </span>
+                  </template>
+                </div>
+              </div>
+            </div>
+
+            <!-- ════ 下载任务 ════ -->
+            <div v-else-if="page==='tasks'" class="flex flex-col gap-4">
+              <!-- 工具栏 -->
+              <div class="fade-slide-in flex flex-wrap items-center gap-3">
+                <h1 class="text-2xl font-bold tracking-tight">下载任务</h1>
+                <span class="text-xs text-base-content/50">只看任务状态 · 挑云端文件请到「云盘预览」</span>
+                <div class="ml-auto flex flex-wrap items-center gap-2">
+                  <button class="btn-sm primary" @click="go('browse')"><i class="ti ti-folder-open"></i>去云盘预览挑文件</button>
+                  <button class="btn-sm danger" :disabled="!finishedCount"
+                          title="一键清空所有已完成 / 出错 / 已暂停的任务记录，并清空统计页已完成传输（不影响已下载文件、运行中和排队中的任务）"
+                          @click="clearFinished"><i class="ti ti-trash-x"></i>一键清理<span v-if="finishedCount" class="ml-1 tabular-nums opacity-70">{{finishedCount}}</span></button>
+                  <button class="btn-sm" @click="refresh"><i class="ti ti-refresh"></i>刷新</button>
+                </div>
+              </div>
+
+              <!-- URL 直链下载 -->
+              <div class="card-p fade-slide-in flex flex-wrap items-center gap-3 p-3.5" style="animation-delay:90ms">
+                <i class="ti ti-link text-lg leading-none text-info"></i>
+                <div class="relative min-w-72 flex-1">
+                  <input class="fld w-full" v-model.trim="urlForm.url" placeholder="粘贴 http(s) 直链，rclone 直接下载到 NAS（不经过网盘）" @keyup.enter="urlDl">
+                </div>
+                <div class="relative">
+                  <input class="fld w-36" v-model.trim="urlForm.folder" placeholder="保存目录（默认 URL下载）" @focus="openPicker('url')" @click="openPicker('url')">
+                  <div v-if="pickerTarget==='url'" class="picker-panel pop-in absolute right-0 top-11 z-50 w-64">
+                    <div class="picker-head">选择已有目录</div>
+                    <div class="max-h-60 overflow-y-auto p-2">
+                      <button v-for="d in pickerFiltered" :key="d" class="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-base-content/10" :class="urlForm.folder===d ? 'bg-primary/15 text-primary' : 'text-base-content/80'" @mousedown.prevent="pickDir(d)">
+                        <i class="ti ti-folder"></i><span class="flex-1 truncate text-left">{{d}}</span>
+                        <i v-if="urlForm.folder===d" class="ti ti-check"></i>
+                      </button>
+                    </div>
+                    <div class="border-t border-base-content/10 px-3 py-2 text-xs text-base-content/40">默认 URL下载 · 也可输入新名字</div>
+                  </div>
+                </div>
+                <button class="btn-sm primary" :disabled="urlAdding || !urlForm.url" @click="urlDl">
+                  <i class="ti ti-download" :class="urlAdding ? 'animate-spin' : ''"></i>{{urlAdding ? '提交中…' : '开始下载'}}
+                </button>
+              </div>
+
+
+              <!-- 批量操作 -->
+              <div class="fade-slide-in flex flex-wrap items-center gap-2" style="animation-delay:120ms">
+                <button class="btn-sm warn" @click="stopAll"><i class="ti ti-player-pause"></i>暂停全部</button>
+                <button class="btn-sm primary" @click="resumeAll"><i class="ti ti-player-play"></i>继续全部</button>
+                <span class="text-xs tabular-nums text-base-content/50">并发上限 {{settings.maxConcurrent}} · 排队任务自动接续 · 睡前排队 → 睡醒「继续全部」秒速续传</span>
+              </div>
+
+              <!-- 任务过滤 chips -->
+              <div class="fade-slide-in flex flex-wrap items-center gap-2" style="animation-delay:160ms">
+                <button v-for="c in stateChips" :key="c.id" class="chip" :class="filter===c.id ? 'chip-on ' + c.onCls : ''" @click="filter=c.id">
+                  {{c.label}}<span class="tabular-nums opacity-70">{{stateCounts[c.id] || 0}}</span>
+                </button>
+                <button v-if="stateCounts.error" class="btn-sm danger ml-auto" @click="retryAllFailed"><i class="ti ti-rotate"></i>重试全部失败</button>
+              </div>
+
+              <!-- 任务列表 -->
+              <div class="flex flex-col gap-3">
+                <div v-for="j in filteredJobs" :key="j.id" class="job-card lift-hover">
+                  <div class="flex min-w-0 items-center gap-2">
+                    <i class="ti ti-folder shrink-0 text-base leading-none text-base-content/40"></i>
+                    <span class="min-w-0 flex-1 truncate text-sm font-semibold" :title="j.title">{{j.title}}</span>
+                    <span class="badge-pill" :class="'b-'+j.state">{{j.stateText || stateLabel[j.state]}}</span>
+                    <span v-if="j.kind==='unzip'" class="badge-pill bg-secondary/15 text-secondary">
+                      <i class="ti ti-file-zip mr-0.5"></i>{{j.engine==='local' ? '本地解压' : '云端解压'}}
+                    </span>
+                    <span v-if="j.kind==='xfer' && j.method!=='externalshare'" class="badge-pill bg-accent/15 text-accent"><i class="ti ti-switch-horizontal mr-0.5"></i>跨账号</span>
+                    <span v-if="j.kind==='xfer' && j.method==='externalshare'" class="badge-pill bg-info/15 text-info"><i class="ti ti-link mr-0.5"></i>分享转存</span>
+                    <span v-if="j.kind==='xfer' && j.method!=='externalshare'" class="badge-pill bg-base-content/8 text-base-content/60">{{j.mode==='move'?'搬完删源':'保留源'}}</span>
+                    <span v-else-if="j.kind!=='xfer' && j.kind!=='unzip'" class="badge-pill bg-base-content/8 text-base-content/60">{{j.mode==='move'?'下完删云端':'保留云端'}}</span>
+                    <span v-if="j.kind==='unzip'" class="badge-pill bg-base-content/8 text-base-content/60">{{j.engine==='local' ? '解压到同目录子文件夹' : '解压到云盘同目录'}}</span>
+                    <span v-if="j.remote && j.remote!=='URL' && j.method!=='externalshare' && j.kind!=='unzip'" class="badge-pill" :class="j.proxy ? 'bg-info/15 text-info' : 'bg-base-content/8 text-base-content/50'">{{j.proxy ? '代理下载' : '直连下载'}}</span>
+                    <span v-if="j.filterText" class="badge-pill bg-warning/15 text-warning" :title="'下载过滤：' + j.filterText">
+                      <i class="ti ti-filter"></i>已过滤
+                    </span>
+                    <span v-if="j.cleaned" class="badge-pill bg-base-content/10 text-base-content/50">已清理</span>
+                    <div class="flex shrink-0 gap-1.5">
+                      <button class="btn-sm" @click="openDetail(j.id)"><i class="ti ti-info-circle"></i>详情</button>
+                      <button v-if="j.state==='running'"  class="btn-sm warn"   @click="jobOp('stop',j.id)"><i class="ti ti-player-pause"></i>暂停</button>
+                      <button v-if="j.state==='queued'"   class="btn-sm"        @click="jobOp('stop',j.id)"><i class="ti ti-x"></i>取消排队</button>
+                      <button v-if="j.state==='stopped'||j.state==='error'" class="btn-sm primary" @click="jobOp('resume',j.id)"><i class="ti ti-player-play"></i>继续</button>
+                      <button v-if="j.state==='done' && !j.cleaned && j.kind!=='xfer' && j.kind!=='unzip'" class="btn-sm danger" @click="cleanupJob(j.dest)"><i class="ti ti-eraser"></i>清理文件</button>
+                      <button v-if="j.state!=='running'&&j.state!=='queued'" class="btn-sm danger" @click="jobOp('remove',j.id)"><i class="ti ti-trash"></i>删除记录</button>
+                    </div>
+                  </div>
+                  <div class="h-1.5 w-full overflow-hidden rounded-full bg-base-300">
+                    <div class="h-full rounded-full transition-[width] duration-500 ease-[var(--ease-soft)]" :class="barCls[j.state]" :style="{width:j.pct+'%'}"></div>
+                  </div>
+                  <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs tabular-nums text-base-content/60">
+                    <template v-if="j.kind==='unzip'">
+                      <span v-if="j.state==='done'" class="text-success">{{j.error || '解压完成'}}</span>
+                      <span v-else-if="j.state==='error'" class="text-error">{{j.error}}</span>
+                      <span v-else class="text-secondary">{{j.pct.toFixed(0)}}% · {{j.phaseStr || '解压中'}}</span>
+                      <span v-if="j.state==='running' && j.curfile" class="max-w-48 truncate text-accent" :title="j.curfile">正在解 {{j.curfile}}</span>
+                      <span class="truncate">目标 {{j.dest}}</span>
+                      <span v-if="j.password" class="text-base-content/45">带密码</span>
+                    </template>
+                    <template v-else-if="j.kind==='xfer'">
+                      <span v-if="j.state==='done'" class="text-success">已完成</span>
+                      <span v-else-if="j.state==='stopped'" class="text-warning">{{j.error ? '已中断' : '已暂停'}}</span>
+                      <span v-else-if="j.state==='queued'" class="text-accent">排队中</span>
+                      <span v-else class="text-info">{{j.phaseStr || '处理中'}}</span>
+                      <span v-if="j.srcCount" class="text-base-content/50">{{j.single_file ? '单个文件' : ('共 ' + j.srcCount + ' 项')}}</span>
+                      <span v-if="j.note" class="text-warning">{{j.note}}</span>
+                    </template>
+                    <template v-else-if="j.nochange">
+                      <span class="font-medium text-warning">无变化</span>
+                      <span>0 字节传输 · 源目录为空或目标已存在相同文件</span>
+                    </template>
+                    <template v-else>
+                      <span>{{j.pct.toFixed(1)}}%</span>
+                      <span>{{fmt(j.bytes)}} / {{j.total>0?fmt(j.total):'--'}}</span>
+                    </template>
+                    <span v-if="j.state==='running'" class="text-info">{{j.speedStr}}</span>
+                    <span v-if="j.state==='running'">剩余 {{j.etaStr}}</span>
+                    <span v-if="j.state==='running' && j.curfile" class="max-w-48 truncate text-accent" :title="j.curfile">正在传 {{j.curfile}}</span>
+                    <span class="truncate">目标 {{j.dest}}</span>
+                    <span v-if="j.qpos" class="text-accent">队列第 {{j.qpos}} 位</span>
+                    <span v-if="j.error && !j.nochange" class="text-error">{{j.error}}</span>
+                  </div>
+                </div>
+                <div v-if="!jobs.length" class="card-p empty-state py-12"><i class="ti ti-download"></i>还没有任务 —— 点「去云盘预览挑文件」或粘贴直链开始</div>
+                <div v-else-if="!filteredJobs.length" class="card-p empty-state py-12"><i class="ti ti-filter-off"></i>该状态下没有任务</div>
+              </div>
+            </div>
+
+            <!-- ════ 本地文件（v3.15：只读落盘资源，在线播放 / 下载到本机）════ -->
+            <div v-else-if="page==='files'" class="flex flex-col gap-4">
+              <div class="fade-slide-in flex flex-wrap items-center gap-3">
+                <h1 class="text-2xl font-bold tracking-tight">本地文件</h1>
+                <span class="text-xs text-base-content/50">已下载到 NAS 的资源 · 浏览 / 播放 / 导出 / 批量改名</span>
+                <div class="ml-auto flex flex-wrap items-center gap-2">
+                  <button class="btn-sm" :disabled="lfLoading" @click="reloadLocalFiles">
+                    <i class="ti ti-refresh" :class="lfLoading ? 'animate-spin' : ''"></i>刷新
+                  </button>
+                  <!-- v3.43：M3U 用 /media 绝对地址，导出后可直接用 VLC / PotPlayer 打开 -->
+                  <div class="relative">
+                    <button class="btn-sm" :class="lfExpOpen ? 'primary' : ''" @click="lfExpOpen=!lfExpOpen"
+                            title="导出当前目录的播放列表（M3U）或清单（CSV）"><i class="ti ti-file-export"></i>导出</button>
+                    <div v-if="lfExpOpen" class="fixed inset-0 z-20" @click="lfExpOpen=false"></div>
+                    <div v-if="lfExpOpen" class="pop-in absolute right-0 top-full z-30 mt-1 w-72 rounded-xl border border-base-content/10 bg-base-100 p-1 shadow-lg">
+                      <button class="menu-item" @click="lfExpOpen=false; exportLocalM3u()">
+                        <i class="ti ti-playlist text-secondary"></i>
+                        <span class="flex-1 text-left">导出 M3U 播放列表<span class="block text-[11px] text-base-content/40">当前目录音视频 · 局域网可直连播放</span></span>
+                      </button>
+                      <button class="menu-item" @click="lfExpOpen=false; exportLocalCsv()">
+                        <i class="ti ti-file-spreadsheet text-success"></i>
+                        <span class="flex-1 text-left">导出 CSV 清单<span class="block text-[11px] text-base-content/40">本目录文件夹 + 文件 + 大小 + 时间</span></span>
+                      </button>
+                    </div>
+                  </div>
+                  <!-- v3.50：本地批量改名，复用云盘「批量改名」的模板 / 正则 / 序号规则 -->
+                  <button class="btn-sm" :disabled="!lfRenameNames.length" @click="openRename('local')"
+                          title="批量重命名当前目录的文件与文件夹：模板 / 正则替换 / 序号，先预览再执行"><i class="ti ti-abc"></i>批量改名</button>
+                  <button class="btn-sm primary" @click="openVerify()"><i class="ti ti-shield-check"></i>一致性校验</button>
+                  <!-- v3.44：本地批量解压（NAS 侧 zip / tar，不走 PikPak 会员功能） -->
+                  <button class="btn-sm" :disabled="!lfPickedArchives.length" @click="lfUnzipPicked"
+                          :title="lfPickedArchives.length ? '把勾选的压缩包解到同目录下的同名文件夹' : '先在下方勾选压缩包'">
+                    <i class="ti ti-file-zip"></i>解压选中（{{lfPickedArchives.length}}）
+                  </button>
+                  <button class="btn-sm" @click="go('tasks')"><i class="ti ti-download"></i>下载任务</button>
+                </div>
+              </div>
+
+              <div class="card-p fade-slide-in flex flex-col gap-3 p-4" style="animation-delay:60ms">
+                <div class="flex flex-wrap items-center gap-2">
+                  <button class="btn-sm" :disabled="!lfPath" @click="lfUp" title="返回上一级"><i class="ti ti-arrow-left"></i>上一级</button>
+                  <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1 text-sm">
+                    <template v-for="(c,i) in lfCrumbs" :key="'crumb-'+c.path">
+                      <i v-if="i" class="ti ti-chevron-right text-xs text-base-content/40"></i>
+                      <button class="lf-crumb" :class="i===lfCrumbs.length-1 ? 'is-current' : ''" @click="goLf(c.path)">{{c.label}}</button>
+                    </template>
+                  </div>
+                  <span class="text-xs tabular-nums text-base-content/50">/vol2/download{{lfPath ? '/' + lfPath : ''}}</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-2 border-t border-base-content/10 pt-3">
+                  <div class="relative min-w-48 flex-1">
+                    <i class="ti ti-search absolute left-2.5 top-1/2 -translate-y-1/2 text-sm text-base-content/40"></i>
+                    <input class="fld w-full pl-8" v-model.trim="lfQuery" placeholder="筛选当前目录的文件名">
+                  </div>
+                  <select class="fld w-28" v-model="lfSort">
+                    <option value="name">按名称</option>
+                    <option value="size">按大小</option>
+                    <option value="time">按时间</option>
+                  </select>
+                  <label class="flex cursor-pointer items-center gap-1.5 text-xs text-base-content/60"
+                         title="勾选当前列表全部文件夹与文件，供「批量改名」的已勾选范围使用">
+                    <input type="checkbox" class="checkbox checkbox-xs checkbox-primary" :checked="lfAllPicked"
+                           @change="lfToggleAll($event.target.checked)">全选（{{lfRenameNames.length}}）
+                  </label>
+                  <span class="text-xs tabular-nums text-base-content/50">{{lfDirs.length}} 个文件夹 · {{lfFiles.length}} 个文件 · {{fmt(lfTotalSize)}}</span>
+                </div>
+              </div>
+
+              <div v-if="lfError" class="card-p flex items-center gap-2 border border-error/30 bg-error/10 p-3.5 text-sm text-error">
+                <i class="ti ti-alert-triangle"></i>{{lfError}}
+              </div>
+              <div v-if="lfLoading && !lfDirs.length && !lfFiles.length" class="card-p empty-state py-12">
+                <i class="ti ti-loader-2 animate-spin text-2xl"></i>正在读取目录…
+              </div>
+
+              <div v-if="lfViewDirs.length" class="card-p fade-slide-in overflow-hidden p-0" style="animation-delay:100ms">
+                <div class="flex items-center gap-2 border-b border-base-content/10 px-4 py-2.5 text-xs font-medium text-base-content/60">
+                  <i class="ti ti-folders"></i>文件夹（{{lfViewDirs.length}}）
+                </div>
+                <div v-for="d in lfViewDirs" :key="'d-'+d.name" class="lf-row">
+                  <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="d.name" v-model="lfPicked"
+                         :title="'勾选以便批量改名：' + d.name">
+                  <button class="flex min-w-0 flex-1 items-center gap-3 text-left" @click="openLfDir(d.name)">
+                    <i class="ti ti-folder-filled text-lg leading-none text-warning"></i>
+                    <span class="min-w-0 flex-1 truncate text-sm font-medium">{{d.name}}</span>
+                  </button>
+                  <span class="text-xs tabular-nums text-base-content/50">{{d.count}} 项</span>
+                  <span class="hidden text-xs tabular-nums text-base-content/40 sm:inline">{{fmtTime(d.mtime)}}</span>
+                  <button class="btn-sm" :title="'校验此文件夹与云端：'+d.name" @click="openVerify({localPath: lfPath ? lfPath + '/' + d.name : d.name})"><i class="ti ti-shield-check"></i>校验</button>
+                  <i class="ti ti-chevron-right text-sm leading-none text-base-content/40"></i>
+                </div>
+              </div>
+
+              <div v-if="lfViewFiles.length" class="card-p fade-slide-in overflow-hidden p-0" style="animation-delay:140ms">
+                <div class="flex items-center gap-2 border-b border-base-content/10 px-4 py-2.5 text-xs font-medium text-base-content/60">
+                  <i class="ti ti-files"></i>文件（{{lfViewFiles.length}}）
+                  <label v-if="lfArchives.length" class="ml-2 flex cursor-pointer items-center gap-1 font-normal normal-case text-base-content/50"
+                         title="只对压缩包生效：勾选后可用顶部「解压选中」批量解压">
+                    <input type="checkbox" class="checkbox checkbox-xs checkbox-secondary"
+                           :checked="lfAllArchivesPicked" @change="lfToggleAllArchives($event.target.checked)">
+                    全选压缩包（{{lfArchives.length}}）
+                  </label>
+                  <span v-if="lfTruncated" class="ml-auto text-warning">文件过多，仅显示前 2000 项</span>
+                </div>
+                <div v-for="f in lfViewFiles" :key="'f-'+f.name" class="lf-row">
+                  <input type="checkbox" class="checkbox checkbox-sm checkbox-primary"
+                         :value="f.name" v-model="lfPicked"
+                         :title="(f.archive ? '勾选以便批量解压 / 改名：' : '勾选以便批量改名：') + f.name">
+                  <i class="ti text-lg leading-none" :class="f.kind==='video' ? 'ti-movie text-primary' : f.kind==='audio' ? 'ti-music text-secondary' : f.kind==='image' ? 'ti-photo text-info' : (f.archive ? 'ti-file-zip text-warning' : 'ti-file text-base-content/50')"></i>
+                  <span class="min-w-0 flex-1 truncate text-sm" :title="f.name">{{f.name}}</span>
+                  <span class="w-20 shrink-0 text-right text-xs tabular-nums text-base-content/60">{{fmt(f.size)}}</span>
+                  <span class="hidden w-28 shrink-0 text-right text-xs tabular-nums text-base-content/40 md:inline">{{fmtTime(f.mtime)}}</span>
+                  <div class="flex shrink-0 items-center gap-1.5">
+                    <button v-if="f.archive" class="btn-sm" :title="'解压到同目录下的同名文件夹：' + f.name" @click="openLocalUnzip([f.name])"><i class="ti ti-file-zip"></i>解压</button>
+                    <button class="btn-sm" :title="'校验此文件与云端：'+f.name" @click="openVerify({localPath: lfPath ? lfPath + '/' + f.name : f.name})"><i class="ti ti-shield-check"></i>校验</button>
+                    <button v-if="f.playable" class="btn-sm primary" @click="openPlayer(f)"><i class="ti ti-player-play"></i>{{f.kind==='audio' ? '播放' : f.kind==='video' ? '播放' : '预览'}}</button>
+                    <span v-else class="rounded-md bg-base-content/8 px-2 py-1 text-[10px] text-base-content/50" title="浏览器不支持直接播放，请下载到本机">仅下载</span>
+                    <a class="btn-sm" :href="lfUrl(f, true)" :download="f.name" :title="'下载到本机：'+f.name"><i class="ti ti-download"></i>下载</a>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="!lfLoading && !lfError && lfEmpty" class="card-p empty-state py-12">
+                <i class="ti ti-folder-off"></i>{{lfQuery ? '没有匹配的文件' : '这个目录是空的'}}
+              </div>
+              <div class="px-1 text-xs leading-relaxed text-base-content/45">
+                文件来自 NAS 的 <code class="rounded bg-base-content/8 px-1">/vol2/download</code>，即任务里「目标 /data/…」对应的真实落盘位置。播放支持拖动进度；不支持的格式请点「下载」用本机播放器打开。「批量改名」会真实改动 NAS 上的文件名（含文件夹），先预览再执行，改名后旧的播放 / 下载链接会失效。
+              </div>
+            </div>
+
+            <!-- ════ 统计 ════ -->
+            <div v-else-if="page==='stats'" class="flex flex-col gap-4">
+              <div class="fade-slide-in flex flex-wrap items-center gap-3">
+                <h1 class="text-2xl font-bold tracking-tight">统计</h1>
+                <span v-if="rcloneVer" class="text-xs tabular-nums text-base-content/50">rclone {{rcloneVer}}</span>
+                <button class="btn-sm ml-auto" @click="loadStatsPage"><i class="ti ti-refresh" :class="usageLoading ? 'animate-spin' : ''"></i>刷新</button>
+              </div>
+
+              <!-- rclone 健康条 -->
+              <div class="card-p fade-slide-in flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3 text-xs tabular-nums text-base-content/70" style="animation-delay:0ms">
+                <span class="flex items-center gap-1.5"><i class="ti ti-cpu text-secondary"></i>rclone 内存 {{health.allocMB}} / {{health.sysMB}} MB</span>
+                <span class="flex items-center gap-1.5"><i class="ti ti-stack-2 text-info"></i>累计作业 {{health.finishedJobs}}</span>
+                <span class="ml-auto text-base-content/40">{{rcloneVer}}</span>
+              </div>
+
+              <div class="stagger grid grid-cols-1 gap-4 lg:grid-cols-2">
+                <div class="card-p flex flex-col p-4 lg:col-span-2" style="animation-delay:0ms">
+                  <div class="mb-1 flex items-center gap-2 text-sm font-medium text-base-content/80">
+                    <i class="ti ti-chart-area-line text-info"></i>24 小时速度曲线
+                  </div>
+                  <div class="relative h-56"><div ref="histChart" class="absolute inset-0"></div></div>
+                  <div class="mt-1 text-center text-xs tabular-nums text-base-content/60">峰值 {{histPeak}} · 均值 {{histAvg}}（5 分钟均值粒度，服务端每 20 秒采样）</div>
+                </div>
+
+                <div class="card-p flex flex-col p-4" style="animation-delay:50ms">
+                  <div class="mb-1 flex items-center gap-2 text-sm font-medium text-base-content/80">
+                    <i class="ti ti-calendar-event text-success"></i>14 天下载量
+                  </div>
+                  <div class="relative h-56"><div ref="dailyChart" class="absolute inset-0"></div></div>
+                  <div class="mt-1 text-center text-xs tabular-nums text-base-content/60">14 天合计 {{dailyTotal}}</div>
+                </div>
+
+                <div class="card-p flex flex-col p-4" style="animation-delay:100ms">
+                  <div class="mb-2 flex items-center gap-2 text-sm font-medium text-base-content/80">
+                    <i class="ti ti-cloud text-secondary"></i>账号容量
+                  </div>
+                  <div v-if="usageLoading" class="flex flex-col gap-2 py-2">
+                    <div v-for="i in 4" :key="i" class="h-8 animate-pulse rounded-lg bg-base-content/5"></div>
+                  </div>
+                  <div v-else-if="accountUsage.length" class="flex min-h-0 flex-1 flex-col justify-center gap-2.5">
+                    <div v-for="a in accountUsage" :key="a.remote" class="flex items-center gap-3">
+                      <span class="w-28 shrink-0 truncate text-xs font-medium" :title="a.remote">{{a.remote}}</span>
+                      <template v-if="a.total">
+                        <div class="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-base-300">
+                          <div class="h-full rounded-full transition-[width] duration-500 ease-[var(--ease-soft)]" :class="acctBar(a)" :style="{width:acctPct(a)+'%'}"></div>
+                        </div>
+                        <span class="w-40 shrink-0 text-right text-xs tabular-nums text-base-content/60">{{fmt(a.used)}} / {{fmt(a.total)}}</span>
+                      </template>
+                      <template v-else>
+                        <div class="min-w-0 flex-1 text-xs text-base-content/40">容量信息不可用{{a.error ? '（' + a.error + '）' : ''}}</div>
+                      </template>
+                    </div>
+                  </div>
+                  <div v-else class="empty-state flex-1 py-8"><i class="ti ti-cloud-off"></i>暂无账号容量数据</div>
+                </div>
+
+                <div class="card-p flex flex-col p-4 lg:col-span-2" style="animation-delay:150ms">
+                  <div class="mb-1 flex items-center gap-2 text-sm font-medium text-base-content/80">
+                    <i class="ti ti-list-details text-accent"></i>本次运行已完成传输
+                    <span v-if="transfers.length" class="rounded-full bg-accent/10 px-2 py-0.5 text-xs font-semibold tabular-nums text-accent">{{transfers.length}}</span>
+                    <div class="ml-auto flex items-center gap-1">
+                      <button class="btn-icon always" :title="hideNames ? '显示文件名' : '隐藏文件名（云盘与统计页同时生效）'" @click="toggleHideNames">
+                        <i class="ti" :class="hideNames ? 'ti-eye-off' : 'ti-eye'"></i>
+                      </button>
+                      <button class="btn-icon always" :disabled="!transfers.length" title="清空本次运行已完成传输的记录（不影响已下载文件）" @click="clearTransfers">
+                        <i class="ti ti-eraser"></i>
+                      </button>
+                    </div>
+                  </div>
+                  <div v-if="transfers.length" class="max-h-64 min-h-0 flex-1 overflow-y-auto">
+                    <div v-for="(t,i) in transfers" :key="i" class="flex items-center gap-3 border-t border-base-content/8 py-2 text-xs first:border-t-0">
+                      <i class="ti ti-circle-check shrink-0 text-success"></i>
+                      <span class="min-w-0 flex-1 truncate" :title="hideNames ? '' : t.name">{{hideNames ? '••••••••' : t.name}}</span>
+                      <span class="shrink-0 tabular-nums text-base-content/60">{{fmt(t.size || t.bytes)}}</span>
+                      <span class="hidden w-32 shrink-0 truncate text-right text-base-content/40 sm:block">{{hideNames ? '' : t.group}}</span>
+                    </div>
+                  </div>
+                  <div v-else class="empty-state flex-1 py-8"><i class="ti ti-moon"></i>暂无记录 —— 传完的文件会出现在这里</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- ════ 账号 ════ -->
+            <div v-else-if="page==='accounts'" class="flex flex-col gap-4">
+              <div class="fade-slide-in flex flex-wrap items-center gap-3">
+                <h1 class="text-2xl font-bold tracking-tight">账号</h1>
+                <span class="text-xs text-base-content/50">共 {{namedAccounts.length}} 个 · 不自动验证 · token 靠 PikPak 身份识别，换电脑也能自动对上号</span>
+                <!-- v3.51：rclone 的 captcha 回写会留下无 type 的空壳段，已自动忽略并可一键清理 -->
+                <span v-if="ghostAccounts.length" class="text-xs text-base-content/50"
+                      :title="'已忽略的无效配置段：' + ghostAccounts.join('、')">已忽略 {{ghostAccounts.length}} 个无效残留</span>
+                <div class="ml-auto flex flex-wrap items-center gap-2">
+                  <!-- v3.49 一键测试全部：复用 testAllAccounts，3 路并发逐一验证并刷新凭证/容量 -->
+                  <button class="btn-sm primary" :disabled="testingAll || repairing || !namedAccounts.length"
+                          :title="testingAll ? '正在逐一连接全部账号' : '一键连接测试全部账号（3 路并发），刷新每行的凭证状态与容量'"
+                          @click="testAllAccounts(false)">
+                    <i class="ti" :class="testingAll ? 'ti-loader-2 animate-spin' : 'ti-bolt'"></i>{{testingAll ? '测试中 ' + testDone + '/' + testTotal : '一键测试全部'}}
+                  </button>
+                  <button class="btn-sm primary" @click="openTokenImport()"
+                          title="下载一次性采集器（任意 Windows 双击），或直接粘贴 refresh_token 导入">
+                    <i class="ti ti-cloud-download"></i>导入 / 采集 Token
+                  </button>
+                  <button class="btn-icon always" title="刷新账号列表" @click="loadAccounts"><i class="ti ti-refresh"></i></button>
+                  <div class="relative">
+                    <button class="btn-icon always" title="更多账号操作" @click="moreOpen = !moreOpen">
+                      <i class="ti ti-dots"></i>
+                    </button>
+                    <div v-if="moreOpen" class="fixed inset-0 z-20" @click="moreOpen = false"></div>
+                    <div v-if="moreOpen" class="absolute right-0 top-full z-30 mt-1 w-56 rounded-xl border border-base-content/10 bg-base-100 p-1 shadow-lg">
+                      <button class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-base-content/70 hover:bg-base-200 disabled:opacity-40"
+                              :disabled="repairing || testingAll || identifying || !namedAccounts.length"
+                              @click="checkAndRepair">
+                        <i class="ti" :class="repairing || testingAll ? 'ti-loader-2 animate-spin' : 'ti-tool'"></i>
+                        <span>{{repairing || testingAll ? '检查修复中…' : '检查并修复全部'}}</span>
+                      </button>
+                      <button v-if="ghostAccounts.length"
+                              class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-base-content/70 hover:bg-base-200 disabled:opacity-40"
+                              :disabled="purgingGhosts"
+                              title="清理 rclone 里没有 type 的残留配置段（旧账号改名 / 删除后由 captcha 回写产生），两个守护进程都会清理"
+                              @click="purgeGhosts">
+                        <i class="ti" :class="purgingGhosts ? 'ti-loader-2 animate-spin' : 'ti-eraser'"></i>
+                        <span>{{purgingGhosts ? '清理中…' : '清理 ' + ghostAccounts.length + ' 个无效残留'}}</span>
+                      </button>
+                      <button class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-base-content/70 hover:bg-base-200 disabled:opacity-40"
+                              :disabled="identifying || !namedAccounts.length"
+                              title="把每个账号的 PikPak 身份（sub/邮箱）记到 NAS；导入时已自动登记，一般无需手动执行"
+                              @click="identifyAccounts">
+                        <i class="ti" :class="identifying ? 'ti-loader-2 animate-spin' : 'ti-fingerprint'"></i>
+                        <span>{{identifying ? '识别中…' : '识别身份（低频）'}}</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Token 导入结果 -->
+              <div v-if="importResult" class="card-p p-4 fade-slide-in">
+                <div class="mb-2 flex items-center gap-2 text-sm font-medium">
+                  <i class="ti ti-cloud-download text-primary"></i>导入结果
+                  <span class="text-xs font-normal text-base-content/50">
+                    <template v-if="importResult.extracted">扫描 {{importResult.extracted}} 个浏览器环境 · </template>
+                    成功 {{importResult.okCount||0}}/{{importResult.total||0}}
+                  </span>
+                  <button class="btn-sm ml-auto" @click="importResult=null"><i class="ti ti-x"></i>关闭</button>
+                </div>
+                <div class="overflow-x-auto">
+                  <table class="table table-xs w-full">
+                    <thead><tr><th>来源</th><th>控制台账号</th><th>动作</th><th>结果</th></tr></thead>
+                    <tbody>
+                      <tr v-for="(r,i) in (importResult.results||[])" :key="i">
+                        <td class="font-mono text-xs">{{r.env || '—'}}</td>
+                        <td class="font-mono text-xs">{{r.target || '—'}}</td>
+                        <td class="text-xs">{{r.action || '—'}}</td>
+                        <td class="text-xs" :class="r.ok ? 'text-success' : 'text-error'">{{safeMsg(r.msg) || (r.ok ? '成功' : '失败')}}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- 添加账号（通用向导） -->
+              <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:60ms">
+                <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                  <i class="ti ti-user-plus text-primary"></i>添加账号
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <select class="fld w-56" v-model="acctForm.type" @change="acctForm.params={}">
+                    <option v-for="p in providers" :key="p.type" :value="p.type">{{p.label}}</option>
+                  </select>
+                  <input class="fld w-44" v-model.trim="acctForm.name" placeholder="账号名（自定义）">
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <template v-for="pd in curProvider.params" :key="pd.name">
+                    <label class="text-xs text-base-content/60">{{pd.label}}</label>
+                    <input class="fld min-w-48 flex-1" :type="pd.secret ? 'password' : 'text'"
+                           v-model.trim="acctForm.params[pd.name]" :placeholder="pd.ph || pd.label">
+                  </template>
+                  <button class="btn-primary btn-press ml-auto" :disabled="acctAdding" @click="acctAdd">
+                    <i class="ti ti-plus" :class="acctAdding ? 'animate-spin' : ''"></i>{{acctAdding ? '验证中…' : '添加并验证'}}
+                  </button>
+                </div>
+                <div class="text-xs leading-relaxed text-base-content/50">
+                  添加后立即连接验证，失败自动回滚删除。本页永不回显 token / 密码。
+                  <span v-if="acctForm.type==='pikpak'">
+                    三种方式任选：① 只填账号 + 密码（会先申请验证码再登录，PikPak 若判定需人工验证码会直接报错）；
+                    ② 只填 refresh_token（现场换发 access_token 写入 token 字段，rclone 只认后者）；
+                    ③ 上面的「导入 / 采集 Token」——下载一次性采集器在任意电脑双击，或直接粘贴 token，批量写入且自动对号。
+                  </span>
+                  Google Drive / OneDrive 等 OAuth 类型需交互授权，暂不支持网页添加。
+                </div>
+              </div>
+
+              <!-- 账号列表 -->
+              <div class="flex flex-col gap-2">
+                <div class="px-1 text-xs leading-relaxed text-base-content/50">
+                  凭证状态：后台每 12 小时自动保活一次。PikPak 的 refresh_token 是一次性轮换凭证，被别处刷新、改密码或网页端重新登录都会让它作废。<b>每个 PikPak 账号行都常驻「重新登录」</b>：出现红色错误、下载任务报「人工验证 / captcha / no username」，或只是想刷新凭证，都点它 → 在官方登录页登录同一个账号（验证码 / 二次验证在这里过）→ 重新采集后自动覆盖原账号，不用删了重建。
+                </div>
+                <div v-for="a in namedAccounts" :key="a.name" class="card-p lift-hover flex items-center gap-3 p-3.5">
+                  <i class="ti ti-cloud text-lg leading-none text-base-content/40"></i>
+                  <div class="w-64 min-w-0 shrink-0">
+                    <div class="truncate text-sm font-semibold" :title="a.name">{{a.name}}</div>
+                    <div v-if="a.email" class="truncate text-xs leading-tight text-base-content/50" :title="a.email">{{a.email}}</div>
+                  </div>
+                  <span class="badge-pill bg-base-content/8 text-base-content/60">{{a.type}}</span>
+                  <span v-if="a.cred" class="badge-pill whitespace-nowrap"
+                        :class="[credClass(a.cred), (a.cred.state==='dead'||a.cred.state==='warn') ? 'cursor-pointer' : '']"
+                        :title="a.cred.note + ((a.cred.state==='dead'||a.cred.state==='warn') ? '（点击重新采集 Token）' : '')"
+                        @click="credClick(a.cred, a)">
+                    {{credLabel(a.cred)}}<template v-if="a.cred.days !== null && a.cred.days !== undefined"> · {{a.cred.days === 0 ? '今天' : a.cred.days + '天前'}}</template>
+                  </span>
+                  <template v-if="a.testing">
+                    <i class="ti ti-loader-2 animate-spin text-base-content/40"></i>
+                    <span class="text-xs text-base-content/40">测试中…</span>
+                  </template>
+                  <template v-else-if="a.ok===true">
+                    <div class="h-1.5 w-32 shrink-0 overflow-hidden rounded-full bg-base-300">
+                      <div class="h-full rounded-full transition-[width] duration-500" :class="acctBar(a)" :style="{width:acctPct(a)+'%'}"></div>
+                    </div>
+                    <span class="text-xs tabular-nums text-base-content/60">{{fmt(a.used)}} / {{fmt(a.total)}}</span>
+                    <i class="ti ti-circle-check shrink-0 text-success"></i>
+                  </template>
+                  <template v-else-if="a.ok===false">
+                    <i class="ti ti-circle-x shrink-0 text-error"></i>
+                    <span class="min-w-0 flex-1 truncate text-xs text-error" :title="a.error">{{acctErrorText(a)}}</span>
+                  </template>
+                  <template v-else>
+                    <span class="text-xs text-base-content/40">未测试</span>
+                  </template>
+                  <div class="ml-auto flex shrink-0 gap-1.5">
+                    <button v-if="showRelink(a)" :class="relinkUrgent(a) ? 'btn-sm primary' : 'btn-sm'"
+                            :title="relinkUrgent(a) ? '凭证异常：打开 PikPak 登录页重新采集，自动覆盖该账号' : '打开 PikPak 登录页重新采集 refresh_token（登录同一个账号即可，自动覆盖，不会新建）'"
+                            @click="relinkAccount(a)"><i class="ti ti-login"></i>重新登录</button>
+                    <button class="btn-sm" @click="openAcctEdit(a)"><i class="ti ti-pencil"></i>编辑</button>
+                    <button class="btn-sm" :disabled="a.testing" @click="acctTest(a)"><i class="ti ti-plug-connected"></i>测试</button>
+                    <button class="btn-sm danger" @click="acctDel(a)"><i class="ti ti-trash"></i>删除</button>
+                  </div>
+                </div>
+                <div v-if="accountsLoading && !namedAccounts.length" class="flex flex-col gap-2">
+                  <div v-for="i in 4" :key="i" class="h-14 animate-pulse rounded-xl bg-base-content/5"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- ════ 设置 ════ -->
+            <div v-else-if="page==='settings'" class="mx-auto flex w-full max-w-3xl flex-col gap-4">
+              <h1 class="text-2xl font-bold tracking-tight">设置</h1>
+              <div class="card-p flex flex-col gap-5 p-5 fade-slide-in" style="animation-delay:60ms">
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sMax">同时下载任务上限</label>
+                  <select id="sMax" class="fld w-24" v-model.number="form.maxConcurrent">
+                    <option v-for="n in 6" :key="n" :value="n">{{n}}</option>
+                  </select>
+                  <span class="text-xs text-base-content/50">超出数量的任务自动排队等待</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sStart">每天自动开始</label>
+                  <input id="sStart" type="time" class="fld w-32" v-model="form.autoStart">
+                  <label class="text-sm text-base-content/70" for="sPause">自动暂停</label>
+                  <input id="sPause" type="time" class="fld w-32" v-model="form.autoPause">
+                  <span class="text-xs text-base-content/50">两个都填才生效，到点自动「继续全部 / 暂停全部」</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sTr">每任务传输线程数</label>
+                  <select id="sTr" class="fld w-24" v-model.number="form.transfers">
+                    <option v-for="n in 12" :key="n" :value="n">{{n}}</option>
+                  </select>
+                  <span class="text-xs text-base-content/50">单个任务同时传输的文件连接数</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sChk">校验器并发数</label>
+                  <select id="sChk" class="fld w-24" v-model.number="form.checkers">
+                    <option v-for="n in 16" :key="n" :value="n">{{n}}</option>
+                  </select>
+                  <span class="text-xs text-base-content/50">任务开始前列比对云端文件的并发数</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sDisk">磁盘最低可用空间</label>
+                  <input id="sDisk" type="number" min="0" step="5" class="fld w-24" v-model.number="form.diskMinGB">
+                  <span class="text-sm text-base-content/70">GB</span>
+                  <span class="text-xs text-base-content/50">低于此值自动暂停全部任务并禁止新任务</span>
+                </div>
+                <!-- v3.49：NAS 主页地址改为可在设置里配置，侧栏 / 移动端顶栏共用 -->
+                <div class="flex flex-wrap items-center gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
+                  <i class="ti ti-home text-lg leading-none text-primary"></i>
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sNasHome">NAS 主页地址</label>
+                  <input id="sNasHome" class="fld min-w-48 flex-1" v-model.trim="form.nasHomeUrl"
+                         placeholder="http://127.0.0.1:8080/" aria-label="NAS 主页地址">
+                  <button class="btn-sm" title="填回出厂地址，点「保存设置」后生效" @click="form.nasHomeUrl = defaultNasHomeUrl">用默认</button>
+                  <div class="w-full text-xs leading-relaxed text-base-content/50">
+                    侧边栏与移动端顶栏「返回 NAS 主页」的跳转地址，保存后立即生效，仅支持 http / https。
+                    当前生效：<span class="font-mono text-base-content/70">{{nasHomeUrl}}</span>
+                    <a :href="nasHomeUrl" target="_blank" rel="noopener noreferrer" class="ml-2 text-primary underline decoration-dotted">试打开</a>
+                  </div>
+                </div>
+
+                <!-- v3.37：基础 / 高级两块合并为一张卡，高级参数由开关控制显示与生效 -->
+                <div class="flex flex-wrap items-center gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
+                  <i class="ti ti-adjustments text-lg leading-none text-info"></i>
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                      启用高级传输参数
+                      <span class="badge-pill bg-base-content/8 text-base-content/60">rclone</span>
+                    </div>
+                    <div class="mt-0.5 text-xs leading-relaxed text-base-content/50">
+                      {{form.advancedMode ? '已启用：保存后新提交的任务按下方参数启动' : '当前按 rclone 默认参数启动（推荐）；开启后才会显示并应用下方参数，原有取值会保留'}}
+                    </div>
+                  </div>
+                  <input id="sAdvMode" type="checkbox" class="toggle toggle-primary" v-model="form.advancedMode" aria-label="启用高级传输参数">
+                </div>
+
+                <div v-if="form.advancedMode" class="flex flex-col gap-4 border-t border-base-content/10 pt-4 fade-slide-in">
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sMts">单文件多线程流数</label>
+                  <input id="sMts" type="number" min="1" max="32" class="fld w-24" v-model.number="form.multiThreadStreams">
+                  <span class="text-xs text-base-content/50">--multi-thread-streams · 默认 8，单个大文件分成几段并发下载</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sMtc">多线程分块阈值</label>
+                  <input id="sMtc" type="number" min="1" max="1024" class="fld w-24" v-model.number="form.multiThreadCutoffMB">
+                  <span class="text-sm text-base-content/70">MB</span>
+                  <span class="text-xs text-base-content/50">--multi-thread-cutoff · 默认 64，超过此大小才分块（小视频也走多线程）</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sOrder">排序方式</label>
+                  <select id="sOrder" class="fld w-44" v-model="form.orderBy">
+                    <option value="size,descending">大的先下（推荐）</option>
+                    <option value="size,ascending">小的先下</option>
+                    <option value="modtime,descending">最新修改优先</option>
+                    <option value="modtime,ascending">最早修改优先</option>
+                    <option value="name,ascending">按文件名</option>
+                    <option value="">不排序（rclone 默认）</option>
+                  </select>
+                  <span class="text-xs text-base-content/50">--order-by · 先下大文件，避免末尾卡在小文件的长尾</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sBwOn">任务限速开关</label>
+                  <input id="sBwOn" type="checkbox" class="toggle toggle-primary" v-model="form.bwLimitOn">
+                  <input v-if="form.bwLimitOn" class="fld w-24" v-model.trim="form.bwLimit" placeholder="5M" aria-label="限速值">
+                  <span class="text-xs text-base-content/50">--bwlimit · 默认关；值如 1M / 5M / 20M。与下方「实时限速」独立：这里只作用于保存后新提交的任务</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sRetries">重试次数</label>
+                  <input id="sRetries" type="number" min="0" max="100" class="fld w-24" v-model.number="form.retries">
+                  <span class="text-xs text-base-content/50">--retries · 默认 10，弱网自动续传</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sTimeout">超时 / 空闲超时</label>
+                  <input id="sTimeout" class="fld w-24" v-model.trim="form.timeout" placeholder="1m">
+                  <input class="fld w-24" v-model.trim="form.idleTimeout" placeholder="10m" aria-label="连接空闲超时">
+                  <span class="text-xs text-base-content/50">--timeout 1m / --contimeout 10m · 长任务保活；rclone 1.75 无 --idle-timeout，用连接空闲超时等价覆盖</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sEmpty">保留空目录</label>
+                  <input id="sEmpty" type="checkbox" class="toggle toggle-primary" v-model="form.createEmptySrcDirs">
+                  <span class="text-xs text-base-content/50">--create-empty-src-dirs · 默认开，目录结构 1:1（对目录任务生效）</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sLogLevel">日志级别 / 文件</label>
+                  <select id="sLogLevel" class="fld w-28" v-model="form.logLevel">
+                    <option v-for="l in ['INFO','DEBUG','NOTICE','WARN','ERROR','OFF']" :key="l" :value="l">{{l}}</option>
+                  </select>
+                  <input class="fld w-64" v-model.trim="form.logFile" placeholder="可选，如 /app/logs/rclone.log" aria-label="日志文件路径">
+                </div>
+                </div>
+
+                <div class="flex flex-wrap items-center gap-3 border-t border-base-content/10 pt-4">
+                  <button class="btn-primary btn-press" :disabled="saving" @click="saveSettings">
+                    <i class="ti ti-device-floppy" :class="saving?'animate-spin':''"></i>{{saving?'保存中…':'保存设置'}}
+                  </button>
+                  <button class="btn-sm danger" :disabled="saving" title="把全部设置（含高级参数开关）恢复为推荐默认值" @click="resetSettings">
+                    <i class="ti ti-rotate-2"></i>恢复默认值
+                  </button>
+                  <span class="text-xs text-base-content/45">恢复会覆盖所有设置，但不影响任务记录、账号和已下载文件</span>
+                </div>
+              </div>
+
+              <!-- 代理与测速 -->
+              <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:120ms">
+                <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                  <i class="ti ti-shield-lock text-info"></i>mihomo 代理
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sDownloadProxy">下载任务走 mihomo 代理</label>
+                  <input id="sDownloadProxy" type="checkbox" class="toggle toggle-primary" :checked="form.downloadProxy" @change="toggleDownloadProxy($event.target.checked)">
+                  <span class="text-xs tabular-nums text-base-content/50">当前：新任务{{form.downloadProxy ? '走代理' : '走直连'}}</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxy">分享链接优先走代理</label>
+                  <input id="sProxy" type="checkbox" class="toggle toggle-primary" :checked="form.proxy" @change="toggleProxy($event.target.checked)">
+                  <span class="text-xs tabular-nums text-base-content/50">当前：{{form.proxy ? '分享：代理优先（直连兜底）' : '分享：直连优先（代理兜底）'}}</span>
+                </div>
+                <div class="text-xs leading-relaxed text-base-content/50">
+                  <strong class="text-base-content/70">下载开关按任务生效</strong>：切换后只影响之后提交的任务，已有任务保持不变；想给某一条任务换路径，点它的「详情」→ 切换路径重试（会停掉旧任务并重新下载）。代理由一个独立的 rclone 守护进程（127.0.0.1:5573）承担，按需自动拉起，<strong class="text-base-content/70">不用改 compose、不用重建容器，也不会中断直连任务</strong>；具体路由规则在 mihomo 面板控制。<br>
+                  分享开关<strong class="text-base-content/70">只影响「分享链接」</strong>的尝试顺序，切换即自动保存。<br>
+                  「云盘预览」文件行的仪表盘图标 = 直连 / 经 mihomo 代理各下载 5 秒（共约 10 秒）对比速度，<strong class="text-base-content/70">固定两条路都跑</strong>，不受以上两个开关影响；进度与结果显示在目录浏览器顶部，结果仅供参考，且会真实下载文件、消耗云盘下游流量。
+                </div>
+              </div>
+              <!-- 实时限速 -->
+              <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:120ms">
+                <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                  <i class="ti ti-gauge text-info"></i>实时限速
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="bwSel">下载带宽上限</label>
+                  <select id="bwSel" class="fld w-36" v-model="bwSel">
+                    <option value="off">不限速</option>
+                    <option value="1M">1 MB/s</option>
+                    <option value="2M">2 MB/s</option>
+                    <option value="5M">5 MB/s</option>
+                    <option value="10M">10 MB/s</option>
+                    <option value="20M">20 MB/s</option>
+                    <option value="50M">50 MB/s</option>
+                  </select>
+                  <button class="btn-primary btn-press" @click="applyBw">应用</button>
+                  <span class="text-xs text-base-content/50">当前 {{bwText}} · 立即生效；rclone 重启后恢复其配置默认值</span>
+                </div>
+              </div>
+              <!-- v3.54：版本与在线更新 -->
+              <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:160ms">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                    <i class="ti ti-refresh text-info"></i>版本与更新
+                  </div>
+                  <span class="badge-pill bg-base-content/8 text-base-content/60 tabular-nums">当前 {{consoleVer || 'v3.54'}}</span>
+                </div>
+                <div class="text-xs leading-relaxed text-base-content/50">
+                  从 GitHub Releases 检查新版本，确认后可一键下载安装。更新只替换程序文件（后端与前端），<strong class="text-base-content/70">不会改动设置、任务记录、账号凭证和已下载文件</strong>；替换前自动备份，支持回滚。更新 Python 后控制台会自动重启，页面可能短暂中断。
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <button class="btn-primary btn-press" :disabled="updChecking || updApplying" @click="checkUpdate(true)">
+                    <i class="ti ti-refresh" :class="updChecking ? 'animate-spin' : ''"></i>{{updChecking ? '检查中…' : '检查更新'}}
+                  </button>
+                  <button v-if="updInfo && updInfo.hasUpdate && updInfo.latest" class="btn-primary btn-press" :disabled="updApplying" @click="applyUpdate">
+                    <i class="ti ti-download" :class="updApplying ? 'animate-spin' : ''"></i>{{updApplying ? '下载并安装中…' : '下载并更新到 ' + updInfo.latest}}
+                  </button>
+                  <a v-if="updInfo && updInfo.htmlUrl" :href="updInfo.htmlUrl" target="_blank" rel="noopener noreferrer" class="btn-sm"><i class="ti ti-external-link"></i>发行说明</a>
+                  <button v-if="updState && updState.backup && !updState.rolledBack" class="btn-sm" :disabled="updApplying" @click="rollbackUpdate"><i class="ti ti-rotate-2"></i>回滚上一版</button>
+                  <span v-if="updCheckedAt" class="text-xs tabular-nums text-base-content/45">最近检查 {{updCheckedAt}}</span>
+                </div>
+                <div v-if="updError" class="flex items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-xs text-error">
+                  <i class="ti ti-alert-triangle mt-0.5"></i><span v-text="updError"></span>
+                </div>
+                <div v-if="updInfo" class="rounded-lg border border-base-content/10 bg-base-200/40 p-3 text-xs leading-relaxed">
+                  <div class="flex flex-wrap items-center gap-2 font-medium text-base-content/80">
+                    <i class="ti" :class="updInfo.hasUpdate ? 'ti-sparkles text-warning' : 'ti-circle-check text-success'"></i>
+                    <span>{{updInfo.hasUpdate ? '发现新版本 ' + updInfo.latest : '已是最新版本 ' + updInfo.current}}</span>
+                    <span class="text-base-content/45">· {{updInfo.name}}</span>
+                    <span v-if="updInfo.publishedAt" class="text-base-content/45">· {{String(updInfo.publishedAt).slice(0, 10)}}</span>
+                  </div>
+                  <div v-if="updInfo.notes" class="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap text-base-content/60" v-text="updInfo.notes"></div>
+                </div>
+                <div v-if="updState" class="text-xs text-base-content/50">
+                  上次更新：<span class="tabular-nums">{{updState.from}} → {{updState.to}}</span>
+                  <span v-if="updState.at"> · {{updState.at}}</span>
+                  <span v-if="updState.rolledBack" class="text-warning"> · 已回滚</span>
+                  <span v-else-if="updState.backup"> · 备份 {{updState.backup}}</span>
+                </div>
+              </div>
+              <div class="px-1 text-xs leading-relaxed text-base-content/50">
+                说明：任务队列自动管理 —— 运行中的任务完成后，排队任务自动顶上；定时启停每天各触发一次；改完设置立即生效。
+              </div>
+            </div>
+
+          </section>
+        </transition>
+      </main>
+
+    <!-- ══ 移动端底部导航（<lg）══ -->
+    <nav class="fixed inset-x-0 bottom-0 z-40 lg:hidden" aria-label="底部导航">
+      <div class="mx-1 mb-2 grid grid-cols-7 rounded-2xl border border-base-content/10 bg-base-300/90 p-1 shadow-lg backdrop-blur-[12px]">
+        <button v-for="n in navs" :key="'m-'+n.id" class="relative flex flex-col items-center gap-0.5 rounded-xl py-2 transition-colors"
+                :class="page===n.id?'text-primary':'text-base-content/70'" @click="go(n.id)" :aria-current="page===n.id?'page':null">
+          <span v-if="page===n.id" class="absolute top-0.5 h-1 w-8 rounded-full bg-primary"></span>
+          <i class="ti text-xl leading-none" :class="[n.icon, page===n.id?'scale-110':'']" style="transition:transform 200ms var(--ease-spring)"></i>
+          <span class="text-[10px] font-medium">{{n.short || n.label}}</span>
+          <span v-if="page===n.id" class="absolute inset-1 -z-10 rounded-xl bg-primary/10"></span>
+        </button>
+      </div>
+    </nav>
+
+    <!-- Toast -->
+    <div class="toast-host">
+      <div v-for="t in toasts" :key="t.id" class="toast-item" :class="'t-'+t.type"
+           :style="t.action ? 'pointer-events:auto' : ''">
+        <i class="ti text-base leading-none" :class="t.type==='error'?'ti-circle-x text-error':'ti-circle-check text-success'"></i>
+        <span class="min-w-0 flex-1 leading-snug">{{t.msg}}</span>
+        <button v-if="t.action" class="btn-sm primary shrink-0" @click="runToastAction(t)">
+          <i class="ti ti-login"></i>{{t.action.label}}
+        </button>
+      </div>
+    </div>
+
+    <!-- ══ 传输配额详情弹窗（v3.36：官方四档配额 + 所有账号每日限额）══ -->
+    <div v-if="quotaOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="quotaOpen=false"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-chart-donut text-lg leading-none text-info"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">传输配额详情</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="quotaOpen=false" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <div class="flex flex-wrap items-center gap-2">
+            <select class="fld w-56" v-model="quotaRemote" aria-label="选择账号">
+              <option v-for="q in quota" :key="'q-'+q.remote" :value="q.remote">{{q.remote}}</option>
+              <option v-if="!quota.length" :value="curRemote">{{curRemote}}</option>
+            </select>
+            <span v-if="quotaDetail && !quotaDetail.error" class="badge-pill" :class="quotaDetail.vip ? 'bg-success/15 text-success' : 'bg-base-content/8 text-base-content/60'">{{quotaDetail.vip ? '会员' : '非会员'}}</span>
+            <span v-if="quotaLoading" class="text-xs text-base-content/50"><i class="ti ti-loader-2 animate-spin"></i> 读取中…</span>
+          </div>
+          <p class="text-xs leading-relaxed text-base-content/50">
+            传输配额包括每个账号每月享有的传输流量，以及非会员每日的下行限额，通常足以满足常规使用。这里显示了该账号的传输配额使用详情。
+          </p>
+          <div v-if="quotaDetail && quotaDetail.error" class="rounded-lg border px-3 py-2 text-xs"
+               :class="quotaDetail.unsupported ? 'border-base-content/10 bg-base-content/5 text-base-content/50' : 'border-warning/30 bg-warning/10 text-warning'">
+            {{quotaDetail.unsupported ? quotaDetail.error : '读取失败：' + quotaDetail.error}}
+          </div>
+          <template v-else>
+            <div class="text-sm font-bold text-base-content/80">每月传输配额</div>
+            <div v-for="r in quotaRows" :key="r.key" class="flex flex-col gap-2">
+              <div class="flex items-center gap-2 text-sm font-semibold"><i class="ti text-base-content/50" :class="r.icon"></i>{{r.label}}</div>
+              <div class="text-sm tabular-nums text-base-content/70">{{fmtQ(r.data.total)}}</div>
+              <div class="h-1.5 w-full overflow-hidden rounded-full bg-base-300">
+                <div class="h-full rounded-full transition-all" :class="quotaBar(r.data)" :style="{width: quotaPct(r.data) + '%'}"></div>
+              </div>
+              <div class="flex flex-wrap justify-between gap-2 text-xs text-base-content/55">
+                <span class="tabular-nums">已用 {{fmtQ(r.data.used)}} / 共 {{fmtQ(r.data.total)}}（{{quotaPct(r.data).toFixed(1)}}%）</span>
+                <span v-if="r.note">{{r.note}}</span>
+              </div>
+            </div>
+            <div v-if="quota.length" class="mt-2 border-t border-base-content/10 pt-4">
+              <div class="mb-2 text-sm font-bold text-base-content/80">所有账号 · 每日下行限额</div>
+              <div class="flex flex-col gap-1.5">
+                <div v-for="q in quota" :key="'qd-'+q.remote" class="flex items-center gap-2 text-xs">
+                  <span class="w-40 shrink-0 truncate" :title="q.remote">{{q.remote}}</span>
+                  <template v-if="!q.error">
+                    <div class="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-base-300">
+                      <div class="h-full rounded-full" :class="quotaBar(q.daily)" :style="{width: quotaPct(q.daily) + '%'}"></div>
+                    </div>
+                    <span class="w-40 shrink-0 text-right tabular-nums text-base-content/60">{{fmtQ(q.daily.used)}} / {{fmtQ(q.daily.total)}}</span>
+                  </template>
+                  <span v-else class="truncate" :class="q.unsupported ? 'text-base-content/40' : 'text-warning'">{{q.error}}</span>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="flex shrink-0 items-center justify-end gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <button class="btn-sm" @click="loadQuota(true)"><i class="ti ti-refresh"></i>刷新配额</button>
+          <button class="btn-sm primary" @click="quotaOpen=false">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 我的分享管理弹窗（v3.42：提取上限 + 自动取消）══ -->
+    <div v-if="myShareOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeMyShares"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-list-details text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">我的分享</span>
+          <span class="badge-pill bg-base-content/8 text-base-content/60">{{mySharesView.length}} 条</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeMyShares" aria-label="关闭"><i class="ti ti-x"></i></button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-5">
+          <div class="flex flex-wrap items-center gap-2">
+            <select class="fld w-36" v-model="myShareFilterRemote" aria-label="按账号筛选">
+              <option value="">全部账号</option>
+              <option v-for="r in myShareRemoteOpts" :key="'msr-'+r" :value="r">{{r}}</option>
+            </select>
+            <select class="fld w-28" v-model="myShareFilterStatus" aria-label="按状态筛选">
+              <option value="OK">有效</option>
+              <option value="ALL">全部</option>
+              <option value="DELETED">已失效</option>
+            </select>
+            <button class="btn-sm" :disabled="myShareLoading" @click="loadMyShares(true)"><i class="ti" :class="myShareLoading?'ti-loader-2 animate-spin':'ti-refresh'"></i>刷新</button>
+            <label class="ml-auto flex items-center gap-2 text-xs text-base-content/70" title="开启后每 5 分钟巡检一次，达到上限的分享会被自动取消">
+              <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" v-model="myShareAuto" @change="toggleShareAuto">
+              提取次数达上限自动取消
+            </label>
+          </div>
+
+          <div v-if="myShareErr" class="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+            <i class="ti ti-alert-triangle mt-0.5"></i><div class="leading-relaxed">{{myShareErr}}</div>
+          </div>
+
+          <div class="overflow-x-auto rounded-xl border border-base-content/10">
+            <table class="w-full text-xs">
+              <thead class="bg-base-content/5 text-base-content/45">
+                <tr>
+                  <th class="px-3 py-2 text-left font-semibold">账号 / 标题</th>
+                  <th class="px-2 py-2 text-left font-semibold">状态</th>
+                  <th class="px-2 py-2 text-left font-semibold">提取码</th>
+                  <th class="px-2 py-2 text-right font-semibold">查看 / 转存</th>
+                  <th class="px-2 py-2 text-left font-semibold">上限</th>
+                  <th class="px-2 py-2 text-right font-semibold">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in mySharesView" :key="'ms-'+myShareKey(r)" class="border-t border-base-content/8">
+                  <td class="max-w-[18rem] px-3 py-2">
+                    <div class="truncate font-medium" :title="r.title || r.shareId">{{r.title || r.shareId}}</div>
+                    <div class="mt-0.5 truncate text-[11px] text-base-content/40">{{r.remote}} · {{r.created || '—'}}</div>
+                  </td>
+                  <td class="px-2 py-2">
+                    <span class="badge-pill" :class="r.status==='OK' ? 'bg-success/12 text-success' : 'bg-base-content/8 text-base-content/50'">{{r.statusText || r.status || '未知'}}</span>
+                  </td>
+                  <td class="px-2 py-2 tabular-nums text-base-content/60">{{r.passCode || '—'}}</td>
+                  <td class="px-2 py-2 text-right tabular-nums text-base-content/60">{{r.views}} / <b class="text-base-content/80">{{r.restores}}</b></td>
+                  <td class="px-2 py-2">
+                    <div class="flex items-center gap-1">
+                      <input class="fld w-16 px-2 py-1 text-xs" v-model="r.limitDraft" placeholder="不限" aria-label="提取次数上限" title="填 0 或留空 = 清除上限">
+                      <button class="btn-sm" :disabled="myShareBusy===myShareKey(r)" title="保存上限" @click="saveMyShareLimit(r)"><i class="ti ti-check"></i></button>
+                    </div>
+                  </td>
+                  <td class="px-2 py-2 text-right">
+                    <div class="flex shrink-0 justify-end gap-1">
+                      <button class="btn-icon always" title="复制分享链接" @click="copyShareUrl(r)"><i class="ti ti-copy"></i></button>
+                      <button class="btn-icon always danger" :disabled="myShareBusy===myShareKey(r)" title="取消这条分享（链接立即失效）" @click="delMyShare(r)"><i class="ti ti-trash"></i></button>
+                    </div>
+                  </td>
+                </tr>
+                <tr v-if="!mySharesView.length"><td colspan="6" class="px-3 py-8 text-center text-base-content/40">{{myShareLoading ? '读取中…' : '没有符合条件的分享'}}</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="rounded-xl border border-base-content/10 bg-base-content/5 p-3 text-xs leading-relaxed text-base-content/65">
+            <b class="text-base-content/80">上限</b>填的是「被转存次数」（restore_count）。开启总开关后，后台每 5 分钟巡检一次，达标即自动取消链接并记在下方；关闭总开关时上限只记录、不执行。取消分享只让链接失效，云端文件不受影响。
+          </div>
+
+          <div v-if="myShareLog.length" class="flex flex-col gap-1">
+            <span class="text-xs font-semibold text-base-content/50">最近自动取消</span>
+            <div v-for="(l,i) in myShareLog.slice(0,5)" :key="'msl-'+i" class="flex items-center gap-2 rounded-lg border border-base-content/8 px-3 py-1.5 text-[11px]">
+              <i class="ti" :class="l.ok ? 'ti-circle-check text-success' : 'ti-alert-triangle text-error'"></i>
+              <span class="tabular-nums text-base-content/45">{{l.at}}</span>
+              <span class="min-w-0 flex-1 truncate" :title="l.title || l.shareId">{{l.manual ? '手动取消' : (l.title || l.shareId)}}</span>
+              <span class="tabular-nums text-base-content/50">{{l.limit ? (l.restores + '/' + l.limit + ' 次') : l.remote}}</span>
+            </div>
+          </div>
+        </div>
+        <div class="flex shrink-0 items-center justify-end gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <span class="mr-auto text-xs text-base-content/40">列表读取有 60 秒缓存，点刷新可强制重取</span>
+          <button class="btn-sm primary" @click="closeMyShares">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 外部分享链接转存弹窗（v3.41：解析 → 透视 → 勾选 → 服务端转存）══ -->
+    <div v-if="shareOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeShareSave"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-link text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">分享链接转存</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeShareSave" aria-label="关闭"><i class="ti ti-x"></i></button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <div class="flex flex-col gap-2">
+            <span class="text-xs font-semibold text-base-content/50">① 粘贴分享链接</span>
+            <textarea class="fld min-h-[4.5rem] w-full resize-y px-3 py-2 text-sm" v-model="shareForm.text"
+                      placeholder="https://mypikpak.com/s/xxxx?pwd=abcd&#10;也可以直接贴「链接 https://... 提取码：abcd」整段文字"></textarea>
+            <div class="flex flex-wrap items-center gap-2">
+              <input class="fld w-32" v-model="shareForm.passCode" placeholder="提取码（可留空）" aria-label="提取码">
+              <select class="fld w-44" v-model="shareForm.remote" aria-label="查看/转存用的账号">
+                <option v-for="r in pikpakRemotes" :key="'sp-'+r" :value="r">{{r}}</option>
+              </select>
+              <button class="btn-sm primary" :disabled="shareBusy || !shareForm.text.trim()" @click="parseShare()">
+                <i class="ti" :class="shareBusy ? 'ti-loader-2 animate-spin' : 'ti-search'"></i>{{shareBusy ? '处理中…' : '解析链接'}}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="shareErr" class="flex items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-xs text-error">
+            <i class="ti ti-alert-triangle mt-0.5"></i><div class="leading-relaxed">{{shareErr}}</div>
+          </div>
+
+          <template v-if="shareInfo">
+            <div class="flex flex-col gap-2">
+              <span class="text-xs font-semibold text-base-content/50">② 预览并勾选要保存的内容</span>
+              <div class="flex flex-wrap items-center gap-2 rounded-lg border border-base-content/10 bg-base-content/5 px-3 py-2 text-xs">
+                <i class="ti ti-link text-info"></i>
+                <span class="min-w-0 flex-1 truncate font-medium" :title="shareInfo.title || shareInfo.shareId">{{shareInfo.title || shareInfo.shareId}}</span>
+                <span class="badge-pill bg-base-content/8 text-base-content/60">{{shareItems.length}} 项</span>
+                <span class="text-base-content/45">已选 {{sharePicked.length}}</span>
+              </div>
+              <div class="flex flex-wrap items-center gap-1 text-xs text-base-content/50">
+                <button class="crumb-link" @click="jumpShareCrumb(-1)">分享根目录</button>
+                <template v-for="(c,i) in sharePath" :key="i">
+                  <span class="text-base-content/30">/</span><button class="crumb-link" @click="jumpShareCrumb(i)">{{c.name}}</button>
+                </template>
+              </div>
+              <div class="max-h-64 overflow-y-auto rounded-xl border border-base-content/10">
+                <div class="flex items-center gap-2 border-b border-base-content/10 px-3 py-1.5 text-[0.6875rem] font-semibold uppercase tracking-[0.05em] text-base-content/40">
+                  <input type="checkbox" class="checkbox checkbox-xs checkbox-primary"
+                         :checked="shareItems.length > 0 && sharePicked.length === shareItems.length"
+                         @change="toggleShareAll($event.target.checked)" title="全选 / 取消本层">
+                  <span>名称</span><span class="ml-auto">大小</span>
+                </div>
+                <div v-for="it in shareItems" :key="'si-'+it.id" class="flex items-center gap-2 border-b border-base-content/5 px-3 py-1.5 last:border-0 hover:bg-base-content/8">
+                  <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="it.id" v-model="sharePicked">
+                  <i class="ti shrink-0 text-base leading-none" :class="it.isdir ? 'ti-folder text-warning/70' : 'ti-file text-base-content/40'"></i>
+                  <button v-if="it.isdir" class="min-w-0 flex-1 truncate text-left text-sm text-info" :title="it.name + '（点击进入）'" @click="enterShareFolder(it)">{{it.name}}</button>
+                  <span v-else class="min-w-0 flex-1 truncate text-sm" :title="it.name">{{it.name}}</span>
+                  <span class="shrink-0 text-xs tabular-nums text-base-content/45">{{it.isdir ? '文件夹' : fmt(it.size)}}</span>
+                </div>
+                <div v-if="!shareItems.length" class="py-6 text-center text-xs text-base-content/40">这一层没有内容</div>
+              </div>
+              <div v-if="shareNextToken" class="text-[11px] text-warning">本层还有更多条目，当前只显示前 200 项</div>
+            </div>
+
+            <div class="flex flex-col gap-2">
+              <span class="text-xs font-semibold text-base-content/50">③ 保存到</span>
+              <div class="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-2 text-sm">
+                <span class="text-base-content/50">目标账号</span>
+                <select class="fld" v-model="shareForm.remote" aria-label="目标账号">
+                  <option v-for="r in pikpakRemotes" :key="'sd-'+r" :value="r">{{r}}</option>
+                </select>
+                <span class="text-base-content/50">目标目录</span>
+                <input class="fld" v-model="shareForm.dstPath" placeholder="留空 = 该账号根目录，可写多层如 电影/2026">
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-base-content/10 bg-base-content/5 p-3 text-xs leading-relaxed text-base-content/70">
+              <div class="mb-1 flex items-center gap-1.5 font-semibold text-base-content/80"><i class="ti ti-bolt text-success"></i>服务端转存 · 不消耗下载配额</div>
+              解析与预览都是只读的；点「开始转存」后由 PikPak 服务端直接把勾选内容存进目标账号，再自动归位到上面填的目录。全程不过 NAS、不占每天 20GB 下行流量；目标已有同名内容时 PikPak 会自动改名，不会覆盖。
+            </div>
+          </template>
+        </div>
+        <div class="flex shrink-0 items-center justify-end gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <span class="mr-auto text-xs text-base-content/40">分享链接与提取码只用于本次解析</span>
+          <button class="btn-sm" @click="closeShareSave">取消</button>
+          <button class="btn-sm primary" :disabled="shareBusy || !shareInfo || !sharePicked.length" @click="startShareSave">
+            <i class="ti" :class="shareBusy ? 'ti-loader-2 animate-spin' : 'ti-link'"></i>{{shareBusy ? '提交中…' : '开始转存'}}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 跨账号转移弹窗（v3.34：原生转存，不过 NAS、不吃下载配额）══ -->
+    <div v-if="xferOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeXfer"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-switch-horizontal text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">跨账号转移</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeXfer" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <div class="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-3 text-sm">
+            <span class="text-base-content/50">源</span>
+            <div class="flex min-w-0 flex-col gap-1.5">
+              <div class="flex min-w-0 items-center gap-2">
+                <span class="badge-pill shrink-0" :class="!xferChosen.length ? 'bg-base-content/8 text-base-content/50' : (xferChosen.length===1 && xferChosen[0].isFile ? 'bg-info/15 text-info' : 'bg-base-content/8 text-base-content/60')">{{!xferChosen.length ? '待选择' : (xferChosen.length===1 ? (xferChosen[0].isFile ? '单文件' : '文件夹') : xferChosen.length + ' 项')}}</span>
+                <div class="min-w-0 flex-1 truncate font-medium tabular-nums" :title="xferSrcLabel">{{xferSrcLabel}}</div>
+              </div>
+              <!-- v3.46：根目录 / 未勾选时，弹窗内多选清单（可一次选多个文件夹 / 文件） -->
+              <div v-if="xferNeedPick" class="max-h-44 min-w-0 overflow-y-auto rounded-lg border border-base-content/10 bg-base-content/5 p-1.5">
+                <div v-if="!xferSources.length" class="px-2 py-3 text-center text-xs text-base-content/40">当前目录没有可转移的文件夹或文件</div>
+                <label v-for="s in xferSources" :key="'xp-'+s.key" class="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-base-content/8">
+                  <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="s.key" v-model="xferPickSet" />
+                  <i class="ti" :class="s.isFile ? 'ti-file' : 'ti-folder'"></i>
+                  <span class="min-w-0 truncate">{{s.name}}</span>
+                </label>
+              </div>
+              <span class="text-[11px] leading-relaxed text-base-content/45">
+                <template v-if="xferNeedPick">可多选：勾选多个文件夹 / 文件，会逐个建成独立任务。根目录不能整体转移。</template>
+                <template v-else-if="xferChosen.length > 1">已按主列表勾选 {{xferChosen.length}} 项，将逐个转移成独立任务。</template>
+                <template v-else>也可先在列表里勾选多个文件夹 / 文件，再点「跨账号转移」批量提交。</template>
+              </span>
+            </div>
+            <span class="text-base-content/50">目标账号</span>
+            <select class="fld" v-model="xferForm.dstRemote" aria-label="目标账号">
+              <option v-for="r in xferDstRemotes" :key="'xf-'+r" :value="r">{{r === xferForm.srcRemote ? r + '（同账号 · 仅换目录）' : r}}</option>
+            </select>
+            <span class="text-base-content/50">目标目录</span>
+            <input class="fld" v-model="xferForm.dstPath" placeholder="留空 = 根目录，可写多层如 电影/2026" />
+          </div>
+
+          <div class="flex flex-col gap-2">
+            <span class="text-xs font-semibold text-base-content/50">方式</span>
+            <div class="seg w-fit">
+              <button class="seg-btn" :class="{on:xferForm.mode==='copy'}" @click="xferForm.mode='copy'">保留源 · 复制</button>
+              <button class="seg-btn" :class="{on:xferForm.mode==='move'}" @click="xferForm.mode='move'">搬完删源 · 移动</button>
+            </div>
+          </div>
+
+          <div class="rounded-xl border border-base-content/10 bg-base-content/5 p-3 text-xs leading-relaxed text-base-content/70">
+            <div class="mb-1 flex items-center gap-1.5 font-semibold text-base-content/80"><i class="ti ti-bolt text-success"></i>原生转存 · 不消耗下载配额</div>
+            源账号建一个 1 天有效的加密分享，目标账号直接把它转存进自己的网盘，全程在 PikPak 服务端完成：不过 NAS、不吃每天 20GB 的下载流量，大文件夹或单个大文件都是秒级。转存后会自动搬到上面填的目标目录，分享链接用完即删。
+          </div>
+
+          <label class="flex items-center gap-2 text-xs text-base-content/60">
+            <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" v-model="xferForm.proxy" />
+            接口走 mihomo 代理（直连被 PikPak 拦时仍可用）
+          </label>
+
+          <div v-if="xferErr" class="flex items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-xs text-error">
+            <i class="ti ti-alert-triangle mt-0.5"></i><div class="leading-relaxed">{{xferErr}}</div>
+          </div>
+        </div>
+        <div class="flex shrink-0 items-center justify-end gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <button class="btn-sm" @click="closeXfer">取消</button>
+          <button class="btn-sm primary" :disabled="xferBusy || !xferChosen.length" @click="startXfer">
+            <i class="ti" :class="xferBusy?'ti-loader-2 animate-spin':'ti-switch-horizontal'"></i>{{xferBusy ? ('正在提交' + (xferProg ? ' ' + xferProg : '') + '…') : (xferChosen.length > 1 ? ('开始转移（' + xferChosen.length + ' 项）') : '开始转移')}}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 任务详情弹窗（§11.8：纯色遮罩 · rounded-2xl 壳 · 三段式）══ -->
+    <div v-if="detailOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeDetail"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <!-- 头 -->
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-folder text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">{{ detailTitle }}</span>
+          <span v-if="detailJob" class="badge-pill" :class="'b-'+detailJob.state">{{stateLabel[detailJob.state]}}</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeDetail" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+        <!-- 体 -->
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <div v-if="detailLoading && !detail" class="empty-state py-10"><i class="ti ti-loader-2 animate-spin text-2xl"></i>加载中…</div>
+          <template v-else-if="detail">
+            <div v-if="detail.job.error" class="flex items-start gap-2.5 rounded-xl border border-error/30 bg-error/10 px-4 py-3 text-sm text-error">
+              <i class="ti ti-alert-triangle mt-0.5"></i><div>{{detail.job.error}}</div>
+            </div>
+            <div v-if="detail.job.state==='running'" class="flex flex-col gap-1.5">
+              <div class="h-1.5 overflow-hidden rounded-full bg-base-300">
+                <div class="h-full rounded-full bg-info transition-[width] duration-500" :style="{width:(detail.job.total>0?Math.min(100,detail.job.bytes/detail.job.total*100):0)+'%'}"></div>
+              </div>
+              <div class="text-xs tabular-nums text-base-content/60">
+                {{detail.job.total>0?(detail.job.bytes/detail.job.total*100).toFixed(1):0}}% · {{fmt(detail.job.bytes)}} / {{detail.job.total>0?fmt(detail.job.total):'--'}} · {{fmtSpeed(detail.job.speed)}}
+              </div>
+            </div>
+            <div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+              <span class="text-base-content/40">来源</span><span class="truncate tabular-nums" :title="detail.job.src">{{detail.job.src}}</span>
+              <span class="text-base-content/40">目标</span><span class="truncate tabular-nums" :title="detail.job.dest">{{detail.job.dest}}</span>
+              <span class="text-base-content/40">模式</span><span v-if="detail.job.method==='externalshare'">分享转存 · 已选 {{detail.job.srcCount || 0}} 项，服务端转存后归位，不经过 NAS</span>
+              <span v-else-if="detail.job.kind==='xfer'">{{detail.job.mode==='move' ? ('移动 · 转存成功后删除源' + (detail.job.single_file?'文件':'文件夹')) : ('复制 · 源' + (detail.job.single_file?'文件':'文件夹') + '保留')}}</span>
+              <span v-else>{{detail.job.mode==='move'?'move · 下完删云端':'copy · 保留云端'}}</span>
+              <span class="text-base-content/40">下载路径</span><span v-if="detail.job.method==='externalshare'">PikPak 服务端原生转存（不消耗下载配额）</span>
+              <span v-else>{{detail.job.proxy ? '经 mihomo 代理（独立守护进程 5573）' : '直连（主守护进程 5572）'}}</span>
+              <span class="text-base-content/40">开始</span><span class="tabular-nums">{{detail.job.started}}</span>
+            </div>
+            <div v-if="detail.job.state==='running'">
+              <div class="mb-1 flex items-center gap-2 text-sm font-medium text-base-content/80">
+                <i class="ti ti-transfer text-info"></i>正在传输（{{detail.transferring.length}}）
+              </div>
+              <div v-for="(t,i) in detail.transferring" :key="i" class="flex items-center gap-3 border-t border-base-content/8 py-2 text-xs first:border-t-0">
+                <span class="min-w-0 flex-1 truncate" :title="t.name">{{t.name}}</span>
+                <span class="shrink-0 tabular-nums text-base-content/60">{{fmt(t.bytes)}} / {{t.total>0?fmt(t.total):'--'}}</span>
+                <span class="w-20 shrink-0 text-right font-semibold tabular-nums text-info">{{fmtSpeed(t.speed)}}</span>
+              </div>
+              <div v-if="!detail.transferring.length" class="py-2 text-xs text-base-content/40">暂无进行中的文件传输</div>
+            </div>
+            <div v-if="detail.job.state==='done' || detail.exists">
+              <div class="mb-1 flex flex-wrap items-center gap-2 text-sm font-medium text-base-content/80">
+                <i class="ti ti-folder text-secondary"></i>磁盘文件
+                <span v-if="detail.exists" class="rounded-full bg-secondary/10 px-2 py-0.5 text-xs font-semibold tabular-nums text-secondary">{{detail.diskCount}}{{detail.truncated?'+':''}} 个 · {{fmt(detail.diskTotal)}}</span>
+                <button class="btn-sm ml-auto" title="跳到「本地文件」页直接查看这个任务的下载目录" @click="gotoLocalFromDetail"><i class="ti ti-folder-open"></i>查看本地文件</button>
+              </div>
+              <div v-if="detail.exists" class="max-h-60 overflow-y-auto">
+                <div v-for="(f,i) in detail.files" :key="i" class="flex items-center gap-3 border-t border-base-content/8 py-2 text-xs first:border-t-0">
+                  <span class="min-w-0 flex-1 truncate" :title="f.path">{{f.path}}</span>
+                  <span class="shrink-0 tabular-nums text-base-content/60">{{fmt(f.size)}}</span>
+                </div>
+                <div v-if="detail.truncated" class="py-2 text-center text-xs text-base-content/40">文件较多，仅显示前 1000 个（按大小排序）</div>
+              </div>
+              <div v-else class="py-3 text-xs text-base-content/40">{{detail.job.cleaned ? '文件已清理' : '目标目录不存在（可能已被移动或删除）'}}</div>
+            </div>
+          </template>
+        </div>
+        <!-- 脚 -->
+        <div class="flex shrink-0 items-center justify-end gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <button v-if="detail && detail.job && detail.job.remote!=='URL' && detail.job.state!=='done' && detail.job.kind!=='xfer'" class="btn-sm" title="停掉当前任务并换一条下载路径重新下载" @click="reproxyJob(detail.job.id, !detail.job.proxy)"><i class="ti ti-refresh"></i>{{detail.job.proxy ? '切换为直连重试' : '切换为代理重试'}}</button>
+          <button v-if="detail && detail.job && detail.job.remote && detail.job.kind!=='xfer'" class="btn-sm primary" @click="openVerifyFromJob(detail.job)"><i class="ti ti-shield-check"></i>与云端校验</button>
+          <button v-if="detail && detail.exists && !detail.job.cleaned" class="btn-sm danger" @click="cleanupJob(detail.job.dest)"><i class="ti ti-eraser"></i>清理文件</button>
+          <button class="btn-sm" @click="closeDetail">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 导入 / 采集 Token 弹窗 ══ -->
+    <div v-if="importOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeTokenImport"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-cloud-download text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">{{relinkTarget ? '重新登录 · 采集新 Token' : '导入 PikPak Token'}}</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeTokenImport" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+
+        <div class="flex shrink-0 gap-1 border-b border-base-content/10 px-4 pt-3">
+          <button v-for="t in importTabs" :key="t.id" class="press-tactile rounded-t-lg px-4 py-2 text-sm"
+                  :class="importTab===t.id ? 'bg-base-100 font-semibold text-primary' : 'text-base-content/60'"
+                  @click="importTab=t.id">{{t.label}}</button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <!-- v3.38 定向重登：从失效账号的「重新登录」按钮进来，明确告诉用户登哪个号 -->
+          <div v-if="relinkTarget" class="rounded-xl border border-warning/30 bg-warning/8 px-4 py-3 text-xs leading-relaxed text-base-content/75">
+            <div class="flex flex-wrap items-center gap-2">
+              <i class="ti ti-alert-triangle text-warning"></i>
+              <b>正在为「{{relinkTarget.name}}」重新采集凭证</b>
+              <span v-if="relinkTarget.email" class="rounded bg-base-300 px-1.5 py-0.5 font-mono">{{relinkTarget.email}}</span>
+              <button v-if="relinkTarget.email" class="btn-sm" @click="copyRelinkEmail"><i class="ti ti-copy"></i>复制邮箱</button>
+              <button class="btn-sm ml-auto" @click="relinkTarget=null">取消定向</button>
+            </div>
+            <div class="mt-2">
+              这个 refresh_token 已被别处刷新或已失效，<b>服务端重试救不回来</b>，必须在浏览器里重新登录拿一份新的。
+              已为你打开 PikPak 登录页（没弹出就点上方的「打开登录页」），请登录<b>同一个账号</b>，再用书签 / 采集器 / 粘贴新 token 任一种方式采集；
+              控制台会按 PikPak 身份<b>自动覆盖这个账号</b>，不用删除重建，也不会动其它账号；若登录成了别的账号，后端会拒绝写入。
+            </div>
+          </div>
+          <!-- ① 书签一键导入（推荐） -->
+          <div v-if="importTab==='login'" class="flex flex-col gap-3">
+            <div class="rounded-xl border border-info/25 bg-info/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
+              <b>零脚本、零浏览器控制</b>：把下面这个按钮<b>拖到书签栏</b>（只做一次）。以后在
+              <code class="rounded bg-base-300 px-1">https://mypikpak.com/drive/login</code> 登录完点一下书签，
+              它读取<b>当前 PikPak 页面</b>的登录态，打开一个小窗口把凭证送回控制台自动导入。
+              <b>不扫描你其他浏览器的数据</b>，也不用下载或运行任何 .bat。
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <a class="btn-primary btn-press w-fit select-none" :href="bmHref()"
+                 @click.prevent="bmHint" draggable="true"
+                 title="按住拖到浏览器书签栏；不要在控制台页面点击它">
+                <i class="ti ti-bookmark-plus"></i>拖我到书签栏 · PikPak 一键导入
+              </a>
+              <button class="btn-sm" @click="openPikPakLogin" title="直接在浏览器新标签打开 PikPak 登录页">
+                <i class="ti ti-external-link"></i>打开登录页
+              </button>
+            </div>
+            <ol class="ml-1 list-decimal space-y-1.5 pl-4 text-xs leading-relaxed text-base-content/70">
+              <li>显示书签栏（<b>Ctrl + Shift + B</b>），把上面这个按钮<b>拖进去</b>，名字随意；</li>
+              <li>点「打开登录页」，在新的标签页里手动登录 PikPak（验证码 / 二次验证都能正常过）；</li>
+              <li>登录完成、看到网盘内容后，在<b>同一个标签页</b>点刚拖进去的书签；</li>
+              <li>弹出的小窗口显示「✓ 成功写入 N 个账号」后会自动关闭，控制台账号列表同步自动刷新。</li>
+            </ol>
+            <div class="rounded-xl border border-base-content/10 bg-base-200/60 px-4 py-3 text-xs leading-relaxed text-base-content/60">
+              <b>为什么这样可以</b>：浏览器同源策略禁止控制台读取 PikPak 页面，但书签脚本是
+              <b>在 PikPak 页面里</b>运行的，能读该站点的 localStorage / sessionStorage / cookie / IndexedDB；
+              它把凭证放进新窗口 URL 的 <code class="rounded bg-base-300 px-1">#fragment</code>
+              （fragment 不会发送到任何服务器，打开后立刻抹掉），再由控制台同源的小窗口调
+              <code class="rounded bg-base-300 px-1">acctimport</code> 完成换发、实测、按
+              <code class="rounded bg-base-300 px-1">sub</code> 对号。已存在的账号更新，新账号自动新建。
+              <br>没抓到凭证时，PikPak 页面右上角会给出诊断与可见的存储键名；也可改用「粘贴导入」或「② 采集器」。
+              <br><b>换 NAS 地址 / 端口后需重新拖一次书签</b>（书签里固化了当前控制台地址）。
+            </div>
+          </div>
+
+          <!-- ② 采集器：干净浏览器登录脚本（打开全新浏览器、实时读取 token） -->
+          <div v-else-if="importTab==='kit'" class="flex flex-col gap-3">
+            <div class="rounded-xl border border-info/25 bg-info/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
+              下载一次性助手，它会<b>打开一个全新的独立浏览器窗口</b>，让你手动登录 PikPak；
+              登录成功后<b>实时读取该窗口的登录态</b>、采集 refresh_token 并直接推给 NAS，
+              <b>不读取你现有浏览器的任何数据</b>；结束时自动关闭浏览器并删除临时目录。
+              登录页固定为 <code class="rounded bg-base-300 px-1">https://mypikpak.com/drive/login</code>，
+              <b>不是</b>根路径的介绍页（介绍页不会写入登录态）。
+            </div>
+            <a class="btn-primary btn-press w-fit" href="/login-collector.bat" download>
+              <i class="ti ti-download"></i>下载登录采集器（PikPak-Clean-Login.bat）
+            </a>
+            <ol class="ml-1 list-decimal space-y-1.5 pl-4 text-xs leading-relaxed text-base-content/70">
+              <li>在任意一台 Windows 电脑上下载并双击运行（若弹「已保护你的电脑」→ 更多信息 → 仍要运行）；</li>
+              <li>会自动打开一个干净的浏览器窗口，在里面手动登录 PikPak，验证码 / 二次验证都能正常过；</li>
+              <li>看到「✓ 已采集并写入」即成功；要加下一个账号，就在该窗口退出后重新登录；</li>
+              <li>按 <b>Q</b> 结束后，助手会<b>先关闭浏览器再补扫一次</b>，请勿直接关掉黑色窗口；完成后回来点「刷新」。</li>
+              <li>若显示「0 写入」，临时目录与 <code class="rounded bg-base-300 px-1">%TEMP%\pikpak-collect-log.txt</code> 会保留用于排查。</li>
+            </ol>
+            <div class="rounded-xl border border-base-content/10 bg-base-200/60 px-4 py-3 text-xs leading-relaxed text-base-content/60">
+              服务端沿用现有 <code class="rounded bg-base-300 px-1">acctimport</code>：自动换发 token、实测连接，
+              并按 PikPak 的 <code class="rounded bg-base-300 px-1">sub</code> 对号。
+              已存在的账号会被更新，新账号自动新建；一次可连续登录多个账号。
+            </div>
+          </div>
+
+          <!-- ③ 粘贴导入 -->
+          <div v-else class="flex flex-col gap-3">
+            <div class="text-xs leading-relaxed text-base-content/60">
+              每行一条，格式：<code class="rounded bg-base-300 px-1">账号名 + 空格 + refresh_token</code>
+              （也可以只贴 token，靠身份自动对号）。支持直接粘贴导出的 JSON。
+              <b>下面的账号名与 token 均为示例，请替换成你自己的。</b>
+            </div>
+            <textarea class="textarea textarea-bordered h-48 w-full font-mono text-xs" spellcheck="false"
+                      v-model="importText" placeholder="my-pikpak-1   os.EXAMPLE_TOKEN_A_REPLACE_ME
+my-pikpak-2   os.EXAMPLE_TOKEN_B_REPLACE_ME
+os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
+            <div v-if="relinkTarget" class="rounded-xl border border-info/25 bg-info/8 px-3 py-2 text-xs leading-relaxed text-base-content/70">
+              定向重登模式：只贴那一长串新的 <code class="rounded bg-base-300 px-1">refresh_token</code> 即可，服务端会归到「{{relinkTarget.name}}」并现场换发、实测连接；<b>不会新建账号</b>。
+            </div>
+            <label v-else class="flex items-start gap-2 text-xs leading-relaxed text-base-content/70">
+              <input type="checkbox" class="checkbox checkbox-sm checkbox-primary mt-0.5" v-model="importCreate">
+              <span>对不上号的自动新建账号（关闭时只更新已有账号，未匹配的会被跳过）</span>
+            </label>
+            <div class="flex items-center gap-2">
+              <button class="btn-primary btn-press" :disabled="importing || !importText.trim()" @click="doImportText">
+                <i class="ti" :class="importing ? 'ti-loader-2 animate-spin' : 'ti-upload'"></i>{{importing ? '导入中…' : '开始导入'}}
+              </button>
+              <span class="text-xs text-base-content/50">导入时服务端会现场换发 token 并实测连接，8 个账号约需 10-30 秒</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex shrink-0 items-center justify-between gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <span class="text-xs text-base-content/40">{{relinkTarget ? '重新登录后采集一次即可恢复，账号名与云端文件都不变' : '刷新页面不影响：token 都存 NAS 上'}}</span>
+          <button class="btn-sm" @click="closeTokenImport">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 编辑账号弹窗 ══ -->
+    <div v-if="acctEditOpen && acctEditForm" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeAcctEdit"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-key text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">编辑账号 · {{acctEditForm.name}}</span>
+          <span class="badge-pill bg-base-content/8 text-base-content/60">{{acctEditForm.type}}</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeAcctEdit" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <div class="rounded-xl border border-info/25 bg-info/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
+            留空 = 保持不变。本页不会回显已有的 refresh_token / 密码，只需粘贴新值即可。保存后<b>不会自动验证</b>，请自行点该行的「测试」。
+          </div>
+          <div v-if="acctEditForm.type==='pikpak'" class="flex items-start gap-3 rounded-xl border border-base-content/10 bg-base-200/60 px-4 py-3">
+            <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+              <i class="ti ti-mail text-lg leading-none"></i>
+            </div>
+            <div class="min-w-0 flex-1">
+              <div class="truncate text-sm font-semibold" :title="acctEditForm.name">{{acctEditForm.name}}</div>
+              <div v-if="acctEditForm.email" class="mt-0.5 break-all text-xs leading-snug text-base-content/60">{{acctEditForm.email}}</div>
+              <div v-else class="mt-0.5 text-xs leading-snug text-base-content/40">未记录登录邮箱（⋯ → 识别身份 可补录）</div>
+            </div>
+            <span class="badge-pill mt-0.5 shrink-0 bg-base-content/8 text-base-content/60">登录邮箱 · 只读</span>
+          </div>
+          <div class="flex flex-col gap-1.5">
+            <label class="text-xs font-medium text-base-content/70">账号名（可修改）</label>
+            <input class="fld w-full" type="text" autocomplete="off" spellcheck="false" maxlength="64"
+                   v-model.trim="acctEditForm.newName">
+            <span class="text-xs text-base-content/40">原名：{{acctEditForm.name}}｜改名会同步更新身份记录与历史任务引用</span>
+          </div>
+          <div v-for="f in acctEditForm.fields" :key="f.name" class="flex flex-col gap-1.5">
+            <label class="text-xs font-medium text-base-content/70">{{f.label}}</label>
+            <input class="fld w-full" :type="f.secret ? 'password' : 'text'" autocomplete="off" spellcheck="false"
+                   v-model.trim="acctEditForm.values[f.name]" :placeholder="f.has ? '已设置，留空保持不变' : '未设置'">
+            <span v-if="f.has" class="text-xs tabular-nums text-base-content/40">当前：{{f.masked}}</span>
+            <span v-if="f.name==='username' && acctEditForm.type==='pikpak'" class="text-xs leading-relaxed text-base-content/40">这是 rclone 直登用的账号字段；上方显示的是该 PikPak 账号的登录邮箱（身份记录，只读）</span>
+          </div>
+          <label v-if="acctEditForm.type==='pikpak'" class="flex items-start gap-2 text-xs leading-relaxed text-base-content/70">
+            <input type="checkbox" class="checkbox checkbox-sm checkbox-primary mt-0.5" v-model="acctEditForm.clearToken">
+            <span>保存时立即用新 refresh_token 换发 access_token（推荐，会自动实测一次连接）。rclone 的 pikpak 后端不认 refresh_token 字段，只认 OAuth token，所以这一步必须做；换发成功后旧 token 会轮换失效。</span>
+          </label>
+        </div>
+        <div class="flex shrink-0 items-center justify-end gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <button class="btn-sm" @click="closeAcctEdit">取消</button>
+          <button v-if="acctEditForm.type==='pikpak'" class="btn-sm" :disabled="acctEditSaving"
+                  title="不改任何字段，直接用当前 refresh_token 重新换发 access_token 并实测连接"
+                  @click="saveAcctEdit(true)">
+            <i class="ti ti-refresh"></i>仅重新换发 token
+          </button>
+          <button class="btn-primary btn-press" :disabled="acctEditSaving" @click="saveAcctEdit(false)">
+            <i class="ti" :class="acctEditSaving ? 'ti-loader-2 animate-spin' : 'ti-device-floppy'"></i>{{acctEditSaving ? '保存中…' : '保存'}}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 一致性校验弹窗（v3.16）：云盘 ↔ 落盘目录/单文件 ══ -->
+    <div v-if="verifyOpen" class="fixed inset-0 z-[95] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeVerify"></div>
+      <div class="pop-in relative flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-shield-check text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">一致性校验</span>
+          <span class="hidden text-xs text-base-content/50 sm:inline">云盘 ↔ /vol2/download · 全程只读</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeVerify" aria-label="关闭"><i class="ti ti-x"></i></button>
+        </div>
+
+        <div class="vf-body flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <div class="grid gap-3 sm:grid-cols-2">
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="font-medium text-base-content/60">云端账号</span>
+              <select class="fld w-full" v-model="verifyForm.remote">
+                <option v-for="r in remotes" :key="r" :value="r">{{r}}</option>
+              </select>
+            </label>
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="font-medium text-base-content/60">从下载任务导入（自动填下面两格）</span>
+              <select class="fld w-full" v-model="verifyJobId" @change="applyVerifyJob">
+                <option value="">— 手动填写 —</option>
+                <option v-for="j in verifyJobs" :key="j.id" :value="j.id">{{j.remote}} · {{j.subpath || '根目录'}} → {{destToLocal(j.dest) || '下载根目录'}}</option>
+              </select>
+            </label>
+            <label class="flex flex-col gap-1 text-xs sm:col-span-2">
+              <span class="font-medium text-base-content/60">云端路径（相对账号根目录；留空＝根目录，也可直接填单个文件）</span>
+              <div class="flex flex-wrap gap-2">
+                <input class="fld min-w-0 flex-1" v-model.trim="verifyForm.cloudPath" placeholder="Pack From Shared/kz 或 …/0501.mp4">
+                <button class="btn-sm shrink-0" @click="useBrowsePath" title="填入云盘预览页当前目录"><i class="ti ti-folder-open"></i>用预览当前目录</button>
+              </div>
+            </label>
+            <label class="flex flex-col gap-1 text-xs sm:col-span-2">
+              <span class="font-medium text-base-content/60">本地路径（相对 /vol2/download；留空＝下载根目录，可填单个文件）</span>
+              <input class="fld w-full" v-model.trim="verifyForm.localPath" list="vf-local-dirs" placeholder="kz 或 kz/0501.mp4">
+              <datalist id="vf-local-dirs"><option v-for="d in localDirs" :key="d" :value="d"></option></datalist>
+            </label>
+            <label class="flex flex-col gap-1 text-xs">
+              <span class="font-medium text-base-content/60">校验档位</span>
+              <select class="fld w-full" v-model="verifyForm.mode">
+                <option value="quick">快速 · 清单 + 大小</option>
+                <option value="sample">抽样 · 内容字节比对</option>
+                <option value="full">完整 · SHA256 全量</option>
+              </select>
+            </label>
+            <label v-if="verifyForm.mode !== 'quick'" class="flex flex-col gap-1 text-xs">
+              <span class="font-medium text-base-content/60">内容核对文件数（最多 20；完整模式最多 5）</span>
+              <input class="fld w-full" type="number" min="1" max="20" v-model.number="verifyForm.limit">
+            </label>
+          </div>
+
+          <div class="rounded-xl border border-base-content/10 bg-base-300/40 px-3.5 py-2.5 text-xs leading-relaxed text-base-content/60">
+            <i class="ti ti-info-circle mr-1"></i>{{verifyModeHint}}。隐藏文件与传输临时文件（.part / .partial）不参与比较；若任务用了 move，云端源文件已被删除，会显示「云端已无」，属正常。
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <button class="btn-sm primary" :disabled="verifyBusy" @click="runVerify">
+              <i class="ti" :class="verifyBusy ? 'ti-loader-2 animate-spin' : 'ti-shield-check'"></i>{{verifyBusy ? '校验中…' : '开始校验'}}
+            </button>
+            <button v-if="verifyResult" class="btn-sm" @click="exportVerifyCsv"><i class="ti ti-file-export"></i>导出 CSV</button>
+            <span v-if="verifyResult" class="truncate text-xs tabular-nums text-base-content/50">耗时 {{verifyResult.elapsed}}s · {{verifyResult.cloudRoot}} ↔ {{verifyResult.localRoot}}</span>
+          </div>
+
+          <div v-if="verifyError" class="flex items-start gap-2.5 rounded-xl border border-error/30 bg-error/10 px-4 py-3 text-sm text-error">
+            <i class="ti ti-alert-triangle mt-0.5"></i><div>{{verifyError}}</div>
+          </div>
+          <div v-if="verifyBusy" class="card-p empty-state py-8">
+            <i class="ti ti-loader-2 animate-spin text-2xl"></i>正在列云端文件并比对，请稍候…
+          </div>
+
+          <template v-if="verifyResult">
+            <div class="flex flex-wrap items-center gap-2 rounded-xl border px-4 py-3 text-sm"
+                 :class="verifyResult.ok ? 'border-success/30 bg-success/10 text-success' : 'border-warning/30 bg-warning/10 text-warning'">
+              <i class="ti" :class="verifyResult.ok ? 'ti-circle-check' : 'ti-alert-triangle'"></i>
+              <span class="font-semibold">{{verifyResult.ok ? '完全一致：云端与本地文件一致' : '发现差异，详见下表'}}</span>
+              <span class="ml-auto text-xs tabular-nums text-base-content/60">云端 {{verifyResult.cloud.count}} 个 / {{fmt(verifyResult.cloud.bytes)}} · 本地 {{verifyResult.local.count}} 个 / {{fmt(verifyResult.local.bytes)}}</span>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+              <div v-for="s in ['match','missing','extra','size','content','unknown']" :key="s" class="card-p flex flex-col gap-0.5 px-3 py-2.5">
+                <span class="text-[11px] text-base-content/50">{{verifyLabels[s]}}</span>
+                <span class="text-xl font-bold tabular-nums" :class="'vf-text-'+s">{{verifyResult.summary[s]}}</span>
+              </div>
+            </div>
+
+            <div v-if="verifyResult.warnings.length" class="flex flex-col gap-1 rounded-xl border border-warning/25 bg-warning/8 px-3.5 py-2.5 text-xs text-warning">
+              <div v-for="(w,i) in verifyResult.warnings" :key="i"><i class="ti ti-alert-circle mr-1"></i>{{w}}</div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="text-sm font-medium text-base-content/80">文件明细（{{verifyItems.length}}）</span>
+              <select class="fld w-36" v-model="verifyFilter">
+                <option value="diff">仅差异</option>
+                <option value="all">全部</option>
+                <option value="match">仅一致</option>
+                <option value="missing">本地缺失</option>
+                <option value="extra">云端已无</option>
+                <option value="size">大小不符</option>
+                <option value="content">内容不符</option>
+                <option value="unknown">无法判定</option>
+              </select>
+              <span v-if="verifyResult.summary.deepChecked" class="text-xs text-base-content/50">已核对内容 {{verifyResult.summary.deepChecked}} 个 · 云端读取 {{fmt(verifyResult.summary.deepBytes)}}</span>
+              <span class="ml-auto text-xs text-base-content/40">共 {{verifyResult.items.length}} 条，最多显示 300 条</span>
+            </div>
+
+            <div class="card-p overflow-hidden p-0">
+              <div class="vf-row vf-head">
+                <span>状态</span><span>相对路径</span><span class="text-right">云端</span><span class="text-right vf-local">本地</span><span class="vf-note">说明</span>
+              </div>
+              <div v-for="it in verifyItems.slice(0,300)" :key="it.path" class="vf-row">
+                <span class="vf-pill" :class="'vf-'+it.status">{{verifyLabels[it.status] || it.status}}</span>
+                <span class="min-w-0 truncate text-xs" :title="it.path">{{it.path}}</span>
+                <span class="text-right text-xs tabular-nums" :title="it.cloudSize">{{fmt(it.cloudSize)}}</span>
+                <span class="vf-local text-right text-xs tabular-nums" :title="it.localSize">{{fmt(it.localSize)}}</span>
+                <span class="vf-note min-w-0 truncate text-xs text-base-content/50" :title="it.note">{{it.note}}</span>
+              </div>
+              <div v-if="!verifyItems.length" class="empty-state py-8"><i class="ti ti-circle-check"></i>这个筛选下没有文件</div>
+            </div>
+          </template>
+        </div>
+
+        <div class="flex shrink-0 items-center justify-end gap-2 border-t border-base-content/10 bg-base-200 px-5 py-3">
+          <button class="btn-sm" @click="closeVerify">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 下载过滤弹窗（v3.43：规则翻译成 rclone 的 _filter，随任务下发）══ -->
+    <div v-if="dlFilterOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="dlFilterOpen=false"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-filter text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">下载过滤</span>
+          <label class="flex shrink-0 items-center gap-2 text-xs text-base-content/60">
+            <input type="checkbox" class="toggle toggle-sm toggle-primary" v-model="dlFilterOn">
+            启用
+          </label>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="dlFilterOpen=false" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5" :class="dlFilterOn ? '' : 'opacity-60'">
+          <div class="rounded-xl border border-base-content/10 bg-base-content/5 p-3 text-xs leading-relaxed text-base-content/70">
+            规则会翻译成 rclone 的 <code class="rounded bg-base-content/10 px-1">--min-size / --max-size / --include / --exclude</code>
+            随任务一起下发，<b>只作用于这一次下载</b>：不下载的文件既不占磁盘，也不消耗云盘下行流量。
+            单个文件点「下载」时不受过滤影响（那是你明确要下的那一个）。
+          </div>
+
+          <label class="flex items-start gap-2.5 rounded-xl border border-base-content/10 px-3 py-2.5 text-sm">
+            <input type="checkbox" class="checkbox checkbox-sm checkbox-primary mt-0.5" v-model="dlFilter.skipEmpty" :disabled="!dlFilterOn">
+            <span class="flex-1">
+              跳过 0 字节文件
+              <span class="block text-[11px] leading-relaxed text-base-content/45">网盘里 0 字节的多为占位壳或断流留下的空文件，下载下来也是打不开的空壳。</span>
+            </span>
+          </label>
+
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <label class="flex flex-col gap-1.5 text-xs text-base-content/60">
+              最小大小
+              <input class="fld" v-model.trim="dlFilter.minSize" :disabled="!dlFilterOn"
+                     placeholder="如 100M（留空 = 不限）" aria-label="最小大小">
+            </label>
+            <label class="flex flex-col gap-1.5 text-xs text-base-content/60">
+              最大大小
+              <input class="fld" v-model.trim="dlFilter.maxSize" :disabled="!dlFilterOn"
+                     placeholder="如 20G（留空 = 不限）" aria-label="最大大小">
+            </label>
+            <label class="flex flex-col gap-1.5 text-xs text-base-content/60">
+              仅下载这些扩展名
+              <input class="fld" v-model.trim="dlFilter.incExt" :disabled="!dlFilterOn"
+                     placeholder="mkv, mp4, ass（留空 = 不限）" aria-label="仅包含扩展名">
+            </label>
+            <label class="flex flex-col gap-1.5 text-xs text-base-content/60">
+              排除这些扩展名
+              <input class="fld" v-model.trim="dlFilter.excExt" :disabled="!dlFilterOn"
+                     placeholder="nfo, txt, url" aria-label="排除扩展名">
+            </label>
+            <label class="flex flex-col gap-1.5 text-xs text-base-content/60 sm:col-span-2">
+              排除关键词（文件名包含即跳过，多个用逗号分隔）
+              <input class="fld" v-model.trim="dlFilter.excKw" :disabled="!dlFilterOn"
+                     placeholder="sample, 预告, 花絮, trailer" aria-label="排除关键词">
+            </label>
+          </div>
+
+          <!-- 预览：纯前端在本目录现算，不发请求 -->
+          <div class="rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-2.5 text-xs">
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <span class="font-medium text-base-content/70"><i class="ti ti-calculator text-info"></i> 当前目录预估</span>
+              <span class="tabular-nums">共 {{dirFiles.length}} 个文件</span>
+              <span class="tabular-nums text-success">会下载 {{dlFilterPreview.pass}} 个 · {{fmt(dlFilterPreview.bytes)}}</span>
+              <span class="tabular-nums text-warning">跳过 {{dlFilterPreview.skip}} 个</span>
+            </div>
+            <div v-if="dlFilterOn && dlFilterPreview.pass === 0 && dirFiles.length" class="mt-1 text-warning">
+              按这套规则本目录一个文件都不会下载，确认一下是不是写得太严。
+            </div>
+            <div class="mt-1 text-[11px] leading-relaxed text-base-content/45">
+              这是按<b>当前目录</b>估算的；文件夹内的子目录按同一套规则由 rclone 执行，实际数量可能更多。
+            </div>
+          </div>
+
+          <div class="text-[11px] leading-relaxed text-base-content/45">
+            大小单位支持 K / M / G / T（1024 进制），可写 1.5G。扩展名可写 mkv 或 *.mkv。
+          </div>
+        </div>
+
+        <div class="flex shrink-0 items-center gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <button class="btn-sm" @click="resetDlFilter"><i class="ti ti-rotate"></i>恢复默认</button>
+          <span class="flex-1"></span>
+          <button class="btn-sm" @click="dlFilterOpen=false">取消</button>
+          <button class="btn-sm primary" @click="saveDlFilter"><i class="ti ti-check"></i>保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 查重弹窗（v3.43：递归扫描后按同名 / 同大小分组，只读）══ -->
+    <div v-if="dupOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeDup"></div>
+      <div class="pop-in relative flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-copy-check text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">查重</span>
+          <span class="hidden truncate text-xs tabular-nums text-base-content/50 sm:inline" :title="curRemote + ':' + (curPath || '/')">{{curRemote}}:{{curPath || '/'}}</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeDup" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-5">
+          <div v-if="dupBusy" class="empty-state py-12">
+            <i class="ti ti-loader-2 animate-spin text-2xl"></i>
+            正在递归扫描（最多 6 层 / 6000 个文件）…
+          </div>
+          <div v-else-if="dupErr" class="flex items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+            <i class="ti ti-alert-triangle mt-0.5"></i>
+            <div class="flex-1 leading-relaxed">{{dupErr}}</div>
+            <button class="btn-sm" @click="runDupScan"><i class="ti ti-rotate"></i>重试</button>
+          </div>
+          <template v-else>
+            <div class="flex flex-wrap items-center gap-x-5 gap-y-1.5 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-2.5 text-xs tabular-nums">
+              <span class="text-base-content/60">已扫描 <b>{{dupResult.files}}</b> 个文件 · {{fmt(dupResult.bytes)}}</span>
+              <span class="text-success">完全重复 <b>{{dupResult.exact.length}}</b> 组</span>
+              <span class="text-info">同名不同大小 <b>{{dupResult.versions.length}}</b> 组</span>
+              <span class="text-warning">同大小不同名 <b>{{dupResult.sameSize.length}}</b> 组</span>
+              <span v-if="dupWaste" class="text-error">可回收 <b>{{fmt(dupWaste)}}</b></span>
+              <span v-if="dupScan && dupScan.truncated" class="text-warning">已截断到 6000 个文件</span>
+              <button class="btn-icon always ml-auto" title="重新扫描" @click="runDupScan"><i class="ti ti-refresh"></i></button>
+            </div>
+
+            <div class="seg w-fit">
+              <button class="seg-btn" :class="{on:dupTab==='exact'}" @click="dupTab='exact'">完全重复 {{dupResult.exact.length}}</button>
+              <button class="seg-btn" :class="{on:dupTab==='versions'}" @click="dupTab='versions'">同名不同大小 {{dupResult.versions.length}}</button>
+              <button class="seg-btn" :class="{on:dupTab==='samesize'}" @click="dupTab='samesize'">同大小不同名 {{dupResult.sameSize.length}}</button>
+            </div>
+
+            <div v-if="!dupGroups.length" class="empty-state py-10">
+              <i class="ti ti-discount-check"></i>{{dupTab==='exact' ? '没有完全重复的文件' : dupTab==='versions' ? '没有同名不同大小的文件' : '没有同大小的不同文件'}}
+            </div>
+            <div v-else class="flex flex-col gap-2">
+              <div v-for="(g,i) in dupGroups.slice(0, 60)" :key="dupTab+'-'+i" class="rounded-xl border border-base-content/10">
+                <div class="flex flex-wrap items-center gap-2 border-b border-base-content/10 px-3 py-2 text-xs">
+                  <span class="min-w-0 flex-1 truncate font-medium" :title="g.name">{{g.name}}</span>
+                  <span class="badge-pill bg-base-content/8 text-base-content/60">{{g.items.length}} 份</span>
+                  <span class="tabular-nums text-base-content/60">{{fmt(g.size)}}<span v-if="dupTab==='versions'" class="text-base-content/40">（按最大那份）</span></span>
+                </div>
+                <div class="flex flex-col divide-y divide-base-content/8">
+                  <div v-for="(f,j) in g.items" :key="j" class="flex items-center gap-2 px-3 py-1.5 text-[11px]">
+                    <span v-if="dupTab==='exact'" class="shrink-0" :class="j===0 ? 'text-success' : 'text-error'">{{j===0 ? '保留' : '重复'}}</span>
+                    <span class="min-w-0 flex-1 truncate tabular-nums text-base-content/70" :title="f.p">{{f.p}}</span>
+                    <span class="shrink-0 tabular-nums text-base-content/40">{{fmt(f.s)}}</span>
+                  </div>
+                </div>
+              </div>
+              <div v-if="dupGroups.length > 60" class="text-center text-xs text-base-content/45">
+                仅显示前 60 组（共 {{dupGroups.length}} 组），完整结果请导出 CSV
+              </div>
+            </div>
+            <div class="text-[11px] leading-relaxed text-base-content/45">
+              「完全重复」= 同名且同字节，通常是同一集被重复转存/下载；组内第一条标「保留」，其余可删。
+              清理请回云盘列表用「清理」模式逐项删除，本弹窗不会动任何文件。
+            </div>
+          </template>
+        </div>
+
+        <div class="flex shrink-0 items-center gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <button class="btn-sm" :disabled="dupBusy || !dupResult.files" @click="exportDupCsv"><i class="ti ti-file-spreadsheet"></i>导出报告 CSV</button>
+          <span class="flex-1"></span>
+          <button class="btn-sm" @click="closeDup">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 批量重命名（v3.44：模板 / 正则 / 序号，先预览后执行；v3.52：本地执行后保持窗口）══ -->
+    <div v-if="renameOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeRename"></div>
+      <div class="pop-in relative flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-abc text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">批量重命名</span>
+          <span class="badge-pill shrink-0 bg-primary/10 text-primary">{{renameCtx === 'local' ? 'NAS 本地文件' : '云盘'}}</span>
+          <span class="shrink-0 text-xs tabular-nums text-base-content/50">{{renameChanged.length}} / {{renameSources.length}} 项会变</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeRename" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-xs text-base-content/50">作用范围</span>
+            <div class="seg">
+              <button class="seg-btn" :class="{on: renameScope==='picked'}" :disabled="!renamePickedNames.length" @click="renameScope='picked'">已勾选（{{renamePickedNames.length}}）</button>
+              <button class="seg-btn" :class="{on: renameScope==='all'}" @click="renameScope='all'">{{renameCtx === 'local' ? '当前列表全部' : '本目录全部'}}（{{renameAllNames.length}}）</button>
+            </div>
+            <div class="seg ml-auto">
+              <button class="seg-btn" :class="{on: renameMode==='template'}" @click="renameMode='template'">模板</button>
+              <button class="seg-btn" :class="{on: renameMode==='regex'}" @click="renameMode='regex'">正则替换</button>
+              <button class="seg-btn" :class="{on: renameMode==='seq'}" @click="renameMode='seq'">序号</button>
+            </div>
+          </div>
+
+          <template v-if="renameMode==='template'">
+            <label class="flex flex-col gap-1.5 text-xs text-base-content/60">
+              模板
+              <input class="fld font-mono" v-model="renameTpl" placeholder="{name}{ext}" aria-label="重命名模板">
+            </label>
+            <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
+              <span class="text-base-content/45">点选插入：</span>
+              <button v-for="t in ['{name}','{ext}','{i}','{n}','{idx}']" :key="t" class="badge-pill bg-base-content/8 font-mono text-base-content/70 hover:bg-primary/15 hover:text-primary" @click="renameInsertToken(t)">{{t}}</button>
+            </div>
+            <div class="text-[11px] leading-relaxed text-base-content/45">
+              <code class="rounded bg-base-content/10 px-1">{name}</code> 不含扩展名 ·
+              <code class="rounded bg-base-content/10 px-1">{ext}</code> 含点 ·
+              <code class="rounded bg-base-content/10 px-1">{i}</code> 序号（下面控制起始/步长/位数）·
+              <code class="rounded bg-base-content/10 px-1">{n}</code> 完整原名 ·
+              <code class="rounded bg-base-content/10 px-1">{idx}</code> 从 1 开始的行号
+            </div>
+          </template>
+
+          <template v-else-if="renameMode==='regex'">
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label class="flex flex-col gap-1.5 text-xs text-base-content/60">
+                查找（正则）
+                <input class="fld font-mono" v-model="renameFind" placeholder="如 ^\\[.*?\\]\\s*" aria-label="正则查找">
+              </label>
+              <label class="flex flex-col gap-1.5 text-xs text-base-content/60">
+                替换为
+                <input class="fld font-mono" v-model="renameRepl" placeholder="可用 $1 引用分组" aria-label="替换为">
+              </label>
+            </div>
+            <label class="flex items-center gap-2 text-xs text-base-content/60">
+              <input type="checkbox" class="checkbox checkbox-xs" v-model="renameCI">忽略大小写
+            </label>
+            <div class="text-[11px] leading-relaxed text-base-content/45">
+              正则只作用于整个文件名（含扩展名）。写错语法时不会改任何名字，预览会保持原样。
+            </div>
+          </template>
+
+          <template v-else>
+            <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <label class="flex flex-col gap-1.5 text-xs text-base-content/60">前缀
+                <input class="fld" v-model="renamePrefix" placeholder="如 合集-" aria-label="前缀">
+              </label>
+              <label class="flex flex-col gap-1.5 text-xs text-base-content/60">起始
+                <input class="fld tabular-nums" type="number" min="0" v-model.number="renameStart" aria-label="起始序号">
+              </label>
+              <label class="flex flex-col gap-1.5 text-xs text-base-content/60">步长
+                <input class="fld tabular-nums" type="number" min="1" v-model.number="renameStep" aria-label="步长">
+              </label>
+              <label class="flex flex-col gap-1.5 text-xs text-base-content/60">位数
+                <input class="fld tabular-nums" type="number" min="1" max="6" v-model.number="renamePad" aria-label="补零位数">
+              </label>
+            </div>
+            <label class="flex flex-col gap-1.5 text-xs text-base-content/60">后缀（在序号之后、扩展名之前）
+              <input class="fld" v-model="renameSuffix" placeholder="如 -1080p" aria-label="后缀">
+            </label>
+          </template>
+
+          <div class="overflow-hidden rounded-xl border border-base-content/10">
+            <div class="flex items-center gap-2 border-b border-base-content/10 bg-base-content/5 px-3 py-2 text-[11px] font-medium text-base-content/50">
+              <span class="flex-1">预览（前 {{renamePreview.length}} 项）</span>
+              <span v-if="renameBlocked" class="text-error">{{renameBlocked}} 项冲突</span>
+            </div>
+            <div class="max-h-64 overflow-y-auto">
+              <div v-for="r in renamePreview" :key="'rn-'+r.from" class="flex items-center gap-2 px-3 py-1.5 text-xs"
+                   :class="r.conflict ? 'bg-error/8' : ''">
+                <span class="min-w-0 flex-1 truncate text-base-content/50" :title="r.from">{{r.from}}</span>
+                <i class="ti ti-arrow-right shrink-0 text-base-content/30"></i>
+                <span class="min-w-0 flex-1 truncate" :class="r.conflict ? 'text-error' : (r.same ? 'text-base-content/40' : 'text-success')"
+                      :title="r.to">{{r.to}}</span>
+                <span v-if="r.conflict" class="shrink-0 text-[10px] text-error">{{r.bad ? '名称非法' : (r.dup ? '重名' : '已存在')}}</span>
+                <span v-else-if="r.same" class="shrink-0 text-[10px] text-base-content/35">不变</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- v3.53：结果条只保留一行数据，不堆说明文字 -->
+          <div v-if="renameResult && renameResult.ok" class="rounded-xl border border-success/30 bg-success/10 p-3 text-xs text-success">
+            <div class="font-medium">已完成 {{renameResult.ok}} 项改名，预览已按新文件名刷新</div>
+          </div>
+          <div v-if="renameResult && renameResult.failed.length" class="rounded-xl border border-error/30 bg-error/10 p-3 text-xs text-error">
+            <div class="mb-1 font-medium">失败 {{renameResult.failed.length}} 项</div>
+            <div v-for="(f,i) in renameResult.failed.slice(0,5)" :key="'rf-'+i" class="truncate">{{f.name}}：{{f.error}}</div>
+          </div>
+
+          <div class="text-[11px] leading-relaxed text-base-content/45">
+            <template v-if="renameCtx === 'local'">
+              改的是 <b>NAS 上 /vol2/download/{{lfPath || ''}}</b> 里的真实文件与文件夹名字，立即生效、不进回收站；
+              改名后旧的播放 / 下载 / 外链地址会失效。不处理隐藏文件与传输中的 .part 临时文件。
+              目标名已存在或彼此重名时整批拒绝执行，不会改到一半停下来。
+            </template>
+            <template v-else>
+              只改当前目录里的<b>文件</b>名字（文件夹改名需要重建目录再搬运，风险太高，这里不做）。
+              目标名已存在或与别的项重名时整批拒绝执行，不会改到一半停下来。
+            </template>
+          </div>
+        </div>
+
+        <div class="flex shrink-0 items-center gap-2 border-t border-base-content/10 bg-base-200 px-5 py-3">
+          <span class="flex-1 text-[11px] text-base-content/45">
+            {{renameBlocked ? '有冲突，先改规则' : (renameChanged.length ? '将执行 ' + renameChanged.length + ' 项改名' : (renameCtx === 'local' && renameResult ? '本轮已完成，改规则可继续下一轮' : '还没有名字会变'))}}
+          </span>
+          <button class="btn-sm" @click="closeRename">{{renameCtx === 'local' && renameResult ? '关闭' : '取消'}}</button>
+          <button class="btn-sm primary" :disabled="renameBusy || !renameChanged.length || !!renameBlocked" @click="renameApply"
+                  :title="renameCtx === 'local' ? '在 NAS 上执行改名，不可撤销（请先核对预览）' : '在云盘上执行改名'">
+            <i class="ti ti-check" :class="renameBusy ? 'animate-pulse' : ''"></i>执行改名
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 回收站（v3.44：仅 PikPak，恢复 / 彻底删除 / 清空）══ -->
+    <div v-if="trashOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeTrash"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-trash-x text-lg leading-none text-warning"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">回收站 · {{curRemote}}</span>
+          <span class="shrink-0 text-xs tabular-nums text-base-content/50">{{trashItems.length}} 项 · {{fmt(trashTotal)}}</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeTrash" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-5">
+          <div class="rounded-xl border border-base-content/10 bg-base-content/5 p-3 text-xs leading-relaxed text-base-content/70">
+            PikPak 删除的文件会先落到这里（受官方保留期限制）。<b>恢复</b>会放回删除前的目录；
+            <b>彻底删除</b>不可撤销，也会立刻释放占用的云盘空间。
+          </div>
+
+          <div v-if="trashErr" class="rounded-xl border border-error/30 bg-error/10 p-3 text-xs text-error">{{trashErr}}</div>
+          <div v-if="trashBusy" class="flex items-center gap-2 py-6 text-sm text-base-content/50">
+            <i class="ti ti-loader-2 animate-spin"></i>正在读取回收站…
+          </div>
+          <div v-else-if="!trashItems.length && !trashErr" class="empty-state py-10">
+            <i class="ti ti-trash-off"></i>回收站是空的
+          </div>
+
+          <div v-else class="overflow-hidden rounded-xl border border-base-content/10">
+            <div class="flex items-center gap-2 border-b border-base-content/10 bg-base-content/5 px-3 py-2 text-[11px] font-medium text-base-content/50">
+              <input type="checkbox" class="checkbox checkbox-xs" :checked="trashAllPicked" @change="toggleAllTrash($event.target.checked)">
+              <span class="flex-1">条目</span>
+              <span class="w-20 text-right">大小</span>
+              <span class="w-24 text-right">删除时间</span>
+            </div>
+            <div class="max-h-[42vh] overflow-y-auto">
+              <div v-for="t in trashItems" :key="'tr-'+t.id" class="flex items-center gap-2 px-3 py-2 text-xs hover:bg-base-content/5">
+                <input type="checkbox" class="checkbox checkbox-sm checkbox-error" :value="t.id" v-model="trashPicked">
+                <i class="ti shrink-0 text-base leading-none" :class="t.isdir ? 'ti-folder text-base-content/45' : 'ti-file text-base-content/45'"></i>
+                <span class="min-w-0 flex-1 truncate" :title="hideNames ? '' : t.name">{{hideNames ? '••••••••' : t.name}}</span>
+                <span class="w-20 shrink-0 text-right tabular-nums text-base-content/55">{{t.isdir ? '文件夹' : fmt(t.size)}}</span>
+                <span class="hidden w-24 shrink-0 text-right tabular-nums text-base-content/40 sm:inline">{{fmtIso(t.created)}}</span>
+                <button class="btn-sm" :title="'恢复：' + t.name" @click="trashPicked=[t.id]; trashOp('restore')"><i class="ti ti-restore"></i>恢复</button>
+                <button class="btn-sm danger" :title="'彻底删除：' + t.name" @click="trashOp('delete', t)"><i class="ti ti-trash"></i></button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex shrink-0 flex-wrap items-center gap-2 border-t border-base-content/10 bg-base-200 px-5 py-3">
+          <button class="btn-sm" :disabled="trashBusy" @click="loadTrash"><i class="ti ti-refresh" :class="trashBusy ? 'animate-spin' : ''"></i>刷新</button>
+          <span class="text-[11px] text-base-content/45">已选 {{trashPicked.length}} 项</span>
+          <div class="ml-auto flex items-center gap-2">
+            <button class="btn-sm" :disabled="trashBusy || !trashPicked.length" @click="trashOp('restore')"><i class="ti ti-restore"></i>恢复选中</button>
+            <button class="btn-sm danger" :disabled="trashBusy || !trashPicked.length" @click="trashOp('delete')"><i class="ti ti-trash"></i>彻底删除选中</button>
+            <button class="btn-sm danger" :disabled="trashBusy || !trashItems.length" @click="emptyTrash"><i class="ti ti-trash-x"></i>清空回收站</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 解压（v3.44：云端预览/解压 + NAS 本地解压）══ -->
+    <div v-if="unzipOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeUnzip"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-file-zip text-lg leading-none text-secondary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">{{unzipMode==='local' ? '本地解压' : '压缩包'}}</span>
+          <span class="badge-pill shrink-0" :class="unzipMode==='local' ? 'bg-secondary/15 text-secondary' : 'bg-info/15 text-info'">
+            {{unzipMode==='local' ? 'NAS 侧' : '云端'}}
+          </span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeUnzip" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-5">
+          <div class="truncate text-sm font-medium" :title="unzipName">{{unzipName}}</div>
+
+          <!-- 非会员提示：云端解压是 PikPak 会员功能（已实测免费账号返回 NEED_MORE_QUOTA） -->
+          <div v-if="unzipMode==='cloud' && curVip===false"
+               class="rounded-xl border border-warning/30 bg-warning/10 p-3 text-xs leading-relaxed text-warning">
+            <div class="mb-1 flex items-center gap-1.5 font-medium"><i class="ti ti-crown-off"></i>当前账号不是 PikPak 会员</div>
+            云端解压是会员功能（免费账号会返回 <code class="rounded bg-base-content/10 px-1">NEED_MORE_QUOTA</code>）。
+            但仍可以<b>预览压缩包里有什么</b>，或先把压缩包下载到 NAS，再到「本地文件」页批量解压 —— 那条路径不需要会员。
+          </div>
+
+          <div class="flex flex-wrap items-end gap-2">
+            <label class="flex min-w-44 flex-1 flex-col gap-1.5 text-xs text-base-content/60">
+              密码（有就填，没有留空）
+              <input class="fld" type="password" v-model="unzipPwd" placeholder="压缩包密码"
+                     @keyup.enter="unzipMode==='cloud' && loadUnzipList()" aria-label="压缩包密码">
+            </label>
+            <button v-if="unzipMode==='cloud'" class="btn-sm" :disabled="unzipBusy" @click="loadUnzipList">
+              <i class="ti ti-refresh" :class="unzipBusy ? 'animate-spin' : ''"></i>读取目录
+            </button>
+          </div>
+
+          <label v-if="unzipMode==='local'" class="flex items-start gap-2.5 rounded-xl border border-base-content/10 px-3 py-2.5 text-sm">
+            <input type="checkbox" class="checkbox checkbox-sm checkbox-error mt-0.5" v-model="unzipDeleteAfter">
+            <span class="flex-1">
+              解压成功后删除原压缩包
+              <span class="block text-[11px] leading-relaxed text-base-content/45">失败不会删；解压到同目录下与压缩包同名的文件夹。</span>
+            </span>
+          </label>
+
+          <div v-if="unzipErr" class="rounded-xl border border-error/30 bg-error/10 p-3 text-xs leading-relaxed text-error">
+            {{unzipErr}}
+            <span v-if="unzipNeedPwd" class="block text-base-content/50">压缩包需要密码：填在密码框里再点「读取目录」。</span>
+          </div>
+
+          <div v-if="unzipMode==='cloud' && unzipEntries.length" class="overflow-hidden rounded-xl border border-base-content/10">
+            <div class="border-b border-base-content/10 bg-base-content/5 px-3 py-2 text-[11px] font-medium text-base-content/50">
+              包内条目（前 {{unzipEntries.length}} 项{{unzipInfo && unzipInfo.more ? '，仅显示前 300 项' : ''}}）
+            </div>
+            <div class="max-h-56 overflow-y-auto">
+              <div v-for="(e,i) in unzipEntries" :key="'uz-'+i" class="flex items-center gap-2 px-3 py-1.5 text-xs">
+                <i class="ti shrink-0 text-sm leading-none" :class="e.isdir ? 'ti-folder text-base-content/40' : 'ti-file text-base-content/40'"></i>
+                <span class="min-w-0 flex-1 truncate" :title="hideNames ? '' : e.path">{{hideNames ? '••••••••' : e.path}}</span>
+                <span class="shrink-0 tabular-nums text-base-content/45">{{e.isdir ? '文件夹' : fmt(e.size)}}</span>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="unzipMode==='local'" class="text-[11px] leading-relaxed text-base-content/45">
+            支持 zip / tar / tar.gz / tgz / tar.bz2 / tar.xz；zip 支持密码。7z / rar 需要 NAS 上有 7z / unrar
+            （当前没有），可用「下载」到本机再解压。解压过程会出现在「下载任务」里，可看进度。
+          </div>
+        </div>
+
+        <div class="flex shrink-0 flex-wrap items-center gap-2 border-t border-base-content/10 bg-base-200 px-5 py-3">
+          <button class="btn-sm" @click="closeUnzip">取消</button>
+          <div class="ml-auto flex items-center gap-2">
+            <template v-if="unzipMode==='cloud'">
+              <button class="btn-sm" @click="downloadForUnzip"><i class="ti ti-download"></i>下载到 NAS</button>
+              <button class="btn-sm primary" :disabled="unzipBusy || curVip===false" @click="startUnzip"
+                      :title="curVip===false ? '云端解压需要 PikPak 会员' : '提交云端解压，解到云盘同目录'">
+                <i class="ti ti-package-export" :class="unzipBusy ? 'animate-pulse' : ''"></i>云端解压
+              </button>
+            </template>
+            <button v-else class="btn-sm primary" :disabled="unzipBusy" @click="startUnzip">
+              <i class="ti ti-package-export" :class="unzipBusy ? 'animate-pulse' : ''"></i>开始解压（{{unzipTargets.length}}）
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 本地文件 · 在线播放器 / 预览（v3.15）══ -->
+    <div v-if="player" class="fixed inset-0 z-[90] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.78)]" @click="closePlayer"></div>
+      <div class="pop-in relative flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 flex-wrap items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-3.5">
+          <i class="ti ti-player-play text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-base font-bold" :title="player.name">{{player.name}}</span>
+          <span class="text-xs tabular-nums text-base-content/50">{{fmt(player.size)}}</span>
+          <button v-if="player.cloud" class="btn-sm primary" title="把这个文件加入下载任务（NAS 落盘）"
+                  @click="downloadFromPlayer"><i class="ti ti-download"></i>下载到 NAS</button>
+          <a v-else class="btn-sm primary" :href="player.dl" :download="player.name"><i class="ti ti-download"></i>下载到本机</a>
+          <button class="modal-x press-tactile flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15" @click="closePlayer" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+        <div class="relative flex min-h-0 flex-1 items-center justify-center bg-[oklch(0%_0_0_/_0.92)] p-2">
+          <video v-if="player.kind==='video'" ref="playerVideo" class="max-h-[72vh] w-full" :src="player.url"
+                 controls autoplay playsinline preload="metadata"
+                 @loadedmetadata="onPlayerMeta" @timeupdate="onPlayerTime"
+                 @ended="onPlayerEnd" @error="onPlayerError"></video>
+          <audio v-else-if="player.kind==='audio'" ref="playerAudio" class="w-full" :src="player.url" controls autoplay
+                 @loadedmetadata="onPlayerMeta" @timeupdate="onPlayerTime"
+                 @ended="onPlayerEnd" @error="onPlayerError"></audio>
+          <div v-else-if="player.kind==='pdf'" class="h-[72vh] w-full">
+            <iframe class="h-full w-full" :src="player.url" :title="player.name"></iframe>
+          </div>
+          <img v-else class="max-h-[72vh] max-w-full object-contain" :src="player.url" :alt="player.name">
+          <!-- 进度恢复提示：只在真的跳转过之后短暂显示 -->
+          <div v-if="playResumeHint" class="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-lg bg-base-content/85 px-3 py-1.5 text-xs font-medium text-base-100 shadow-lg">
+            <i class="ti ti-history"></i> 从 {{playResumeHint}} 继续
+          </div>
+        </div>
+        <div class="shrink-0 border-t border-base-content/10 bg-base-200 px-5 py-2.5 text-xs text-base-content/50">
+          <div v-if="player.meta" class="mb-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-base-content/60">
+            <span v-if="player.meta.width" class="tabular-nums">{{player.meta.width}}×{{player.meta.height}}</span>
+            <span v-if="player.meta.bitrate" class="tabular-nums">{{fmtBitrate(player.meta.bitrate)}}</span>
+            <span v-if="player.meta.videoCodec" class="uppercase">{{player.meta.videoCodec}}<span v-if="player.meta.audioCodec"> / {{player.meta.audioCodec}}</span></span>
+            <span v-if="player.direct" class="badge-pill b-done"><i class="ti ti-bolt"></i>直连 CDN</span>
+            <span v-if="player.meta.expiresIn" class="text-base-content/40">链接 {{(player.meta.expiresIn/3600).toFixed(0)}} 小时内有效</span>
+          </div>
+          <div v-if="player.meta && player.meta.hint" class="mb-1 text-warning">{{player.meta.hint}}</div>
+          播放不了？多为视频编码不受浏览器支持（如 H.265 / MKV 封装），点右上角「下载到本机」用本地播放器打开。
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script src="/static/echarts.min.js"></script>
+<script src="/static/vue.global.prod.js"></script>
+<script src="/static/bm-code.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

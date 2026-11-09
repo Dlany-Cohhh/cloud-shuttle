@@ -1,0 +1,65 @@
+# 云梭 CloudShuttle · 最小可运行部署示例（所有敏感值都来自 .env，本文件可安全提交）
+#
+#   cp .env.example .env      # 然后修改路径与凭据
+#   # 在 RCLONE_CONFIG_DIR 放好 rclone.conf，见 docs/DEPLOYMENT.md
+#   docker compose -f docker-compose.example.yml up -d --build
+#
+# 网络说明：示例沿用线上部署的 host 网络（飞牛 fnOS 的 bridge 端口映射不可达），
+# 控制台直接占用 5566 端口。普通 Docker 环境可删掉 network_mode 并改用
+# ports: - "5566:5566"，但要注意控制台仍需通过 docker.sock 访问 rclone-backend。
+services:
+  download-console:
+    build: .
+    image: download-console:local
+    container_name: download-console
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      RCLONE_RC_USER: ${RCLONE_RC_USER:?请在 .env 中设置 RCLONE_RC_USER}
+      RCLONE_RC_PASS: ${RCLONE_RC_PASS:?请在 .env 中设置 RCLONE_RC_PASS}
+      CONSOLE_DATA_DIR: /app
+      # 在线检查更新（可选，见 docs/UPDATE.md）
+      UPDATE_REPO: ${UPDATE_REPO:-Dlany-Cohhh/cloud-shuttle}
+      UPDATE_CONTAINER: download-console
+      UPDATE_AUTO_RESTART: ${UPDATE_AUTO_RESTART:-1}
+      # GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    volumes:
+      # 代码目录同时是数据目录：jobs.json / settings.json 等直接落在这里
+      - ${PROJECT_ROOT:?请在 .env 中设置 PROJECT_ROOT}:/app
+      # 控制台通过 docker exec 指挥 rclone-backend
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 磁盘空间保护 + 「本地文件」页浏览
+      - ${DOWNLOAD_ROOT:?请在 .env 中设置 DOWNLOAD_ROOT}:/vol2/download
+
+  rclone-backend:
+    image: rclone/rclone:latest
+    container_name: rclone-backend
+    restart: unless-stopped
+    network_mode: host
+    # 可选：让下载出来的文件归宿主机管理员所有（按需改成自己的 uid:gid）
+    # user: "${PUID:-1000}:${PGID:-1000}"
+    volumes:
+      # rclone.conf 含账号 refresh_token，只挂载、绝不进仓库
+      - ${RCLONE_CONFIG_DIR:?请在 .env 中设置 RCLONE_CONFIG_DIR}:/config/rclone
+      - ${DOWNLOAD_ROOT:?请在 .env 中设置 DOWNLOAD_ROOT}:/data
+    # 纯后端模式：rc 只绑本机回环，控制台经 docker exec 调用
+    command: >
+      rcd
+      --rc-addr 127.0.0.1:5572
+      --rc-user ${RCLONE_RC_USER}
+      --rc-pass ${RCLONE_RC_PASS}
+      --log-level INFO
+
+  # ── 可选：代理下载 ────────────────────────────────────────────────
+  # 开启后，控制台会按需拉起 127.0.0.1:5573 的第二个 rcd 进程，
+  # 并把它的 HTTP(S)_PROXY 指向下面的 7890 端口（见 download-console.py 的 PROXY_RCD）。
+  # mihomo:
+  #   image: metacubex/mihomo:latest
+  #   container_name: mihomo
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   volumes:
+  #     - ./mihomo:/root/.config/mihomo
+
+  # ── 可选扩展：OpenList（聚合网盘）/ aria2（BT 磁力）/ yt-dlp（视频站）──
+  # 启用后控制台「下载任务」页会多出对应入口，完整片段见 docs/DEPLOYMENT.md。
