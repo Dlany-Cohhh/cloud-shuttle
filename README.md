@@ -8,6 +8,8 @@
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 
+**关键词**：PikPak 下载器 · PikPak 多账号 · PikPak 批量下载 · PikPak 网盘 · NAS 下载器 · rclone pikpak · pikpak downloader · multi-account downloader · 云梭 CloudShuttle
+
 > [!WARNING]
 > 这是**内网自用的无鉴权工具**：Web 界面与 `/api` 都没有登录校验。请把 5566 端口限制在局域网内，不要直接暴露到公网；使用第三方网盘服务时请自行遵守其服务条款。详见 [SECURITY.md](SECURITY.md)。
 >
