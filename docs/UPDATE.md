@@ -69,8 +69,21 @@ collector.ps1      login-collector.ps1
    git tag v3.55 && git push origin v3.55
    ```
 
-4. `.github/workflows/release.yml` 会自动构建资源包、校验哈希并创建 Release（也可在 Actions 里手动 `workflow_dispatch` 重建某个 tag 的资源）。
+4. 发布 Release，二选一：
+
+   ```bash
+   # A. 本地一键发布（推荐，不依赖 CI 权限）
+   python3 scripts/publish_release.py          # 自动构建 + 校验 + 上传资源
+
+   # B. 启用 CI：把 docs/release-workflow.yml 复制到 .github/workflows/release.yml
+   #    （在 GitHub 网页端点「Add file → Create new file」粘贴即可，
+   #     或用 gh auth refresh -s workflow 给本机令牌补上 workflow 权限后 git push）
+   #    之后每次 push v* tag 会自动构建并上传资源
+   ```
+
 5. 用户端进入「设置 → 版本与更新」点「检查更新」，即可看到 `v3.55` 并一键升级。
+
+> 本仓库首次推送时使用的 OAuth 令牌没有 `workflow` 权限，因此 CI 文件以模板形式放在 `docs/`，没有直接放进 `.github/workflows/`；文件本身是可用的，复制过去即可生效。
 
 > 发行包的**固定文件名**很重要：后端总是从最新 Release 里找 `cloud-shuttle.zip`，不要改成带版本号的名字；版本号放在 tag 与包内清单里。
 
@@ -90,5 +103,5 @@ collector.ps1      login-collector.ps1
 - 后端实现：`download-console.py` → `update_check` / `update_apply` / `update_rollback` / `update_state`
 - 前端界面：`static/index.html` 设置页「版本与更新」卡片、`static/app.js` 的 `checkUpdate` / `applyUpdate` / `rollbackUpdate`
 - 打包脚本：`scripts/build_release.py`
-- 自动发布：`.github/workflows/release.yml`
+- 本地发布：`scripts/publish_release.py` · 可选 CI 模板：`docs/release-workflow.yml`
 - API 说明：`docs/API.md`

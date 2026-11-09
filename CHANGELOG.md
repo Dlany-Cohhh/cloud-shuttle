@@ -11,7 +11,7 @@
 - 发行包整包 sha256 + `release-manifest.json` 逐文件 sha256 双重校验，主程序落盘前先做 Python 语法编译；成员名限制在 `UPDATE_FILES` 白名单，拒绝路径越界与超 24MB 的包；
 - 替换前按时间戳备份到 `update-backups/`，支持一键回滚；原子替换保留文件权限，容器里延迟 3 秒 `docker restart`，裸机提示手动重启；
 - 只替换程序文件，设置 / 任务 / 账号 / `rclone.conf` / 下载数据均不受影响；
-- 新增 `scripts/build_release.py` 与 `.github/workflows/release.yml`（打 `v*` tag 自动构建资源包并创建 Release）、`docs/UPDATE.md`；
+- 新增 `scripts/build_release.py` / `scripts/publish_release.py`（本地一键构建并发布 Release）、可选 CI 模板 `docs/release-workflow.yml`、`docs/UPDATE.md`；
 - 前端设置页新增「版本与更新」卡片（检查结果、发行说明、下载并更新、回滚、上次更新记录），侧栏版本旁显示「有新版本」提示；
 - 版本号升至 `v3.54`，4 个更新 action 的超时单独配置。
 

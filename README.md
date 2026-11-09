@@ -119,7 +119,7 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 - **自动生效**：容器部署会延迟 `docker restart`，正在跑的 rclone 传输不受影响；裸机部署会提示手动重启；
 - **可换源**：把自己的 fork 写进 `UPDATE_REPO` 环境变量，就能跟随自己的发行版。
 
-维护者的打包与发版流程见 [docs/UPDATE.md](docs/UPDATE.md)，自动构建发行包的工作流在 `.github/workflows/release.yml`。
+维护者的打包与发版流程见 [docs/UPDATE.md](docs/UPDATE.md)：可以直接 `python3 scripts/publish_release.py` 本地一键发布，也可以把 [docs/release-workflow.yml](docs/release-workflow.yml) 复制到 `.github/workflows/release.yml` 启用「打 tag 自动构建」的 CI。
 
 ---
 
@@ -244,11 +244,12 @@ docker compose -f docker-compose.example.yml up -d --build
 │   ├── screenshots/             # 本文使用的 9 张界面截图（全部为虚拟示例数据）
 │   ├── DEPLOYMENT.md            # 详细部署、账号配置与故障排查
 │   ├── UPDATE.md                # 在线检查更新、发版与回滚
+│   ├── release-workflow.yml     # 可选的 CI 模板（复制到 .github/workflows/ 启用）
 │   └── API.md                   # 接口速查与全部 action 清单
 ├── scripts/
 │   ├── build_release.py         # 构建发行包 cloud-shuttle.zip + sha256
+│   ├── publish_release.py       # 本地一键构建并发布 Release（不依赖 CI）
 │   └── refresh-pikpak-token.sh  # PikPak refresh_token 定时续期（建议每小时）
-├── .github/workflows/release.yml # 打 tag 后自动构建并发布 Release 资源
 ├── examples/
 │   └── settings.example.json    # 完整设置示例（由源码 DEFAULTS 生成）
 ├── Dockerfile                   # python:3.12-alpine + docker-cli

@@ -1,0 +1,64 @@
+# 云梭 CloudShuttle · 可选的自动发布工作流模板
+# 复制本文件内容到 .github/workflows/release.yml 即可启用：
+#   - 在 GitHub 网页端 Add file → Create new file 粘贴（推荐，无需额外令牌权限）
+#   - 或本机执行 gh auth refresh -s workflow 后 git add / git push
+# 不启用也没关系：scripts/publish_release.py 能本地一键完成同样的事。
+name: Build Release Asset
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布/重建资源的版本 tag，如 v3.54"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build cloud-shuttle.zip
+        run: python3 scripts/build_release.py
+
+      - name: Verify asset
+        run: |
+          python3 - <<'PY'
+          import json, zipfile, hashlib
+          from pathlib import Path
+          z = Path("dist/cloud-shuttle.zip")
+          want = Path("dist/cloud-shuttle.zip.sha256").read_text().split()[0]
+          got = hashlib.sha256(z.read_bytes()).hexdigest()
+          assert got == want, "整包 sha256 不一致"
+          with zipfile.ZipFile(z) as f:
+              m = json.loads(f.read("release-manifest.json"))
+              assert m["version"] and m["files"], "清单不完整"
+              for name, sha in m["files"].items():
+                  assert hashlib.sha256(f.read(name)).hexdigest() == sha, name
+              print("发行包校验通过：", m["version"], len(m["files"]), "个文件")
+          PY
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/cloud-shuttle.zip dist/cloud-shuttle.zip.sha256 --clobber
+          else
+            gh release create "$TAG" \
+              dist/cloud-shuttle.zip dist/cloud-shuttle.zip.sha256 \
+              --title "云梭 CloudShuttle $TAG" --generate-notes
+          fi
