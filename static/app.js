@@ -1707,6 +1707,30 @@ Vue.createApp({
       this.renameBusy = false;
     },
 
+    /* ---------- v3.56：本地文件 / 文件夹单项重命名 ---------- */
+    /* 与云盘页 cloudRename 对称；后端复用 localrenamebatch 的冲突、越界、软链接校验与失败回滚 */
+    async localRenameOne(name) {
+      if (!name) return;
+      const nn = window.prompt("重命名 NAS 本地文件或文件夹", name);
+      if (nn == null) return;
+      const to = String(nn).trim();
+      if (!to || to === name) return;
+      if (/[\\/]/.test(to)) { this.toast("新名字不能包含路径分隔符", "error"); return; }
+      try {
+        const d = await this.api("localrenamebatch", {
+          path: this.lfPath, items: [{ from: name, to }]
+        }, 120000);
+        if (d.error) { this.toast(d.error, "error"); return; }
+        if ((d.failed || []).length) {
+          this.toast(d.failed[0].error || "重命名失败", "error");
+          return;
+        }
+        this.lfPicked = (this.lfPicked || []).filter(x => x !== name);
+        this.toast("已重命名：" + name + " → " + to, "ok");
+        await this.loadLocalFiles(this.lfPath);
+      } catch (e) { this.toast("重命名失败：" + e.message, "error"); }
+    },
+
     /* ---------- v3.44 回收站 ---------- */
     trashSupported() {
       /* 只有 PikPak 有服务端回收站；其它网盘（openlist 等）删了就是删了 */

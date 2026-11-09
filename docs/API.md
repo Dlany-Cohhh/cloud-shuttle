@@ -21,7 +21,7 @@ curl -s -X POST http://<控制台地址>/api \
 | `accounts` / `accttest` / `acctpurge` | 账号列表 / 单账号测试 / 清理无 type 的残留配置段 |
 | `jobs` / `start` / `stop` / `resume` / `remove` | 任务列表 / 启动 / 停止 / 断点续传 / 删除 |
 | `dirs` / `localdirs` / `scanpath` | 云盘与本地目录浏览 |
-| `localfiles` / `localrenamebatch` | 本地文件浏览 / NAS 侧批量重命名 |
+| `localfiles` / `localrenamebatch` | 本地文件浏览 / NAS 侧重命名（批量与单项共用，items 传 1 项即单项） |
 | `renamebatch` | 云盘目录内批量重命名 |
 | `version` | 版本与运行状态 |
 

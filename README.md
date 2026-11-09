@@ -2,9 +2,9 @@
 
 > **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
-![version](https://img.shields.io/badge/version-v3.55-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
+![version](https://img.shields.io/badge/version-v3.56-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
-**当前版本 v3.55** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
+**当前版本 v3.56** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 
@@ -77,9 +77,9 @@
 
 ### 4. 本地文件
 
-![本地文件页：NAS 本地目录、文件列表与批量操作按钮](docs/screenshots/04-files.png)
+![本地文件页：NAS 本地目录、文件列表、单项与批量重命名](docs/screenshots/04-files.png)
 
-浏览已落盘到 NAS 的目录与文件，面包屑导航、名称筛选、按名称 / 大小 / 时间排序；可在线播放或下载到本机、导出 M3U 播放列表与 CSV 清单、对压缩包批量解压、做云端一致性校验，以及**批量改名**（模板 / 正则 / 序号，先预览再执行，整批预检、失败回滚）。
+浏览已落盘到 NAS 的目录与文件，面包屑导航、名称筛选、按名称 / 大小 / 时间排序；可在线播放或下载到本机、导出 M3U 播放列表与 CSV 清单、对压缩包批量解压、做云端一致性校验，每行右侧的铅笔按钮可**单独重命名**文件或文件夹；也可**批量改名**（模板 / 正则 / 序号，先预览再执行，整批预检、失败回滚）。单项与批量共用后端的安全校验与失败回滚。
 
 ### 5. 统计
 
@@ -126,7 +126,7 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 | 账号管理 | 多账号列表、导入 / 采集 Token、重新登录、编辑改名、单账号测试、**一键测试全部**（3 路并发 + 进度）、容量与凭证状态、清理残留配置段 |
 | 下载任务 | 分享链接解析、批量建任务、启停 / 断点续传 / 重试、实时速度与进度、并发数与定时启停、磁盘空间保护、高级 rclone 参数、代理逐任务切换、任务详情与错误诊断 |
 | 云盘浏览 | 目录浏览、在线播放、对比测速、一致性校验、批量重命名（模板 / 正则 / 序号，先预览再执行）、回收站、分享提取次数管理、查重与导出 |
-| 本地文件 | 浏览 / 播放 / 下载、M3U 与 CSV 导出、批量解压、**批量重命名**（含文件夹，整批预检 + 失败回滚）、一致性校验 |
+| 本地文件 | 浏览 / 播放 / 下载、M3U 与 CSV 导出、批量解压、**单项重命名**（文件夹 / 文件）、**批量重命名**（模板 / 正则 / 序号，整批预检 + 失败回滚）、一致性校验 |
 | 统计 | 实时速度、24 小时曲线、14 天下载量、账号容量、已完成传输、rclone 健康指标 |
 | 下载扩展 | OpenList 聚合网盘、aria2 BT / 磁力、yt-dlp 视频站（均为可选服务） |
 | 设置 | 传输参数、限速、日志、代理开关、**自定义代理地址**、NAS 主页地址等，全部持久化 |

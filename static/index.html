@@ -763,7 +763,7 @@
             <div v-else-if="page==='files'" class="flex flex-col gap-4">
               <div class="fade-slide-in flex flex-wrap items-center gap-3">
                 <h1 class="text-2xl font-bold tracking-tight">本地文件</h1>
-                <span class="text-xs text-base-content/50">已下载到 NAS 的资源 · 浏览 / 播放 / 导出 / 批量改名</span>
+                <span class="text-xs text-base-content/50">已下载到 NAS 的资源 · 浏览 / 播放 / 导出 / 单项重命名 / 批量改名</span>
                 <div class="ml-auto flex flex-wrap items-center gap-2">
                   <button class="btn-sm" :disabled="lfLoading" @click="reloadLocalFiles">
                     <i class="ti ti-refresh" :class="lfLoading ? 'animate-spin' : ''"></i>刷新
@@ -847,6 +847,7 @@
                   </button>
                   <span class="text-xs tabular-nums text-base-content/50">{{d.count}} 项</span>
                   <span class="hidden text-xs tabular-nums text-base-content/40 sm:inline">{{fmtTime(d.mtime)}}</span>
+                  <button class="btn-icon always" :title="'重命名此文件夹：'+d.name" @click="localRenameOne(d.name)"><i class="ti ti-pencil"></i></button>
                   <button class="btn-sm" :title="'校验此文件夹与云端：'+d.name" @click="openVerify({localPath: lfPath ? lfPath + '/' + d.name : d.name})"><i class="ti ti-shield-check"></i>校验</button>
                   <i class="ti ti-chevron-right text-sm leading-none text-base-content/40"></i>
                 </div>
@@ -873,6 +874,7 @@
                   <span class="hidden w-28 shrink-0 text-right text-xs tabular-nums text-base-content/40 md:inline">{{fmtTime(f.mtime)}}</span>
                   <div class="flex shrink-0 items-center gap-1.5">
                     <button v-if="f.archive" class="btn-sm" :title="'解压到同目录下的同名文件夹：' + f.name" @click="openLocalUnzip([f.name])"><i class="ti ti-file-zip"></i>解压</button>
+                    <button class="btn-icon always" :title="'重命名此文件：'+f.name" @click="localRenameOne(f.name)"><i class="ti ti-pencil"></i></button>
                     <button class="btn-sm" :title="'校验此文件与云端：'+f.name" @click="openVerify({localPath: lfPath ? lfPath + '/' + f.name : f.name})"><i class="ti ti-shield-check"></i>校验</button>
                     <button v-if="f.playable" class="btn-sm primary" @click="openPlayer(f)"><i class="ti ti-player-play"></i>{{f.kind==='audio' ? '播放' : f.kind==='video' ? '播放' : '预览'}}</button>
                     <span v-else class="rounded-md bg-base-content/8 px-2 py-1 text-[10px] text-base-content/50" title="浏览器不支持直接播放，请下载到本机">仅下载</span>
@@ -885,7 +887,7 @@
                 <i class="ti ti-folder-off"></i>{{lfQuery ? '没有匹配的文件' : '这个目录是空的'}}
               </div>
               <div class="px-1 text-xs leading-relaxed text-base-content/45">
-                文件来自 NAS 的 <code class="rounded bg-base-content/8 px-1">/vol2/download</code>，即任务里「目标 /data/…」对应的真实落盘位置。播放支持拖动进度；不支持的格式请点「下载」用本机播放器打开。「批量改名」会真实改动 NAS 上的文件名（含文件夹），先预览再执行，改名后旧的播放 / 下载链接会失效。
+                文件来自 NAS 的 <code class="rounded bg-base-content/8 px-1">/vol2/download</code>，即任务里「目标 /data/…」对应的真实落盘位置。播放支持拖动进度；不支持的格式请点「下载」用本机播放器打开。每行右侧的铅笔按钮可单独重命名文件或文件夹；「批量改名」会真实改动 NAS 上的名字（含文件夹），先预览再执行，改名后旧的播放 / 下载链接会失效。
               </div>
             </div>
 

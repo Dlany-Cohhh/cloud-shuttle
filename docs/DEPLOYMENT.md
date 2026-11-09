@@ -70,7 +70,7 @@ cp .env.example .env
 docker compose -f docker-compose.example.yml up -d --build
 # Windows 额外加： -f docker-compose.windows.yml
 docker compose -f docker-compose.example.yml logs -f download-console
-# 看到「PikPak 多账号下载器（云梭 CloudShuttle）v3.55」启动横幅即正常
+# 看到「PikPak 多账号下载器（云梭 CloudShuttle）v3.56」启动横幅即正常
 
 curl -s -X POST http://127.0.0.1:5566/api \
   -H 'Content-Type: application/json' -d '{"action":"version"}'
