@@ -236,6 +236,8 @@ bash rust/scripts/build.sh --release-tag v3.56     # Linux 上执行，产物 ru
 
 想要一个**普通 Windows 软件**：到 Releases 下载 `cloud-shuttle-desktop.exe`，双击就是应用窗口。它不启动 HTTP 服务、不打开浏览器、不需要 `static/` 文件夹，也不依赖 Python 或 Docker —— 单个原生 exe 约 6 MB。
 
+![桌面原生窗口版](docs/screenshots/10-desktop.png)
+
 | | 桌面窗口版 | 服务器版 / Docker 版 |
 | --- | --- | --- |
 | 界面 | 原生窗口（Rust / egui 自绘） | 浏览器访问 Web 控制台 |
