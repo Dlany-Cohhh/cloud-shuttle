@@ -234,26 +234,34 @@ bash rust/scripts/build.sh --release-tag v3.56     # Linux 上执行，产物 ru
 
 ## 桌面版：单文件 exe（不用浏览器）
 
-想要一个**普通 Windows 软件**：到 Releases 下载 `cloud-shuttle-desktop.exe`，双击就是应用窗口。它不启动 HTTP 服务、不打开浏览器、不需要 `static/` 文件夹，也不依赖 Python 或 Docker —— 单个原生 exe 约 6 MB。
+想要一个**普通 Windows 软件**：到 Releases 下载 `cloud-shuttle-desktop.exe`，双击就是应用窗口。它不启动 HTTP 服务、不打开浏览器、不需要 `static/` 文件夹，也不依赖 Python 或 Docker —— 单个原生 exe 约 9 MB。
 
-![桌面原生窗口版](docs/screenshots/10-desktop.png)
+**界面与 Web 控制台完全一致**：桌面窗口内嵌的就是仓库根 `static/` 那份前端，Vue / DaisyUI 多套主题、Tabler 图标、ECharts 图表、动效、七个页面、所有按钮原样保留，前端源码一行未改。区别只在载体 —— 资源由进程内协议提供，`fetch("/api")` 直接桥接到 Rust 后端，**不监听任何端口**。
+
+![桌面窗口版：与 Web 控制台完全一致的界面](docs/screenshots/11-desktop-webview.png)
 
 | | 桌面窗口版 | 服务器版 / Docker 版 |
 | --- | --- | --- |
-| 界面 | 原生窗口（Rust / egui 自绘） | 浏览器访问 Web 控制台 |
+| 界面 | 原生窗口内渲染同一份前端（100% 一致） | 浏览器访问 Web 控制台 |
 | 端口 | 不监听任何端口 | 监听 5566 |
 | 数据位置 | `%APPDATA%\CloudShuttle`，下载到「下载\CloudShuttle」 | 由 compose / 环境变量指定 |
-| 外部依赖 | 只需 `rclone.exe`（首次启动可一键下载） | Docker + rclone-backend |
-| 平台 | Windows（Linux 服务器版继续用上面的构建脚本） | Windows / Linux / NAS |
+| 外部依赖 | `rclone.exe` + 系统 WebView2（Win10/11 自带，首次启动可一键下载 rclone） | Docker + rclone-backend |
+| 平台 | Windows（Linux 继续用服务器版） | Windows / Linux / NAS |
 
-窗口内含**概览、下载任务、云盘浏览、账号管理、本地文件、设置、关于**七个页面，和 Web 版共用同一套业务逻辑与 `settings.json` / `jobs.json` / `rclone.conf` 数据格式；本地文件同样支持单项与批量重命名（两阶段回滚）。分享转存、云端解压等高级能力仍以 Docker 版为准。
+数据格式仍是同一套 `settings.json` / `jobs.json` / `rclone.conf`，本地文件单项与批量重命名（两阶段回滚）、账号管理、下载任务、统计图表都可用。首次启动若检测不到 rclone，顶部出现与主题一致的引导条，点「一键下载 rclone」即从官方源安装（约 80 MB）。
 
-首次启动若检测不到 rclone，顶部会显示引导条，点「一键下载 rclone」自动装到用户目录；也可在「设置」页手动指定已有的 `rclone.exe`。账号可直接在窗口里添加，或把现有 `rclone.conf` 复制到数据目录。
+几点桌面版特有说明：
+
+- 分享转存、云端解压、书签采集、在线热更新等 Rust 后端未实现的按钮会返回中文提示，完整能力仍以 NAS Docker 版为准；
+- 「返回 NAS 主页」的出厂地址 `127.0.0.1:8080` 在桌面上没有对应服务，点击不会跳转；在设置里改成自己的主页地址后即可正常打开；
+- 外链（发行说明、rclone 官网等）统一交给系统默认浏览器；
+- 需要**零 Web 依赖**的纯自绘轻量版，可加 `-LegacyGui` 构建 egui 版本（界面与 Web 版不同，[旧截图](docs/screenshots/10-desktop.png)）。
 
 构建自己的版本：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File rust\scripts\build-desktop.ps1 -ReleaseTag v3.56
+# 默认 --features webview（界面一致）；加 -LegacyGui 切到 egui 自绘版
 # 产物：rust\dist\desktop\cloud-shuttle-desktop.exe（单文件）
 ```
 

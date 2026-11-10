@@ -1,7 +1,7 @@
 //! 桌面版入口：原生窗口，不需要 HTTP 端口、static 目录或浏览器。
 
-pub mod bridge;
-pub mod platform;
+// 这两个模块已提升为 lib 顶层（WebView 窗口版也要用），此处保留原有引用路径。
+pub use crate::{bridge, platform};
 pub mod ui;
 
 use crate::config::{help_text, Config, APP_VERSION};

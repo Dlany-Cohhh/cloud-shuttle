@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "PikPak 多账号下载器 · 云梭 CloudShuttle 的 Rust 原生实现（桌面版 / 服务器版）"
 license = "MIT"
+build = "build.rs"
 
 [lib]
 name = "cloud_shuttle_rs"
@@ -14,15 +15,17 @@ path = "src/lib.rs"
 name = "cloud-shuttle-rs"
 path = "src/main.rs"
 
-# 桌面版：原生窗口应用，双击即用，不启动 HTTP 服务、不需要浏览器
+# 桌面版：原生窗口应用，双击即用，不启动 HTTP 服务、不需要浏览器。
+# --features webview  复用仓库根 static/，界面与 Web 版完全一致（默认发布形态）
+# --features gui      egui 自绘轻量版，零 Web 依赖
 [[bin]]
 name = "cloud-shuttle-desktop"
 path = "src/bin/desktop.rs"
-required-features = ["gui"]
 
 [features]
 default = []
 gui = ["dep:eframe"]
+webview = ["dep:wry", "dep:tao"]
 
 [dependencies]
 tokio = { version = "1", features = [
@@ -38,6 +41,11 @@ serde_json = "1"
 eframe = { version = "=0.31.1", optional = true, default-features = false, features = [
     "glow", "default_fonts"
 ] }
+
+# 桌面窗口版：用系统 WebView2 渲染同一份前端，protocol 提供进程内的资源响应。
+# 只在 Windows 桌面版启用，服务器版与 egui 版不会链接这些依赖。
+wry = { version = "=0.52.1", optional = true, default-features = false, features = ["protocol"] }
+tao = { version = "0.34", optional = true }
 
 [profile.release]
 opt-level = 2

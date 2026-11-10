@@ -3,6 +3,18 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.56（补充三）— 桌面 exe 界面与 Web 版完全一致（2026-11-10）
+
+> 仍然只改 Rust 桌面版资产，Python 版程序文件与 `APP_VERSION` 未变，NAS 在线更新不会误报升级。
+
+- 桌面 exe 默认形态改为 **WebView 原生窗口**，直接渲染仓库根 `static/` 那一份前端：DaisyUI 多套主题、Tabler 图标、ECharts 图表、动效、七个页面与全部按钮和 Web 控制台**像素级一致**，前端源码零改动；
+- `build.rs` 把 160 个静态资源（含 150 个图标字体）`include_bytes!` 进单文件 exe；`wry` 自定义协议在进程内响应 `/static/*` 与 `/media/*`（含 Range 在线播放），**全程不监听端口、不打开浏览器**；
+- 注入 `fetch` 桥接：前端唯一的 `POST /api` 经 IPC 交给后台 tokio runtime 的 `api::dispatch`，结果由事件循环回调，慢操作不卡窗口；
+- 新增 `webview` / `gui` 双 feature：`--features webview`（默认发布）界面一致且依赖系统 WebView2，`--features gui` 保留零 Web 依赖的 egui 自绘版；`build-desktop.ps1` 增加 `-LegacyGui` 开关；
+- 桌面适配：缺 rclone 时显示与主题一致的「一键下载」引导条（实测从官方源装出 v1.76.0）、外链统一交给系统浏览器、出厂 NAS 主页地址不再弹出连接失败页；
+- 回归：`clippy -D warnings`（gui / webview / 服务器版）、e2e 20/20、smoke 25/25；实机验证概览 / 统计 / 云盘预览 / 本地文件 / 账号 / 设置六个页面数据加载正常；
+- 新增实机截图 `docs/screenshots/11-desktop-webview.png`，README 与 `rust/README.md` 同步。
+
 ## v3.56（补充二）— 新增桌面原生窗口版（2026-11-10）
 
 > 只新增 Rust 桌面 exe 资产，Python 版程序文件与 `APP_VERSION` 均未变，NAS 在线更新不会误报升级。

@@ -4,7 +4,11 @@
 #   - cloud-shuttle.zip + .sha256            Python / Docker 版（NAS 在线更新固定找这两个名字）
 #   - cloud-shuttle-rs-windows-x86_64.zip    Rust 服务器版 Windows
 #   - cloud-shuttle-rs-linux-x86_64.tar.gz   Rust 服务器版 Linux
-#   - cloud-shuttle-desktop.exe              Rust 桌面原生窗口版（单文件 exe）
+#   - cloud-shuttle-desktop.exe              Rust 桌面窗口版（单文件 exe，界面与 Web 版一致）
+#
+# 桌面 exe 由 rust/scripts/build-desktop.ps1 默认构建（--features webview），
+# build.rs 会把仓库根 static/ 编进二进制，因此 CI 必须 checkout 完整仓库；
+# 构建机不需要 WebView2，那是最终用户机器上的运行时（Win10/11 自带）。
 #
 # 启用方式：在 GitHub 网页端 Add file → Create new file 建 .github/workflows/release.yml
 #          粘贴本文件；或用具备 workflow 权限的令牌直接 git push。
