@@ -1,17 +1,11 @@
 //! 云梭 CloudShuttle · Rust 原生应用进程
 //! 一个可执行文件同时服务 Windows 与 Linux：内建 HTTP 控制台 + rclone 下载编排。
 
-mod api;
-mod app;
-mod config;
-mod localfs;
-mod rclone;
-mod store;
-mod update;
-mod web;
-
-use app::{log, AppState};
-use config::{help_text, Config, APP_VERSION, DEFAULT_UPDATE_REPO};
+use cloud_shuttle_rs::api;
+use cloud_shuttle_rs::app::{log, AppState};
+use cloud_shuttle_rs::config::{help_text, Backend, Config, APP_VERSION, DEFAULT_UPDATE_REPO};
+use cloud_shuttle_rs::rclone;
+use cloud_shuttle_rs::web;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -38,11 +32,11 @@ fn self_check(cfg: &Config) -> Vec<(bool, String)> {
         format!("下载根目录：{}", cfg.download_root.display()),
     ));
     match cfg.backend {
-        config::Backend::Local => out.push((
+        Backend::Local => out.push((
             cfg.rclone_config.exists(),
             format!("rclone 配置：{}", cfg.rclone_config.display()),
         )),
-        config::Backend::Docker => out.push((
+        Backend::Docker => out.push((
             true,
             format!(
                 "docker 容器：{}（配置 {}）",
@@ -61,30 +55,6 @@ fn self_check(cfg: &Config) -> Vec<(bool, String)> {
         ),
     ));
     out
-}
-
-/// 上一次进程遗留的 running 任务没有子进程了，标记为已暂停。
-fn recover(st: &AppState) {
-    let mut store = st.store.lock().unwrap();
-    let mut n = 0;
-    if let Some(arr) = store.jobs.as_array_mut() {
-        for j in arr.iter_mut() {
-            if j.get("state").and_then(|v| v.as_str()) == Some("running") {
-                j["state"] = serde_json::json!("stopped");
-                j["error"] = serde_json::json!("进程重启后任务已暂停，点「继续」可续传");
-                j["speed"] = serde_json::json!(0);
-                j["pid"] = serde_json::json!(0);
-                n += 1;
-            }
-        }
-    }
-    if n > 0 {
-        store.save_jobs();
-        log(&format!(
-            "[recover] {} 个中断任务已标记为暂停（rclone 支持断点续传）",
-            n
-        ));
-    }
 }
 
 async fn shutdown_signal() {
@@ -168,7 +138,7 @@ async fn main() {
         log("[warn] rclone 不可用：账号 / 云盘列表 / 下载会报错，但本地文件页与设置仍可使用。");
     }
 
-    recover(&st);
+    cloud_shuttle_rs::app::recover(&st);
     let bg = st.clone();
     tokio::spawn(async move {
         // 先跑一轮，把重启时排队的任务拉起来

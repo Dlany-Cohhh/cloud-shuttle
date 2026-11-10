@@ -86,3 +86,28 @@ impl AppState {
 pub fn log(msg: &str) {
     println!("{}", msg);
 }
+
+/// 进程重启后，上次遗留的 running 任务已经没有 rclone 子进程了，标记为「已暂停」。
+/// HTTP 服务器版与桌面版共用，避免两处行为不一致。
+pub fn recover(st: &AppState) {
+    let mut store = st.store.lock().unwrap();
+    let mut n = 0;
+    if let Some(arr) = store.jobs.as_array_mut() {
+        for j in arr.iter_mut() {
+            if j.get("state").and_then(|v| v.as_str()) == Some("running") {
+                j["state"] = serde_json::json!("stopped");
+                j["error"] = serde_json::json!("程序重启后任务已暂停，点「继续」可续传");
+                j["speed"] = serde_json::json!(0);
+                j["pid"] = serde_json::json!(0);
+                n += 1;
+            }
+        }
+    }
+    if n > 0 {
+        store.save_jobs();
+        log(&format!(
+            "[recover] {} 个中断任务已标记为暂停（rclone 支持断点续传）",
+            n
+        ));
+    }
+}

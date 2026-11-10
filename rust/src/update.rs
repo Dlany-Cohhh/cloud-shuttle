@@ -1,7 +1,7 @@
 //! 版本信息：Python / Docker 版与 Rust 原生版共用一个仓库、一个 Release。
 //!
 //! 统一 Release（tag `v3.xx`）里同时带 `cloud-shuttle.zip`（Python 版在线更新用）
-//! 和 `cloud-shuttle-rs-*.zip|tar.gz`（原生版安装包）。原生版按**资产名**识别
+//! 和 `cloud-shuttle-rs-*.zip|tar.gz`、`cloud-shuttle-desktop.exe`（原生版安装包）。原生版按**资产名**识别
 //! 自己的安装包，不再依赖 `rs-v*` 标签，也就不会和 Python 版抢 `releases/latest`，
 //! NAS 上的在线更新永远不会读到一个没有 `cloud-shuttle.zip` 的 Release。
 //!
@@ -105,9 +105,10 @@ async fn fetch(url: &str) -> Result<String, String> {
 
 /// 统一 Release 里属于原生版的安装包。
 fn is_native_asset(name: &str) -> bool {
-    name.starts_with("cloud-shuttle-rs-")
-        && (name.ends_with(".zip") || name.ends_with(".tar.gz"))
-        && !name.ends_with(".sha256")
+    let native_prefix =
+        name.starts_with("cloud-shuttle-rs-") || name.starts_with("cloud-shuttle-desktop");
+    let package_ext = name.ends_with(".zip") || name.ends_with(".tar.gz") || name.ends_with(".exe");
+    native_prefix && package_ext && !name.ends_with(".sha256")
 }
 
 pub async fn check(repo: &str) -> Value {

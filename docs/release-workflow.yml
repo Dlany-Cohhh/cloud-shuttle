@@ -2,8 +2,9 @@
 #
 # 一个 workflow 同时构建两条发行线，产物附到**同一个 v3.xx Release**：
 #   - cloud-shuttle.zip + .sha256            Python / Docker 版（NAS 在线更新固定找这两个名字）
-#   - cloud-shuttle-rs-windows-x86_64.zip    Rust 原生版 Windows
-#   - cloud-shuttle-rs-linux-x86_64.tar.gz   Rust 原生版 Linux
+#   - cloud-shuttle-rs-windows-x86_64.zip    Rust 服务器版 Windows
+#   - cloud-shuttle-rs-linux-x86_64.tar.gz   Rust 服务器版 Linux
+#   - cloud-shuttle-desktop.exe              Rust 桌面原生窗口版（单文件 exe）
 #
 # 启用方式：在 GitHub 网页端 Add file → Create new file 建 .github/workflows/release.yml
 #          粘贴本文件；或用具备 workflow 权限的令牌直接 git push。
@@ -76,10 +77,19 @@ jobs:
         run: |
           powershell -ExecutionPolicy Bypass -File rust/scripts/build.ps1 -ReleaseTag $env:TAG
           Compress-Archive -Path rust/dist/windows/* -DestinationPath cloud-shuttle-rs-windows-x86_64.zip
+      - name: Build single-file desktop app
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File rust/scripts/build-desktop.ps1 -ReleaseTag $env:TAG
+          Copy-Item rust/dist/cloud-shuttle-desktop.exe .
+          Copy-Item rust/dist/cloud-shuttle-desktop.exe.sha256 .
       - uses: actions/upload-artifact@v4
         with:
           name: rust-windows
-          path: cloud-shuttle-rs-windows-x86_64.zip
+          path: |
+            cloud-shuttle-rs-windows-x86_64.zip
+            cloud-shuttle-desktop.exe
+            cloud-shuttle-desktop.exe.sha256
 
   rust-linux:
     runs-on: ubuntu-latest
@@ -113,7 +123,8 @@ jobs:
         run: |
           mkdir -p assets
           find artifacts -type f \( -name 'cloud-shuttle.zip' -o -name 'cloud-shuttle.zip.sha256' \
-            -o -name 'cloud-shuttle-rs-*.zip' -o -name 'cloud-shuttle-rs-*.tar.gz' \) \
+            -o -name 'cloud-shuttle-rs-*.zip' -o -name 'cloud-shuttle-rs-*.tar.gz' \
+            -o -name 'cloud-shuttle-desktop.exe' -o -name 'cloud-shuttle-desktop.exe.sha256' \) \
             -exec cp {} assets/ \;
           test -f assets/cloud-shuttle.zip || { echo "缺少 Python 发行包，中止"; exit 1; }
           ls -lh assets/

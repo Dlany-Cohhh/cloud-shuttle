@@ -28,6 +28,7 @@
 - [技术栈](#技术栈)
 - [一键部署](#一键部署)
 - [Rust 原生版（Windows / Linux）](#rust-原生版windows--linux)
+- [桌面版：单文件 exe（不用浏览器）](#桌面版单文件-exe不用浏览器)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [目录结构](#目录结构)
@@ -228,6 +229,33 @@ bash rust/scripts/build.sh --release-tag v3.56     # Linux 上执行，产物 ru
 ```
 
 产物目录自带前端 `static/`、`.env.example`，可直接拷到目标机器运行。原生版目前不含在线热更新，也不覆盖分享转存等高级功能；要这些能力请用主线 Docker 版。
+
+---
+
+## 桌面版：单文件 exe（不用浏览器）
+
+想要一个**普通 Windows 软件**：到 Releases 下载 `cloud-shuttle-desktop.exe`，双击就是应用窗口。它不启动 HTTP 服务、不打开浏览器、不需要 `static/` 文件夹，也不依赖 Python 或 Docker —— 单个原生 exe 约 6 MB。
+
+| | 桌面窗口版 | 服务器版 / Docker 版 |
+| --- | --- | --- |
+| 界面 | 原生窗口（Rust / egui 自绘） | 浏览器访问 Web 控制台 |
+| 端口 | 不监听任何端口 | 监听 5566 |
+| 数据位置 | `%APPDATA%\CloudShuttle`，下载到「下载\CloudShuttle」 | 由 compose / 环境变量指定 |
+| 外部依赖 | 只需 `rclone.exe`（首次启动可一键下载） | Docker + rclone-backend |
+| 平台 | Windows（Linux 服务器版继续用上面的构建脚本） | Windows / Linux / NAS |
+
+窗口内含**概览、下载任务、云盘浏览、账号管理、本地文件、设置、关于**七个页面，和 Web 版共用同一套业务逻辑与 `settings.json` / `jobs.json` / `rclone.conf` 数据格式；本地文件同样支持单项与批量重命名（两阶段回滚）。分享转存、云端解压等高级能力仍以 Docker 版为准。
+
+首次启动若检测不到 rclone，顶部会显示引导条，点「一键下载 rclone」自动装到用户目录；也可在「设置」页手动指定已有的 `rclone.exe`。账号可直接在窗口里添加，或把现有 `rclone.conf` 复制到数据目录。
+
+构建自己的版本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File rust\scripts\build-desktop.ps1 -ReleaseTag v3.56
+# 产物：rust\dist\desktop\cloud-shuttle-desktop.exe（单文件）
+```
+
+桌面版与 Python 包、服务器版挂在**同一个 Release** 上，按资产名区分，不会影响 NAS 的在线更新。
 
 ---
 

@@ -3,6 +3,16 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.56（补充二）— 新增桌面原生窗口版（2026-11-10）
+
+> 只新增 Rust 桌面 exe 资产，Python 版程序文件与 `APP_VERSION` 均未变，NAS 在线更新不会误报升级。
+
+- 新增 `cloud-shuttle-desktop.exe`：**单文件原生窗口程序**，双击即用，不启动 HTTP 服务、不打开浏览器、不需要 `static/`、不依赖 Python / Docker；
+- `rust/` 重构为共享库 + 双入口（`cloud-shuttle-rs` 服务器版行为不变 / `cloud-shuttle-desktop` 桌面版），两者共用 `api::dispatch` 全部业务逻辑与数据格式；
+- 桌面版七个页面：概览、下载任务、云盘浏览、账号管理、本地文件（单项 + 批量重命名）、设置、关于；中文字体走系统字体，支持浅色 / 深色；
+- 数据默认写 `%APPDATA%\CloudShuttle`，下载写「下载\CloudShuttle」；rclone 缺失时可在窗口内一键下载或手动指定；
+- 统一 Release 追加桌面 exe 与 sha256，`scripts/publish_release.py` 与 `docs/release-workflow.yml` 自动附带；原生版「检查更新」现在也能列出桌面包。
+
 ## v3.56（补充）— 同一仓库发布 Rust 原生版（2026-11-10）
 
 > 程序文件与 v3.56 完全相同，`APP_VERSION` 未变，NAS 在线更新不会提示升级；本次只是仓库结构与 Release 资产调整。

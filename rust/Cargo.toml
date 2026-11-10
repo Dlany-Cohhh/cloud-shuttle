@@ -2,8 +2,27 @@
 name = "cloud-shuttle-rs"
 version = "0.1.0"
 edition = "2021"
-description = "PikPak 多账号下载器 · 云梭 CloudShuttle 的 Rust 原生应用进程（Windows / Linux）"
+description = "PikPak 多账号下载器 · 云梭 CloudShuttle 的 Rust 原生实现（桌面版 / 服务器版）"
 license = "MIT"
+
+[lib]
+name = "cloud_shuttle_rs"
+path = "src/lib.rs"
+
+# 服务器版：NAS / Linux 上跑 HTTP 控制台，行为与合并前完全一致
+[[bin]]
+name = "cloud-shuttle-rs"
+path = "src/main.rs"
+
+# 桌面版：原生窗口应用，双击即用，不启动 HTTP 服务、不需要浏览器
+[[bin]]
+name = "cloud-shuttle-desktop"
+path = "src/bin/desktop.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = ["dep:eframe"]
 
 [dependencies]
 tokio = { version = "1", features = [
@@ -13,6 +32,12 @@ tokio = { version = "1", features = [
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# 固定版本：0.37 起 eframe::App 改成了 ui(&mut Ui) 模型，与本项目 UI 代码不兼容。
+# 纯 Rust 依赖（glow / OpenGL 走系统库），Windows 上不需要 C 工具链。
+eframe = { version = "=0.31.1", optional = true, default-features = false, features = [
+    "glow", "default_fonts"
+] }
 
 [profile.release]
 opt-level = 2

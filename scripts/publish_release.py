@@ -21,7 +21,12 @@ ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 ASSET = "cloud-shuttle.zip"
 RUST_DIST = ROOT / "rust" / "dist"
-RUST_ASSETS = ("cloud-shuttle-rs-windows-x86_64.zip", "cloud-shuttle-rs-linux-x86_64.tar.gz")
+RUST_ASSETS = (
+    "cloud-shuttle-rs-windows-x86_64.zip",
+    "cloud-shuttle-rs-linux-x86_64.tar.gz",
+    "cloud-shuttle-desktop.exe",
+    "cloud-shuttle-desktop.exe.sha256",
+)
 
 
 def run(args, **kw):

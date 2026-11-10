@@ -1,12 +1,18 @@
-# 云梭 CloudShuttle · Rust 原生应用进程（Windows / Linux）
+# 云梭 CloudShuttle · Rust 原生实现（桌面窗口版 / 服务器版）
 
-[PikPak 多账号下载器](https://github.com/Dlany-Cohhh/cloud-shuttle) 的 **Rust 版后端**：一个原生可执行文件，直接在本机跑起同一套 Web 控制台，用 `rclone` 编排多账号下载，不再依赖 Docker、Python 或常驻的 rclone RC 守护进程。
+[PikPak 多账号下载器](https://github.com/Dlany-Cohhh/cloud-shuttle) 的 Rust 实现。同一个 `src/` 业务逻辑库（`api::dispatch`）驱动两个入口：
 
-> 与 Python / Docker 版是**同一仓库里的两条发行线**，不是替换关系，也不是两个仓库：
-> - 想要 NAS 上完整的分享转存、回收站、云端解压、书签采集、在线热更新 → 继续用 Python / Docker 版。
-> - 想要 Windows / Linux 上「双击就能跑、一个进程管所有、开机自启、内存占用小」 → 用这一版。
+| 入口 | 产物 | 界面 | 适用 |
+| --- | --- | --- | --- |
+| **桌面窗口版** | `cloud-shuttle-desktop.exe` | 原生窗口，**不启动 HTTP、不打开浏览器** | Windows 上双击即用的单文件软件 |
+| **服务器版** | `cloud-shuttle-rs[.exe]` + `static/` | 浏览器访问本机 Web 控制台 | NAS / Linux / 开机自启 / 局域网访问 |
+
+> 与 Python / Docker 版是**同一仓库里的三条发行线**，不是替换关系：
+> - NAS 上要完整分享转存、回收站、云端解压、书签采集、在线热更新 → Python / Docker 版；
+> - Windows 上要「双击就是软件、不碰浏览器」→ 桌面窗口版；
+> - Linux / NAS 上要一个轻量常驻进程 → 服务器版。
 >
-> 两者共用**完全相同的前端**（仓库根目录 `static/`）、兼容的 `settings.json` / `jobs.json` / `rclone.conf` 格式，以及**同一个 Release**（tag `v3.xx`，按资产名区分安装包）。
+> 三者共用兼容的 `settings.json` / `jobs.json` / `rclone.conf` 格式，以及**同一个 Release**（tag `v3.xx`，按资产名区分安装包）。桌面窗口版与服务器版共用全部 Rust 业务代码，只是前端不同。
 
 ---
 
@@ -18,6 +24,25 @@
 - Windows 包解压后先跑 `cloud-shuttle-rs.exe --check`，再直接运行 exe（包内已含前端 `static/`）。
 - Linux 暂无预编译产物时，在 Linux 上执行 `bash scripts/build.sh` 自行编译；统一构建模板见 [`../docs/release-workflow.yml`](../docs/release-workflow.yml)。
 - 升级：原生版不能在线替换自身，下载新包覆盖可执行文件后重启即可，`data/` 里的设置、任务与账号配置全部保留。
+- 桌面窗口版：同一个 Release 里的 `cloud-shuttle-desktop.exe`（单文件，约 6 MB），见下一节。
+
+---
+
+## 〇·五、桌面窗口版（不用浏览器）
+
+`cloud-shuttle-desktop.exe` 双击就是应用窗口：**不启动 HTTP 服务、不打开浏览器、不需要 `static/` 目录**，也不依赖 Python / Docker。
+
+- 数据目录 `%APPDATA%\CloudShuttle\data\`（`settings.json` / `jobs.json` / `rclone.conf`），下载目录默认 `%USERPROFILE%\Downloads\CloudShuttle\`，均可用 `CS_DATA_DIR` / `CS_DOWNLOAD_ROOT` 覆盖；
+- rclone 按「用户指定 → `%APPDATA%\CloudShuttle\bin\` → exe 同目录 → PATH」探测；缺失时窗口顶部出现引导条，点「一键下载 rclone」用系统 PowerShell 从 rclone.org 下载解压，也可在「设置」页手动指定已有的 `rclone.exe`；
+- 七个页面：概览、下载任务、云盘浏览、账号管理、本地文件（单项 + 批量重命名）、设置、关于，共用服务器版全部业务 action；
+- 高级功能（分享转存、云端解压、在线热更新）与服务器版一样返回中文提示，完整能力仍以 Docker 版为准。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-desktop.ps1 -ReleaseTag v3.56
+# 产物 dist\desktop\cloud-shuttle-desktop.exe，另在 dist\ 放一份供发布脚本上传
+```
+
+`--check` / `--version` / `--help` 在桌面版里用系统对话框显示（Release 构建隐藏控制台窗口）。Linux 桌面窗口需要为 eframe 启用 X11 / Wayland 后端，当前发布产物只含 Windows exe；Linux 请继续用服务器版。
 
 ---
 
@@ -120,7 +145,9 @@ Linux 默认 `auto` 会自动探测 `rclone-backend` 容器是否存在；Window
 | 路径 | `PathBuf` 自动处理 `\`；API 路径统一用 `/` | 原生 `/` |
 | 前端资源 | exe 同目录 `static/` | 同左 |
 
-依赖只有 `tokio` / `axum` / `serde` / `serde_json`，**全纯 Rust**：不链接 OpenSSL、不需要 cmake 或 C 交叉编译器，因此同一份源码能在 Windows 与 Linux 上直接编译。唯一的外部命令是「检查更新」用到的系统 `curl`（Windows 10+ 自带，缺失时自动回退 PowerShell）；下载、账号、本地文件等功能只需要 `rclone`。
+> 上表是**服务器版**的差异；桌面窗口版（`cloud-shuttle-desktop.exe`）不需要 `static/`、不监听端口、不启动浏览器，也不使用 `web` 模块的路由。
+
+服务器版依赖只有 `tokio` / `axum` / `serde` / `serde_json`；桌面窗口版额外依赖固定版本的 `eframe 0.31.1`（`gui` feature，glow 走系统 OpenGL）。**全部是纯 Rust**：不链接 OpenSSL、不需要 cmake 或 C 交叉编译器，服务器版源码在 Windows 与 Linux 上都能直接编译。唯一的外部命令是「检查更新」用到的系统 `curl`（Windows 10+ 自带，缺失时自动回退 PowerShell）；下载、账号、本地文件等功能只需要 `rclone`。
 
 ---
 
