@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.64"
+APP_VERSION = "v3.65"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -6202,7 +6202,49 @@ def collector_bat(console_url):
                       "PikPak Token Collector", "pk_collect", "collector.ps1")
 
 
+def login_collector_ps(console_url):
+    """v3.65：直接输出 login-collector.ps1（替换 CONSOLE_URL），供一键协议安装脚本下载。"""
+    ps_path = next((p2 for p2 in LOGIN_PS_CANDIDATES if os.path.isfile(p2)), "")
+    if not ps_path:
+        raise RuntimeError("服务器缺少 login-collector.ps1")
+    with open(ps_path, encoding="utf-8") as f:
+        ps = f.read().replace("__CONSOLE_URL__", console_url)
+    return b"\xef\xbb\xbf" + ps.replace("\n", "\r\n").encode("utf-8")  # BOM：PS 5.1 按 UTF-8 读中文
+
+
+def login_collector_setup_bat(console_host):
+    """v3.65：一键协议安装脚本。运行一次后，Windows 里 pkcollect: 链接会直接
+    弹出干净浏览器采集窗口（不再需要每次下载 .bat）。只写 HKCU（用户级），可随时卸载。"""
+    bat = [
+        "@echo off",
+        "chcp 65001 >nul",
+        "title PikPak 一键采集协议安装",
+        'set "DIR=%LOCALAPPDATA%\\PikPakCollector"',
+        'set "HOST=' + console_host + '"',
+        "echo [1/3] 下载采集脚本（来自控制台 http://%HOST%/login-collector.ps1）...",
+        'if not exist "%DIR%" mkdir "%DIR%"',
+        'set "PKHOST=%HOST%"',
+        'set "PKDIR=%DIR%"',
+        'powershell -NoProfile -Command "try { [Net.ServicePointManager]::SecurityProtocol = '
+        '[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri (\'http://\' + $env:PKHOST + '
+        '\'/login-collector.ps1\') -OutFile (Join-Path $env:PKDIR \'login-collector.ps1\') -UseBasicParsing } '
+        'catch { Write-Host $_.Exception.Message; exit 1 }"',
+        "if errorlevel 1 (echo   下载失败：请确认能访问控制台地址后重试 & pause & exit /b 1)",
+        "echo [2/3] 注册 pkcollect:// 一键协议（仅当前用户）...",
+        'reg add HKCU\\Software\\Classes\\pkcollect /ve /d "URL:PikPak Collector" /f >nul',
+        'reg add HKCU\\Software\\Classes\\pkcollect /v "URL Protocol" /f >nul',
+        'reg add HKCU\\Software\\Classes\\pkcollect\\shell\\open\\command /ve /d '
+        '"powershell -NoProfile -ExecutionPolicy Bypass -File \\"%DIR%\\login-collector.ps1\\" \\"%1\\"" /f >nul',
+        "echo [3/3] 完成！以后在控制台的「重新登录」弹窗里点「打开干净浏览器」即可直接弹出采集窗口。",
+        "echo.",
+        "echo   卸载：删除目录 %DIR%，并运行 reg delete HKCU\\Software\\Classes\\pkcollect /f",
+        "pause",
+    ]
+    return ("\r\n".join(bat) + "\r\n").encode("utf-8")
+
+
 def login_collector_bat(console_url):
+
     """干净浏览器登录采集器：开一个全新临时 profile，用户登录后自动抓 token，
     结束即删除临时目录。不读取用户现有浏览器的任何数据。"""
     return _ps_to_bat(LOGIN_PS_CANDIDATES, console_url,
@@ -6432,7 +6474,38 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                 pass
+        elif path == "/login-collector.ps1":
+            host = self.headers.get("Host") or CONSOLE_PUBLIC_HOST
+            try:
+                data = login_collector_ps("http://%s/" % host)
+            except Exception as e:
+                self._send(500, "text/plain; charset=utf-8", str(e).encode())
+                return
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="login-collector.ps1"')
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+        elif path == "/login-collector-setup.bat":
+            host = self.headers.get("Host") or CONSOLE_PUBLIC_HOST
+            data = login_collector_setup_bat(host)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="PikPak-Collector-Setup.bat"')
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
         elif path in ("/login-collector.bat", "/logincollector"):
+
             host = self.headers.get("Host") or CONSOLE_PUBLIC_HOST
             try:
                 data = login_collector_bat("http://%s/" % host)

@@ -176,9 +176,10 @@ Vue.createApp({
       importOpen: false,
       importTab: "login",
       importTabs: [
-        { id: "login", label: "① 书签一键导入（推荐）" },
-        { id: "kit", label: "② 采集器" },
-        { id: "paste", label: "③ 粘贴导入" },
+        { id: "oneclick", label: "① 一键干净浏览器（推荐）" },
+        { id: "login", label: "② 书签一键导入" },
+        { id: "kit", label: "③ 采集器" },
+        { id: "paste", label: "④ 粘贴导入" },
       ],
       importText: "",
       importCreate: true,
@@ -2189,7 +2190,7 @@ Vue.createApp({
       this.relinkTarget = { name: t.name || "", email: t.email || "" };
       this.importResult = null;
       this.importText = "";
-      this.importTab = "login";
+      this.importTab = "oneclick";   /* v3.65：重登默认走一键干净浏览器 */
       this.importOpen = true;
       this.openPikPakLogin(true);
     },
@@ -2286,7 +2287,7 @@ Vue.createApp({
     /* ---------- Token 导入 / 采集 ---------- */
     openTokenImport() {
       this.importOpen = true; this.importResult = null;
-      this.relinkTarget = null; this.importTab = "login";   /* 普通导入不锁定账号 */
+      this.relinkTarget = null; this.importTab = "oneclick";   /* 普通导入不锁定账号 */
     },
     closeTokenImport() { this.importOpen = false; this.relinkTarget = null; },
 

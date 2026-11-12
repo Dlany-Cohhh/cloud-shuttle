@@ -1872,7 +1872,36 @@
               控制台会按 PikPak 身份<b>自动覆盖这个账号</b>，不用删除重建，也不会动其它账号；若登录成了别的账号，后端会拒绝写入。
             </div>
           </div>
-          <!-- ① 书签一键导入（推荐） -->
+          <!-- ① 一键干净浏览器（v3.65 推荐）：临时 profile + 内置 CDP 采集，登录后自动回传 -->
+          <div v-if="importTab==='oneclick'" class="flex flex-col gap-3">
+            <div class="rounded-xl border border-success/25 bg-success/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
+              <b>全自动流程</b>：点「下载采集器」→ 双击运行 → 自动弹出一个<b>全新的浏览器窗口</b>
+              （独立临时配置，<b>不读取你现有浏览器的任何数据</b>，用完即删），已自动打开 PikPak 登录页。
+              登录完成后凭证<b>自动回传控制台并导入</b>，浏览器自动关闭——不用拖书签、不用复制粘贴。
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <a class="btn-primary btn-press w-fit" href="/login-collector.bat">
+                <i class="ti ti-download"></i>下载采集器（下载后双击运行）
+              </a>
+              <button class="btn-sm" @click="openPikPakLogin()"><i class="ti ti-external-link"></i>打开登录页</button>
+            </div>
+            <div class="rounded-xl border border-base-content/10 bg-base-content/5 px-4 py-3 text-xs leading-relaxed text-base-content/70">
+              <b>进阶（可选，只需一次）</b>：下载并运行「一键协议安装」，之后点下面的按钮就能<b>直接弹出采集窗口</b>，不用每次下载 bat。
+              安装只写当前用户的注册表键，卸载 = 删除 <code class="rounded bg-base-300 px-1">%LOCALAPPDATA%\PikPakCollector</code>
+              并运行 <code class="rounded bg-base-300 px-1">reg delete HKCU\Software\Classes\pkcollect /f</code>。
+              <div class="mt-2 flex flex-wrap items-center gap-2">
+                <a class="btn-sm" href="/login-collector-setup.bat"><i class="ti ti-settings"></i>下载一键协议安装</a>
+                <a class="btn-sm primary" href="pkcollect:" title="需先运行过「一键协议安装」；浏览器提示没有关联应用 = 还没安装">
+                  <i class="ti ti-player-play"></i>打开干净浏览器
+                </a>
+              </div>
+            </div>
+            <div class="text-xs leading-relaxed text-base-content/50">
+              登录的账号必须与要修复的账号一致（按邮箱核对）；采集成功后账号列表会自动刷新，重新登录采集一次即可恢复，账号名与云端文件都不变。
+            </div>
+          </div>
+
+          <!-- ② 书签一键导入 -->
           <div v-if="importTab==='login'" class="flex flex-col gap-3">
             <div class="rounded-xl border border-info/25 bg-info/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
               <b>零脚本、零浏览器控制</b>：把下面这个按钮<b>拖到书签栏</b>（只做一次）。以后在
