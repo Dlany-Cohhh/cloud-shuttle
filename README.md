@@ -2,9 +2,9 @@
 
 > **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
-![version](https://img.shields.io/badge/version-v3.56-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
+![version](https://img.shields.io/badge/version-v3.57-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
-**当前版本 v3.56** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
+**当前版本 v3.57** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 
@@ -97,7 +97,7 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 
 ![设置页：并发、定时启停、传输参数、NAS 主页地址与自定义代理地址](docs/screenshots/07-settings.png)
 
-同时下载任务上限、每天自动开始 / 暂停时间、每任务传输线程数、校验器并发数、磁盘最低可用空间、高级 rclone 参数、限速与代理开关，以及可自定义的「NAS 主页地址」（侧边栏「返回 NAS 主页」用）。**自定义代理地址在页面往下滚后的「代理下载」卡片第三行**：输入框填 `http(s)://host:port`、`socks5://host:port` 或 `off`，点右侧「保存」，下方「当前生效」会回显实际地址。页面更底部的「版本与更新」卡片用来检查 GitHub 新版本并一键升级。所有设置持久化到 `settings.json`，源码 `DEFAULTS` 会自动补齐缺失字段。
+同时下载任务上限、每天自动开始 / 暂停时间、每任务传输线程数、校验器并发数、磁盘最低可用空间、**存储空间配额**（v3.57：给每个下载卷设容量上限，0 = 跟随实际容量）、高级 rclone 参数、限速与代理开关，以及可自定义的「NAS 主页地址」（侧边栏「返回 NAS 主页」用）。**自定义代理地址在页面往下滚后的「代理下载」卡片第三行**：输入框填 `http(s)://host:port`、`socks5://host:port` 或 `off`，点右侧「保存」，下方「当前生效」会回显实际地址。页面更底部的「版本与更新」卡片用来检查 GitHub 新版本并一键升级。所有设置持久化到 `settings.json`，源码 `DEFAULTS` 会自动补齐缺失字段。
 
 ---
 
@@ -129,7 +129,7 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 | 本地文件 | 浏览 / 播放 / 下载、M3U 与 CSV 导出、批量解压、**单项重命名**（文件夹 / 文件）、**批量重命名**（模板 / 正则 / 序号，整批预检 + 失败回滚）、一致性校验 |
 | 统计 | 实时速度、24 小时曲线、14 天下载量、账号容量、已完成传输、rclone 健康指标 |
 | 下载扩展 | OpenList 聚合网盘、aria2 BT / 磁力、yt-dlp 视频站（均为可选服务） |
-| 设置 | 传输参数、限速、日志、代理开关、**自定义代理地址**、NAS 主页地址等，全部持久化 |
+| 设置 | 传输参数、限速、日志、代理开关、**自定义代理地址**、**存储空间配额**（v3.57）、NAS 主页地址等，全部持久化 |
 | 界面与维护 | 32 套主题 + 跟随昼夜、侧栏折叠、版本与更新检查、一键下载升级 / 回滚、发行包校验与自动重启 |
 
 几个实现上值得一提的点：

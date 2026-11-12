@@ -7,7 +7,6 @@ const THEMES = ["acid","aqua","autumn","black","bumblebee","business","cmyk","co
   "sunset","synthwave","valentine","winter","wireframe"];
 const LIGHT_THEMES = new Set(["light","lofi","cupcake","corporate","bumblebee","cmyk","pastel",
   "garden","lemonade","autumn","valentine","winter","wireframe","emerald"]);
-const DISK_TOTAL = 926.4;
 /* 仓库版示例地址：部署后请在「设置 → NAS 主页地址」改成自己的导航页 */
 const DEFAULT_NAS_HOME = "http://127.0.0.1:8080/";
 
@@ -38,10 +37,10 @@ Vue.createApp({
       jobs: [],
       settings: {},
       effectiveProxyUrl: "",
-      state: { diskLow: false, diskFree: null },
+      /* v3.57 storages 由后端自动识别（不再写死磁盘总量），每项含 name/totalGB/freeGB/low */
+      state: { diskLow: false, diskFree: null, diskTotal: null, storages: [] },
       stats: { speed: 0, bytes: 0, transferring: [] },
       hist: [],
-      DISK_TOTAL,
 
       /* 任务页 */
       remotes: [],
@@ -58,6 +57,9 @@ Vue.createApp({
       filter: "all",
       dlFolder: "",
       localDirs: [],
+      dirVolumes: [],             // v3.57 localdirs 返回的存储空间分组
+      dlVolume: "",               // v3.57 新任务目标存储空间（空 = 主卷）
+      urlVolume: "",              // v3.57 URL 下载目标存储空间
       pickerTarget: "",
       urlForm: { url: "", folder: "" },
       urlAdding: false,
@@ -183,7 +185,7 @@ Vue.createApp({
 
       /* 设置页 */
       defaultNasHomeUrl: DEFAULT_NAS_HOME,
-      form: { maxConcurrent: 2, autoStart: "", autoPause: "", diskMinGB: 20,
+      form: { maxConcurrent: 2, autoStart: "", autoPause: "", diskMinGB: 20, diskQuotaGB: 0,
               nasHomeUrl: DEFAULT_NAS_HOME, proxyUrl: "",
               transfers: 6, checkers: 8, proxy: false, downloadProxy: true,
               advancedMode: false,
@@ -240,8 +242,9 @@ Vue.createApp({
                   mode: "copy", method: "share", proxy: true },
       detailLoading: false,
 
-      /* 本地文件页（v3.15）：只读浏览 /vol2/download */
+      /* 本地文件页（v3.15）：只读浏览全部存储空间；v3.57 顶层列卷，卷内绝对路径 */
       lfPath: "",
+      lfVolumes: [],
       lfDirs: [],
       lfFiles: [],
       lfLoading: false,
@@ -330,13 +333,17 @@ Vue.createApp({
       const bag = this.cleanupMode ? this.cleanupPicked : this.picked;
       return names.length > 0 && names.every(n => bag.includes(n));
     },
-    /* 本地文件页 */
+    /* 本地文件页：v3.57 顶层是存储空间列表，卷内为绝对路径导航 */
     lfCrumbs() {
-      const out = [{ label: "下载目录", path: "" }];
+      const out = [{ label: "存储空间", path: "" }];
+      if (!this.lfPath) return out;
+      const segs = this.lfPath.split("/").filter(Boolean);
+      const rootName = this.volumeNameOf("/" + segs.join("/")) || segs[0];
       let cur = "";
-      (this.lfPath ? this.lfPath.split("/") : []).filter(Boolean).forEach(s => {
-        cur = cur ? cur + "/" + s : s;
-        out.push({ label: s, path: cur });
+      segs.forEach((s, i) => {
+        cur = cur ? cur + "/" + s : "/" + s;
+        const isRoot = this.lfVolumes.some(v => v.console === cur);
+        out.push({ label: isRoot ? rootName : s, path: cur });
       });
       return out;
     },
@@ -645,8 +652,8 @@ Vue.createApp({
       return j ? j.remote + ":" + (j.subpath || "(根目录)") : "任务详情";
     },
     diskPct() {
-      if (this.state.diskFree == null) return 0;
-      return Math.max(0, Math.min(100, (1 - this.state.diskFree / DISK_TOTAL) * 100)).toFixed(1);
+      if (this.state.diskFree == null || this.state.diskTotal == null || this.state.diskTotal <= 0) return 0;
+      return Math.max(0, Math.min(100, (1 - this.state.diskFree / this.state.diskTotal) * 100)).toFixed(1);
     },
     statCards() {
       const n = {};
@@ -655,8 +662,8 @@ Vue.createApp({
         { label: "总速度",   value: this.fmtSpeed(this.stats.speed),  icon: "ti-activity",     brick: "bg-info/15 text-info" },
         { label: "本次累计", value: this.fmt(this.stats.bytes),       icon: "ti-stack-2",      brick: "bg-secondary/15 text-secondary" },
         { label: "进行中",   value: String(n.running || 0),           icon: "ti-player-play",  brick: "bg-warning/15 text-warning" },
-        { label: "排队中",   value: String(n.queued || 0),            icon: "ti-list-numbers", brick: "bg-accent/15 text-accent" },
-        { label: "已完成",   value: String(n.done || 0),              icon: "ti-circle-check", brick: "bg-success/15 text-success" },
+        { label: "排队中",   value: String(n.queued || 0),           icon: "ti-list-numbers", brick: "bg-accent/15 text-accent" },
+        { label: "已完成",   value: String(n.done || 0),             icon: "ti-circle-check", brick: "bg-success/15 text-success" },
         { label: "磁盘剩余", value: (this.state.diskFree ?? "--") + " GB", icon: "ti-database",
           brick: this.state.diskLow ? "bg-error/15 text-error" : "bg-success/15 text-success" },
       ];
@@ -1219,6 +1226,7 @@ Vue.createApp({
           path: this.curPath ? this.curPath + "/" + name : name,
           mode: this.mode,
           folder: this.dlFolder,
+          volume: this.dlVolume || undefined,   // v3.57 目标存储空间（空 = 主卷）
           proxy: this.dlProxy(),
           filter: this.dlFilterPayload || undefined,
         });
@@ -1235,6 +1243,7 @@ Vue.createApp({
           path: this.curPath ? this.curPath + "/" + name : name,
           mode: "copy",
           folder: this.dlFolder,
+          volume: this.dlVolume || undefined,
           proxy: this.dlProxy(),
         });
         if (d.error) { this.toast(d.error, "error"); return; }
@@ -1253,6 +1262,7 @@ Vue.createApp({
             path: this.curPath ? this.curPath + "/" + n : n,
             mode: this.mode,
             folder: this.dlFolder,
+            volume: this.dlVolume || undefined,
             proxy: this.dlProxy(),
             filter: this.dlFilterPayload || undefined,
           });
@@ -1527,6 +1537,7 @@ Vue.createApp({
         const d = await this.api("urldl", {
           url: this.urlForm.url,
           folder: this.urlForm.folder || "URL下载",
+          volume: this.urlVolume || undefined,
         });
         if (d.error) { this.toast(d.error, "error"); return; }
         this.toast("已提交 URL 下载任务", "ok");
@@ -2264,8 +2275,16 @@ Vue.createApp({
     async loadLocalDirs() {
       try {
         const d = await this.api("localdirs");
-        this.localDirs = d.dirs || [];
+        /* v3.57：后端返回分组 volumes（每个存储空间一组）；点选列表仍按当前选中卷展开 */
+        this.dirVolumes = d.volumes || [];
+        const cur = this.dirVolumes.find(v => v.root === (this.dlVolume || (this.dirVolumes[0] || {}).root));
+        this.localDirs = cur ? cur.dirs : (d.dirs || []);
       } catch (e) {}
+    },
+    switchDlVolume(root) {
+      this.dlVolume = root;
+      if (this.urlForm) this.urlVolume = root;
+      this.loadLocalDirs();
     },
     openPicker(t) {
       if (this.pickerTarget !== t) this.loadLocalDirs();
@@ -2374,6 +2393,7 @@ Vue.createApp({
         autoStart: s.autoStart || "",
         autoPause: s.autoPause || "",
         diskMinGB: s.diskMinGB ?? 20,
+        diskQuotaGB: s.diskQuotaGB ?? 0,   // v3.57 存储空间配额（0 = 跟随实际容量）
         nasHomeUrl: s.nasHomeUrl || DEFAULT_NAS_HOME,
         proxyUrl: s.proxyUrl || "",
         transfers: s.transfers ?? 6,
@@ -2434,6 +2454,12 @@ Vue.createApp({
         this.toast("NAS 主页地址须以 http:// 或 https:// 开头，且不能含空格", "error");
         return;
       }
+      const q = Number(this.form.diskQuotaGB);
+      if (!isFinite(q) || q < 0) {
+        this.toast("存储空间配额须为不小于 0 的数字（0 = 不限制，跟随实际容量）", "error");
+        return;
+      }
+      this.form.diskQuotaGB = q;
       const pu = String(this.form.proxyUrl || "").trim();
       if (pu && !/^(?:(?:https?|socks5h?):\/\/\S+|off|none|direct|disabled)$/i.test(pu)) {
         this.toast("代理地址须以 http(s):// 或 socks5:// 开头，或填 off 关闭代理", "error");
@@ -2774,7 +2800,8 @@ Vue.createApp({
       this.pickerTarget = "";
       await this.loadLocalFiles(p || "");
       if (this.lfError && p) {
-        const parent = p.split("/").filter(Boolean).slice(0, -1).join("/");
+        const segs = p.split("/").filter(Boolean).slice(0, -1);
+        const parent = p.startsWith("/") && segs.length ? "/" + segs.join("/") : segs.join("/");
         await this.loadLocalFiles(parent);
         if (!this.lfError) this.toast("原下载目录已不在 NAS，已打开上一级目录", "warning");
       }
@@ -2833,6 +2860,7 @@ Vue.createApp({
           this.lfError = d.error;
         } else {
           this.lfPath = d.path || "";
+          this.lfVolumes = d.volumes || this.state.storages || [];
           this.lfDirs = d.dirs || [];
           this.lfFiles = d.files || [];
           this.lfTruncated = !!d.truncated;
@@ -2845,13 +2873,26 @@ Vue.createApp({
         this.lfLoading = false;
       }
     },
+    /* 控制台挂载点 → 卷显示名（面包屑/提示用） */
+    volumeNameOf(consolePath) {
+      const v = (this.lfVolumes.length ? this.lfVolumes : this.state.storages)
+        .find(v => v.console === consolePath);
+      return v ? v.name : "";
+    },
     reloadLocalFiles() { return this.loadLocalFiles(this.lfPath); },
     goLf(path) { return this.loadLocalFiles(path || ""); },
     openLfDir(name) {
-      this.loadLocalFiles((this.lfPath ? this.lfPath + "/" : "") + name);
+      /* v3.57：顶层卷条目带 volumeRoot，点进去直接用该卷的绝对路径 */
+      const d = this.lfDirs.find(x => x.name === name);
+      if (d && d.volumeRoot) return this.loadLocalFiles(d.volumeRoot);
+      this.loadLocalFiles((this.lfPath ? this.lfPath.replace(/\/$/, "") + "/" : "") + name);
     },
     lfUp() {
-      this.loadLocalFiles(this.lfPath.split("/").filter(Boolean).slice(0, -1).join("/"));
+      /* 卷根的上一级 = 顶层存储空间列表 */
+      if (this.volumeNameOf(this.lfPath)) return this.loadLocalFiles("");
+      const p = this.lfPath.split("/").filter(Boolean);
+      p.pop();
+      this.loadLocalFiles(p.length ? "/" + p.join("/") : "");
     },
     /* v3.44 本地压缩包勾选：只对压缩包生效，勾选状态在切换目录时自动清空 */
     lfToggleAllArchives(on) {
@@ -3061,7 +3102,17 @@ Vue.createApp({
 
     /* ---------- 一致性校验（v3.16）：云盘 ↔ 落盘内容 ---------- */
     destToLocal(dest) {
+      /* rclone 侧任务目标 → 本地文件页路径。
+         v3.57：按后端识别的卷映射换算成控制台绝对路径（支持任一存储空间）；
+         识别信息还没回来时回退旧约定（剥 /data 前缀 = 相对主卷）。 */
       const s = String(dest || "").trim();
+      const vols = this.state.storages || [];
+      const hit = vols.filter(v => s === v.rclone || s.indexOf(v.rclone + "/") === 0)
+        .sort((a, b) => b.rclone.length - a.rclone.length)[0];
+      if (hit) {
+        const tail = s.slice(hit.rclone.length).replace(/^\//, "").replace(/\/$/, "");
+        return hit.console.replace(/\/$/, "") + (tail ? "/" + tail : "");
+      }
       if (s.indexOf("/data/") === 0) return s.slice(6).replace(/\/$/, "");
       return s === "/data" ? "" : s;
     },
@@ -3073,18 +3124,27 @@ Vue.createApp({
       } catch (e) { /* 轮询失败由 refresh() 统一提示，这里不弹横幅 */ }
     },
     /* 本地路径 → 反查它属于哪个下载任务，自动带出云端账号与路径。
+       输入兼容两种写法：相对主卷（kz/0501.mp4）与绝对路径（/vol2/download/kz/...）。
        例：kz/0501.mp4 命中 dest=/data/kz 的任务 → pikpik-合集:Pack From Shared/kz/0501.mp4 */
     guessCloudForLocal(localPath) {
-      const lp = String(localPath || "").replace(/^\/+|\/+$/g, "");
+      const raw = String(localPath || "");
+      const lp = raw.replace(/^\/+|\/+$/g, "");
       if (!lp) return null;
       for (const j of (this.jobs || [])) {
         const d = this.destToLocal(j.dest);
         if (!d) continue;
-        if (lp === d) return { remote: j.remote, cloudPath: j.subpath || "" };
-        if (lp.indexOf(d + "/") === 0) {
-          const rest = lp.slice(d.length + 1);
-          const base = String(j.subpath || "").replace(/\/$/, "");
-          return { remote: j.remote, cloudPath: base ? base + "/" + rest : rest };
+        /* 绝对路径（任务目标）与相对主卷两种口径都比对一次 */
+        const relOf = raw.startsWith("/") && raw.indexOf(d + "/") === 0
+          ? raw.slice(d.length + 1).replace(/\/+$/, "") : "";
+        const cand = [lp, relOf].filter(Boolean);
+        for (const c of cand) {
+          const dd = d.replace(/^\/+|\/+$/g, "");
+          if (c === dd) return { remote: j.remote, cloudPath: j.subpath || "" };
+          if (c.indexOf(dd + "/") === 0) {
+            const rest = c.slice(dd.length + 1);
+            const base = String(j.subpath || "").replace(/\/$/, "");
+            return { remote: j.remote, cloudPath: base ? base + "/" + rest : rest };
+          }
         }
       }
       return null;

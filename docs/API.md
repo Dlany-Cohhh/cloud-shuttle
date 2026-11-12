@@ -93,11 +93,26 @@ curl -s -X POST http://<控制台地址>/api \
 - `version`
 - `xferstart`
 
-各 action 的完整参数、返回字段与调用位置见 `download-console.py` 的 `handle_api()`：
+各 action 的完整参数、返回字段与调用位置见 `download-console.py` 的 `api()`：
 
 ```bash
 grep -n 'action ==' download-console.py
 ```
+
+### 存储空间（v3.57+）
+
+后端用 `docker inspect` 把控制台与 `rclone-backend` 的挂载按宿主 Source 配对，自动识别全部下载卷；`docker.sock` 不可用时回退内置约定（`/data` ↔ `/vol2/download`）。
+
+| 接口 | 字段 | 说明 |
+| --- | --- | --- |
+| `settings` / `jobs` | `state.storages` | 识别出的存储空间数组：`name`（存储空间 N）、`rclone`（rclone 侧根）、`console`（控制台挂载点）、`totalGB` / `freeGB` / `usedPct` / `low` |
+| `settings` / `jobs` | `state.diskFree` / `diskTotal` | 兼容字段：最紧卷的剩余与总量（GB） |
+| `savesettings` | `diskQuotaGB` | 每个存储空间的容量上限（GB，0 = 跟随实际容量），配额剩余不足即触发磁盘保护 |
+| `localdirs` | `volumes` | 按空间分组的已有目录：`root`（rclone 侧根）/ `console` / `name` / `dirs`；顶层 `dirs` 仍是主卷平铺列表（兼容旧前端） |
+| `localfiles` | 空路径 | 顶层返回存储空间列表：`dirs` 每项带 `volumeRoot` / `freeGB` / `totalGB`，`volumes` 为完整卷信息；卷内路径为控制台绝对路径 |
+| `start` / `urldl` | `volume` | 可选，传 `localdirs.volumes[].root`，缺省 = 主卷（`/data` 对应卷） |
+
+磁盘空间保护按任务的目标卷判断（`start` / `resume` 的报错会指明具体哪块空间不足）。
 
 ### 自定义代理地址（v3.55+）
 

@@ -52,7 +52,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.56"
+APP_VERSION = "v3.57"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -122,11 +122,16 @@ RCLONE_RC_PASS = os.environ.get("RCLONE_RC_PASS", "")
 CONSOLE_PUBLIC_HOST = os.environ.get("CONSOLE_PUBLIC_HOST", "localhost:5566")
 RC = ["docker", "exec", "rclone-backend", "rclone", "rc", "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS]
 LOCK = threading.RLock()
-STATE = {"diskLow": False, "diskFree": None, "firedStart": None, "firedPause": None}
+STATE = {"diskLow": False, "diskFree": None, "diskTotal": None, "storages": [],
+         "volumePairs": None, "firedStart": None, "firedPause": None}
 # v3.44：正在跑的「解压」任务（云端轮询线程 / 本地解压线程）。
 # job_live 用它区分「线程还在推进度」与「控制台重启过、线程已丢」。
 UNZIP_ALIVE = set()
 DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 20,
+            # v3.57 自定义存储空间：每个下载卷的容量上限（GB，十进制口径与页面显示一致）。
+            # 0 = 不限，按磁盘真实容量显示与保护；>0 时该卷的「剩余」按 配额-已用 折算，
+            # 配额按整卷占用计（同一卷上其他程序的数据也算在内），配额用尽触发磁盘保护。
+            "diskQuotaGB": 0,
             "transfers": 6, "checkers": 8, "proxy": False, "downloadProxy": True,
             # v3.36 高级传输参数：这些值通过 rclone rc 的 _config 按任务注入，
             # 不修改 rcd 守护进程的全局配置，也不会重启容器。
@@ -1060,6 +1065,7 @@ def _norm_settings(raw):
         d[key] = max(lo, min(hi, v))
     num("maxConcurrent", 1, 6)
     num("diskMinGB", 0, 10000, float)
+    num("diskQuotaGB", 0, 10000000, float)
     num("transfers", 1, 12)
     num("checkers", 1, 16)
     num("multiThreadStreams", 1, 32)
@@ -1116,9 +1122,11 @@ def basename_of(path):
     p = path.rstrip("/").split("/")[-1] if path.strip("/") else path.split(":")[0]
     return p or path.split(":")[0]
 
-def dedupe_dest(dest):
+def dedupe_dest(dest, fs="/data"):
+    """目标目录重名避让：列出 fs 根下已有目录名，撞名就追加 -2 / -3。
+    v3.57 支持 fs 参数（多存储空间后每个卷各查各的根）。"""
     try:
-        r = rc("operations/list", fs="/data", remote="")
+        r = rc("operations/list", fs=fs, remote="")
         names = {e.get("Name", "") for e in r.get("list", [])}
     except Exception:
         return dest
@@ -2481,8 +2489,12 @@ def _xfer_worker(job_id):
                     speed=0, eta=None, curfile="")
 
     def finish(err=""):
+        # v3.57：total 取 jobs.json 里的最新值（扫描阶段已回填真实字节数）；
+        # job 变量是启动时的快照，目录任务启动时 total=0，直接用会把统计覆盖回 0
+        cur = _xfer_fetch(job_id) or {}
+        t = cur.get("total") or job.get("total") or 0
         _xfer_patch(job_id, state="done", phase="", speed=0, eta=None, curfile="",
-                    bytes=job.get("total") or 0, total=job.get("total") or 0, error=err)
+                    bytes=t, total=t, error=err)
 
     _xfer_patch(job_id, state="running", phase="scan", error="", bytes=0,
                 speed=0, eta=None, curfile="", started_ts=time.time())
@@ -3009,16 +3021,144 @@ def stop_job_entry(j):
             pass
     j["state"] = "stopped"
 
-def disk_free_gb():
+# ── v3.57 存储空间自动识别 ────────────────────────────────────────────
+# 旧版把下载目录写死成 /vol2/download、磁盘总量写死在前端（926.4 GB）。
+# 现在启动时用 docker inspect 把「控制台」与「rclone-backend」两边的挂载按宿主
+# Source 路径配对：同一个宿主目录在两个容器里的挂载点即构成一个「存储空间」，
+# 挂了几个就识别几个，容量全部实时读取，不再有任何写死的数字。
+# docker.sock 不可用等异常情况回退到内置的单卷约定，行为与旧版完全一致。
+LEGACY_VOLUME = {"rclone": "/data", "console": "/vol2/download"}
+SELF_CONTAINER = os.environ.get("UPDATE_CONTAINER", "download-console")
+
+def _inspect_mounts(container):
+    """docker inspect 拿一个容器的 bind 挂载，返回 [(宿主Source, 容器内Destination)]"""
+    pr = subprocess.run(["docker", "inspect", container,
+                         "--format", "{{json .Mounts}}"],
+                        capture_output=True, text=True, timeout=15)
+    out = []
+    for m in json.loads(pr.stdout or "[]"):
+        src, dst = str(m.get("Source") or ""), str(m.get("Destination") or "")
+        if src and dst:
+            out.append((src, dst))
+    return out
+
+def storage_pairs():
+    """识别可用下载卷：宿主 Source 相同的 (控制台挂载点, rclone挂载点) 配对。
+    rclone=/data 的主卷排最前（历史 dest 约定）；识别失败回退内置单卷。"""
     try:
-        return round(shutil.disk_usage("/vol2/download").free / 1073741824.0, 1)
+        rmap = {}
+        for src, dst in _inspect_mounts("rclone-backend"):
+            rmap.setdefault(src, dst)
+        pairs, seen = [], set()
+        for src, cdst in _inspect_mounts(SELF_CONTAINER):
+            rdst = rmap.get(src)
+            if rdst and rdst != "/" and rdst not in seen and os.path.isdir(cdst):
+                seen.add(rdst)
+                pairs.append({"rclone": rdst.rstrip("/"), "console": cdst.rstrip("/") or "/", "host": src})
+        if pairs:
+            pairs.sort(key=lambda p: (p["rclone"] != "/data", p["rclone"]))
+            return pairs
+    except Exception:
+        pass
+    return [dict(LEGACY_VOLUME)]
+
+def refresh_storages(s=None):
+    """重算每个存储空间的容量（真实值 + 可选配额折算），写入 STATE["storages"]。
+    挂载关系在容器生命周期内不变，只识别一次；容量每轮 scheduler 刷新。"""
+    if not STATE.get("volumePairs"):
+        STATE["volumePairs"] = storage_pairs()
+    s = s or load_settings()
+    quota = float(s.get("diskQuotaGB") or 0)
+    disk_min = float(s.get("diskMinGB") or 0)
+    stors = []
+    for i, p in enumerate(STATE["volumePairs"], 1):
+        try:
+            du = shutil.disk_usage(p["console"])
+        except OSError:
+            continue
+        total = du.total / 1073741824.0
+        free = du.free / 1073741824.0
+        if quota > 0:
+            # 配额只做逻辑上限：显示与保护按 配额-整卷已用 折算，物理剩余仍由解压预检兜底
+            used = total - free
+            total = min(total, quota)
+            free = max(0.0, min(free, quota - used))
+        stors.append({"name": "存储空间 %d" % i,
+                      "rclone": p["rclone"], "console": p["console"], "host": p["host"],
+                      "totalGB": round(total, 1), "freeGB": round(free, 1),
+                      "usedPct": round(min(100.0, (total - free) / total * 100.0), 1) if total > 0 else 0.0,
+                      "low": free < disk_min})
+    STATE["storages"] = stors
+    return stors
+
+def storages():
+    return STATE.get("storages") or []
+
+def primary_root():
+    """主卷（rclone=/data，兼容旧任务）在 storage_pairs 里排第一。"""
+    rs = local_roots()
+    return rs[0] if rs else LEGACY_VOLUME["console"]
+
+def local_roots():
+    return [p["console"] for p in (STATE.get("volumePairs") or [LEGACY_VOLUME])] or [LEGACY_VOLUME["console"]]
+
+def volume_effective_free(pair, s=None):
+    """一个卷的有效剩余（GB）：物理剩余与配额剩余取小；卷不可统计时返回 None"""
+    try:
+        free = shutil.disk_usage(pair["console"]).free / 1073741824.0
+    except OSError:
+        return None
+    quota = float((s or load_settings()).get("diskQuotaGB") or 0)
+    if quota > 0:
+        used = shutil.disk_usage(pair["console"]).total / 1073741824.0 - free
+        free = min(free, quota - used)
+    return max(0.0, free)
+
+def dest_volume(dest):
+    """rclone 侧路径（/data/xxx、/mnt/disk2/xxx…）→ 所属卷 pair；找不到回退主卷"""
+    d = str(dest or "").rstrip("/") or "/"
+    best = None
+    for p in (STATE.get("volumePairs") or [LEGACY_VOLUME]):
+        r = p["rclone"]
+        if d == r or d.startswith(r + "/"):
+            if best is None or len(r) > len(best["rclone"]):
+                best = p
+    return best or (STATE.get("volumePairs") or [LEGACY_VOLUME])[0]
+
+def job_volume(job):
+    """任务 → 所属卷。下载/URL 任务的 dest 是 rclone 路径；本地解压的 dest 是控制台路径。"""
+    lp = str(job.get("dest") or "")
+    for p in (STATE.get("volumePairs") or [LEGACY_VOLUME]):
+        if lp == p["console"] or lp.startswith(p["console"].rstrip("/") + "/"):
+            return p
+    return dest_volume(lp)
+
+def disk_free_gb():
+    """全局展示口径：所有存储空间里最紧的剩余值。"""
+    fr = [st["freeGB"] for st in storages()]
+    if fr:
+        return min(fr)
+    try:
+        return round(shutil.disk_usage(LEGACY_VOLUME["console"]).free / 1073741824.0, 1)
     except Exception:
         return None
 
 def local_dest(dest):
-    """rclone 侧目标路径 /data/xxx → 本容器挂载路径 /vol2/download/xxx（rclone-backend 容器内 /data 即宿主机 /vol2/download）"""
-    if str(dest).startswith("/data/"):
-        return "/vol2/download/" + str(dest)[len("/data/"):]
+    """rclone 侧目标路径 → 本容器挂载路径。
+    v3.57：按自动识别的卷映射（rclone 根 → 控制台根，最长前缀优先）；
+    映射不到时回退内置约定 /data/xxx → /vol2/download/xxx。"""
+    d = str(dest or "")
+    best = None
+    for p in (STATE.get("volumePairs") or [LEGACY_VOLUME]):
+        r = p["rclone"]
+        if r and (d == r or d.startswith(r + "/")):
+            if best is None or len(r) > len(best["rclone"]):
+                best = p
+    if best:
+        tail = d[len(best["rclone"]):].lstrip("/")
+        return best["console"].rstrip("/") + ("/" + tail if tail else "")
+    if d.startswith("/data/"):
+        return "/vol2/download/" + d[len("/data/"):]
     return None
 
 def completed_transfers(since_ts):
@@ -3073,26 +3213,29 @@ def completed_transfers(since_ts):
         out.append({"name": n, "size": size, "bytes": size})
     return out
 
+SPD_LOCK = threading.Lock()   # stats 请求线程与 scheduler 采样线程并发调用，读改写必须串行
+
 def instant_speed(cur):
     """rclone core/stats 的 speed 是"进程启动至今的平均速度"，连续跑几天后几乎不动，
     历史图上就是一条 6.99 MiB/s 的直线。改为用两次采样之间的字节差算瞬时速度，
     再做一次指数平滑压抖动。返回 (速度B/s, 区间内新增字节)。"""
     now = time.time()
-    pb, pt = STATE.get("spdBytes"), STATE.get("spdTime")
-    STATE["spdBytes"], STATE["spdTime"] = cur, now
-    if pb is None or pt is None:
-        return 0.0, 0
-    if cur < pb:                          # rclone 重启，bytes 归零
-        STATE["spdEma"] = 0.0
-        return 0.0, 0
-    dt, delta = now - pt, cur - pb
-    if dt < 0.3:                          # 两次轮询挨太近，用上次的平滑值
-        return float(STATE.get("spdEma") or 0.0), 0
-    raw = delta / dt
-    ema = STATE.get("spdEma")
-    ema = raw if not ema else ema * 0.6 + raw * 0.4
-    STATE["spdEma"] = ema
-    return round(ema, 1), delta
+    with SPD_LOCK:                    # v3.57：加专用小锁，避免两条线程交错污染 EMA
+        pb, pt = STATE.get("spdBytes"), STATE.get("spdTime")
+        STATE["spdBytes"], STATE["spdTime"] = cur, now
+        if pb is None or pt is None:
+            return 0.0, 0
+        if cur < pb:                      # rclone 重启，bytes 归零
+            STATE["spdEma"] = 0.0
+            return 0.0, 0
+        dt, delta = now - pt, cur - pb
+        if dt < 0.3:                      # 两次轮询挨太近，用上次的平滑值
+            return float(STATE.get("spdEma") or 0.0), 0
+        raw = delta / dt
+        ema = STATE.get("spdEma")
+        ema = raw if not ema else ema * 0.6 + raw * 0.4
+        STATE["spdEma"] = ema
+        return round(ema, 1), delta
 
 
 def load_history():
@@ -3157,25 +3300,32 @@ def scheduler():
             with LOCK:
                 s = load_settings()
                 jobs = load_jobs()
-                fr = disk_free_gb()
-                if fr is not None:
-                    STATE["diskFree"] = fr
-                    STATE["diskLow"] = fr < s["diskMinGB"]
-                low = STATE["diskLow"]
+                # v3.57：每轮刷新存储空间容量（含配额折算）；磁盘保护按任务的目标卷判断，
+                # 一个卷满了只停目标在该卷的任务，别的卷照常下载。
+                stors = refresh_storages(s)
+                frs = [st["freeGB"] for st in stors]
+                if frs:
+                    STATE["diskFree"] = min(frs)
+                    tight = min(stors, key=lambda st: st["freeGB"])
+                    STATE["diskTotal"] = tight["totalGB"]
+                disk_min = float(s["diskMinGB"] or 0)
+                STATE["diskLow"] = any(st["low"] for st in stors)
+                def vol_low(j):
+                    vf = volume_effective_free(job_volume(j), s)
+                    return vf is not None and vf < disk_min
                 running = [j for j in jobs if j["state"] == "running"]
                 changed = False   # 只在任务状态真的变化时才写盘，避免每 20s 无谓 I/O
-                if low and running:
-                    for j in running:
+                for j in running:
+                    if vol_low(j):
                         stop_job_entry(j)
                         j["error"] = "磁盘空间保护触发，已自动暂停"
-                    changed = True
-                if not low:
-                    for j in jobs:
-                        if len(running) >= s["maxConcurrent"]:
-                            break
-                        if j["state"] == "queued" and launch_job(j, s):
-                            running.append(j)
-                            changed = True
+                        changed = True
+                for j in jobs:
+                    if len(running) >= s["maxConcurrent"]:
+                        break
+                    if j["state"] == "queued" and not vol_low(j) and launch_job(j, s):
+                        running.append(j)
+                        changed = True
                 if s["autoStart"] and s["autoPause"]:
                     now = time.strftime("%H:%M")
                     today = time.strftime("%F")
@@ -3217,11 +3367,11 @@ def scheduler():
         time.sleep(20)
 
 # ---------------------------------------------------------------------------
-# 本地文件页（v3.15）：只读浏览 /vol2/download，在线播放 + 下载到本机
+# 本地文件页（v3.15）：只读浏览所有已识别的存储空间，在线播放 + 下载到本机
 #   · 只开放 GET/HEAD 读取，不提供写/删接口，避免误操作破坏下载成果
-#   · 所有路径经 realpath 校验，禁止 ../ 与符号链接跳出根目录
+#   · 所有路径经 realpath 校验，禁止 ../ 与符号链接跳出下载卷
+#   · v3.57：/vol2/download 单卷 → 多卷（顶层空路径先列存储空间，路径可为绝对路径）
 # ---------------------------------------------------------------------------
-LOCAL_ROOT = "/vol2/download"
 MEDIA_TYPES = {
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
     ".ogv": "video/ogg", ".mov": "video/quicktime", ".mkv": "video/x-matroska",
@@ -3255,11 +3405,22 @@ def local_kind(ext):
 
 
 def safe_local_path(rel):
-    """前端相对路径 → 绝对路径。任何越界（../ 或软链接指向外部）一律拒绝。"""
+    """本地文件页路径 → 绝对路径。任何越界（../ 或软链接跳出下载卷）一律拒绝。
+    v3.57 支持两种写法：绝对路径（/vol2/download/kz，须落在任一存储空间内），
+    以及相对主卷的旧格式（kz/kz/0501.mp4，老链接与一致性校验沿用）。"""
     parts = [p for p in str(rel or "").split("/") if p not in ("", ".")]
     if any(p == ".." for p in parts):
         raise ValueError("路径越界")
-    root = os.path.realpath(LOCAL_ROOT)
+    if str(rel or "").startswith("/"):
+        if not parts:
+            raise ValueError("路径越界")
+        full = os.path.realpath(os.sep + os.sep.join(parts))
+        for r in local_roots():
+            root = os.path.realpath(r)
+            if full == root or full.startswith(root + os.sep):
+                return full
+        raise ValueError("路径越界")
+    root = os.path.realpath(primary_root())
     full = os.path.realpath(os.path.join(root, *parts))
     if full != root and not full.startswith(root + os.sep):
         raise ValueError("路径越界")
@@ -3347,8 +3508,10 @@ def local_unzip_start(rel, password="", delete_after=False):
     if not kind:
         return {"error": "只支持 zip / tar / tar.gz / tgz / tar.bz2 / tar.xz"}
     dest = os.path.join(os.path.dirname(src), archive_stem(base))
-    root = os.path.realpath(LOCAL_ROOT)
-    if not (os.path.realpath(dest) == root or os.path.realpath(dest).startswith(root + os.sep)):
+    # v3.57：越界校验按「任一存储空间」判断（rel 可以是第二卷的绝对路径）
+    rdest = os.path.realpath(dest)
+    if not any(rdest == os.path.realpath(r) or rdest.startswith(os.path.realpath(r) + os.sep)
+               for r in local_roots()):
         return {"error": "解压目标越界"}
     try:
         free = shutil.disk_usage(os.path.dirname(src)).free
@@ -3359,7 +3522,7 @@ def local_unzip_start(rel, password="", delete_after=False):
            "name": base, "mode": "unzip", "state": "running",
            "started": time.strftime("%m-%d %H:%M"), "bytes": 0, "total": 0,
            "speed": 0, "eta": None, "error": "", "pctNum": 0, "phase": "准备解压",
-           "dest": "/vol2/download/" + (str(rel or "").rsplit("/", 1)[0] + "/" if "/" in str(rel or "") else "") + os.path.basename(dest),
+           "dest": os.path.dirname(src).rstrip("/") + "/" + os.path.basename(dest),
            "freeBytes": free}
     with LOCK:
         jobs = load_jobs()
@@ -3468,7 +3631,22 @@ def _local_unzip_worker(job_id, src, dest, password, delete_after, kind):
 
 
 def localfiles_listing(rel):
-    """列一个目录。path/parent 供前端面包屑；dirs/files 已按名称排序。"""
+    """列一个目录。path/parent 供前端面包屑；dirs/files 已按名称排序。
+    v3.57：空路径返回存储空间顶层——每个卷作为一个目录条目（带 volumeRoot，
+    前端点进后 path 用该卷的绝对路径）。"""
+    if not str(rel or "").strip("/"):
+        dirs = []
+        for st in storages():
+            try:
+                count = sum(1 for n in os.listdir(st["console"])
+                            if os.path.isdir(os.path.join(st["console"], n)))
+            except OSError:
+                count = 0
+            dirs.append({"name": st["name"], "count": count, "mtime": 0,
+                         "volumeRoot": st["console"],
+                         "freeGB": st["freeGB"], "totalGB": st["totalGB"]})
+        return {"path": "", "parent": None, "volumes": storages(),
+                "dirs": dirs, "files": [], "truncated": False}
     try:
         p = safe_local_path(rel)
     except ValueError as e:
@@ -3503,7 +3681,15 @@ def localfiles_listing(rel):
             files.append({"name": name, "size": st.st_size, "mtime": int(st.st_mtime),
                           "ext": ext, "kind": local_kind(ext), "playable": ext in BROWSER_OK,
                           "archive": bool(local_archive_kind(name))})
-    return {"path": "/".join(segs), "parent": "/".join(segs[:-1]),
+    # v3.57 面包屑：绝对路径保持前导斜杠；卷根的上一级是顶层存储空间列表
+    is_abs = str(rel or "").startswith("/")
+    path = ("/" if is_abs else "") + "/".join(segs)
+    rp = os.path.realpath(p)
+    parent = ""
+    if not any(rp == os.path.realpath(r) for r in local_roots()):
+        up = segs[:-1]
+        parent = ("/" + "/".join(up)) if (is_abs and up) else "/".join(up)
+    return {"path": path, "parent": parent,
             "dirs": dirs, "files": files, "truncated": truncated}
 
 # ---------------------------------------------------------------------------
@@ -3777,7 +3963,13 @@ def verify_local(rel):
         p = safe_local_path(rel)
     except ValueError as e:
         return {}, "", "", False, str(e)
-    root = os.path.realpath(LOCAL_ROOT)
+    # v3.57：软链接越界基准改为 p 所属的存储空间根（rel 可指向任一卷）
+    root = os.path.realpath(primary_root())
+    for r in local_roots():
+        rp = os.path.realpath(r)
+        if p == rp or p.startswith(rp + os.sep):
+            root = rp
+            break
     if os.path.isfile(p):
         return {_norm_key(os.path.basename(p)): {"size": os.path.getsize(p), "abs": p}}, \
                "file", p, False, ""
@@ -3809,33 +4001,34 @@ def verify_local(rel):
 
 
 def local_download_index(limit=VERIFY_MAX_FILES):
-    """云盘预览「已下载」判定索引：递归扫 /vol2/download，返回 {(归一化文件名, 字节数)}。
+    """云盘预览「已下载」判定索引：递归扫全部存储空间，返回 {(归一化文件名, 字节数)}。
 
     落盘位置不固定 —— 单文件可能是 /data/<文件名> 或 /data/<保存目录>/<文件名>，
     整个云端目录下载则是 /data/<目录名>/...，所以不能按云端的相对路径去查，
     也不能只扫根层。用「同名 + 同大小」判定可以覆盖以上所有情况，同时自动
     排除 .partial / .part 未下完的临时文件以及大小不同的旧版本。
 
-    控制台容器内 /vol2/download 就是宿主机下载目录的挂载，文件量小（几十~几百），
-    每次列目录实时扫一遍即可：不做缓存，下载一完成标签就出现。
+    v3.57 起逐个扫描自动识别的存储空间；文件量小（几十~几百），每次列目录
+    实时扫一遍即可：不做缓存，下载一完成标签就出现。
     """
     idx = set()
     try:
-        root = os.path.realpath(LOCAL_ROOT)
-        for cur, dnames, fnames in os.walk(root, followlinks=False):
-            dnames[:] = [d for d in dnames if not _junk_name(d)]
-            for fn in fnames:
-                if _junk_name(fn):
-                    continue
-                try:
-                    st = os.stat(os.path.join(cur, fn))
-                    if not statmod.S_ISREG(st.st_mode):
+        for r in local_roots():
+            root = os.path.realpath(r)
+            for cur, dnames, fnames in os.walk(root, followlinks=False):
+                dnames[:] = [d for d in dnames if not _junk_name(d)]
+                for fn in fnames:
+                    if _junk_name(fn):
                         continue
-                except OSError:
-                    continue
-                idx.add((_norm_key(fn), int(st.st_size)))
-                if len(idx) >= limit:
-                    return idx
+                    try:
+                        st = os.stat(os.path.join(cur, fn))
+                        if not statmod.S_ISREG(st.st_mode):
+                            continue
+                    except OSError:
+                        continue
+                    idx.add((_norm_key(fn), int(st.st_size)))
+                    if len(idx) >= limit:
+                        return idx
     except Exception:
         pass
     return idx
@@ -3921,6 +4114,9 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
     deadline = t0 + VERIFY_TIMEOUT
     remote = str(remote or "").strip()
     cloud_path = str(cloud_path or "").strip().strip("/")
+    # v3.57：localPath 支持绝对路径（跨卷校验）；strip 只影响展示用的相对形式
+    local_abs_input = str(local_path or "").startswith("/")
+    raw_local = str(local_path or "")
     local_path = str(local_path or "").strip().strip("/")
     mode = str(mode or "quick").strip().lower()
     if not re.match(r'^[^:/\\\x00-\x1f]{1,80}$', remote):
@@ -3940,7 +4136,7 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
         return {"error": ci["error"]}
     cloud, ctargets = ci["files"], ci["targets"]
     cscope, ctarget, ctrunc = ci["scope"], ci["target"], ci["truncated"]
-    local, lscope, ltarget, ltrunc, err = verify_local(local_path)
+    local, lscope, ltarget, ltrunc, err = verify_local(raw_local if local_abs_input else local_path)
     if err:
         return {"error": err}
     warnings = []
@@ -4061,7 +4257,8 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
         "ok": clean and bool(items),
         "error": "",
         "mode": mode, "remote": remote,
-        "cloudRoot": ctarget, "localRoot": "/vol2/download" + ("/" + local_path if local_path else ""),
+        "cloudRoot": ctarget,
+        "localRoot": ltarget or (primary_root() + ("/" + local_path if local_path else "")),
         "scope": cscope,
         "cloud": {"count": len(cloud), "bytes": sum(cloud.values()), "truncated": ctrunc},
         "local": {"count": len(local),
@@ -4423,8 +4620,6 @@ def api(action, body):
     if action == "start":
         with LOCK:
             s = load_settings()
-            if STATE["diskLow"]:
-                return {"error": "磁盘空间保护中（剩余 %s GB），请先清理或到设置里调低阈值" % STATE["diskFree"]}
             jobs = load_jobs()
             running = sum(1 for j in jobs if j["state"] == "running")
             sub = body.get("path", "").strip("/")
@@ -4432,7 +4627,23 @@ def api(action, body):
             folder = str(body.get("folder") or "").strip("/")
             if folder and not re.match(r'^[\w\u4e00-\u9fff][\w\u4e00-\u9fff -]{0,60}$', folder):
                 return {"error": "保存目录名不合法（单层：中英文/数字/空格/连字符）"}
-            dest = dedupe_dest("/data/" + (folder if folder else name))
+            # v3.57 可选存储空间：body["volume"] 传 rclone 侧根（localdirs 返回的 volumes），
+            # 缺省 = 主卷；保护门槛按目标卷的有效剩余判断，不再一刀切拦全部任务
+            vol_req = str(body.get("volume") or "").strip().rstrip("/")
+            vols = STATE.get("volumePairs") or [LEGACY_VOLUME]
+            if vol_req:
+                vol = next((p for p in vols if p["rclone"] == vol_req), None)
+                if not vol:
+                    return {"error": "未知存储空间：%s" % vol_req}
+            else:
+                vol = vols[0]
+            vroot = vol["rclone"]
+            vf = volume_effective_free(vol, s)
+            disk_min = float(s["diskMinGB"] or 0)
+            if vf is not None and vf < disk_min:
+                return {"error": "「%s」空间保护中（剩余 %.1f GB），请清理该卷或到设置里调低阈值"
+                                 % (vol.get("name") or vroot, vf)}
+            dest = dedupe_dest(vroot + "/" + (folder if folder else name), fs=vroot)
             src = "%s:%s" % (body["remote"], sub) if sub else "%s:" % body["remote"]
             # 必须先定下 proxy：预检与后续 launch_job 都依赖它。
             # v3.31 曾把赋值放在预检之后，导致批量下载全程抛
@@ -4459,8 +4670,8 @@ def api(action, body):
                 job["single_file"] = True
                 job["leaf"] = leaf
                 job["src_dir"] = "%s:%s" % (body["remote"], parent)
-                # 指定保存目录时 dest 本身就是目标目录；否则 dest=/data/<文件名>，目标目录是 /data
-                job["dst_dir"] = dest if folder else "/data"
+                # 指定保存目录时 dest 本身就是目标目录；否则目标目录是该卷的根
+                job["dst_dir"] = dest if folder else vroot
             launched_ok = True
             if running < s["maxConcurrent"]:
                 launched_ok = launch_job(job, s)
@@ -4656,7 +4867,8 @@ def api(action, body):
             if before is None or after is None or before != after:
                 save_jobs(jobs)
         return {"jobs": jobs, "settings": load_settings(),
-                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"]},
+                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
+                        "diskTotal": STATE.get("diskTotal"), "storages": storages()},
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "stop":
@@ -4672,8 +4884,12 @@ def api(action, body):
         with LOCK:
             s = load_settings()
             jobs = load_jobs()
-            if STATE["diskLow"]:
-                return {"error": "磁盘空间保护中，无法继续"}
+            # v3.57：按任务目标卷判断保护（转存到云盘的任务不占下载卷，放行）
+            tgt = next((j for j in jobs if j.get("id") == body.get("id")), None)
+            if tgt and tgt.get("kind") != "xfer":
+                vf = volume_effective_free(job_volume(tgt), s)
+                if vf is not None and vf < float(s["diskMinGB"] or 0):
+                    return {"error": "目标存储空间保护中（剩余 %.1f GB），无法继续" % vf}
             running = sum(1 for j in jobs if j["state"] == "running")
             for j in jobs:
                 if j["id"] == body.get("id") and j["state"] in ("stopped", "error"):
@@ -4756,14 +4972,15 @@ def api(action, body):
 
     if action == "settings":
         return {"settings": load_settings(),
-                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"]},
+                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
+                        "diskTotal": STATE.get("diskTotal"), "storages": storages()},
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "savesettings":
         with LOCK:
             old = load_settings()
             s = dict(old)
-            for k in ("maxConcurrent", "diskMinGB", "transfers", "checkers",
+            for k in ("maxConcurrent", "diskMinGB", "diskQuotaGB", "transfers", "checkers",
                       "multiThreadStreams", "multiThreadCutoffMB", "retries",
                       "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
                       "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
@@ -5009,7 +5226,11 @@ def api(action, body):
         dest = str(job.get("dest") or "")
         lp = local_dest(dest)
         p = os.path.realpath(lp) if lp else ""
-        if lp and p != "/vol2/download" and p.startswith("/vol2/download/") and os.path.isdir(p):
+        # v3.57：落盘内容须落在任一存储空间内，且不能是卷根本身
+        in_root = bool(lp) and any(
+            p != os.path.realpath(r) and p.startswith(os.path.realpath(r) + os.sep)
+            for r in local_roots())
+        if in_root and os.path.isdir(p):
             d["exists"] = True
             total, rows = 0, []
             for root, dirs, files in os.walk(p):
@@ -5035,12 +5256,14 @@ def api(action, body):
         return d
 
     if action == "cleanup":
-        # 清理落盘文件（危险操作：仅允许 /vol2/download 下的任务目录，防止路径逃逸）
+        # 清理落盘文件（危险操作：仅允许存储空间内的任务目录，防止路径逃逸或整卷删除）
         dest = str(body.get("dest") or "")
         lp = local_dest(dest)
         p = os.path.realpath(lp) if lp else ""
-        if not lp or p == "/vol2/download" or not p.startswith("/vol2/download/"):
-            return {"error": "非法路径，仅允许清理下载目录（/data）下的内容"}
+        if not lp or not any(
+                p != os.path.realpath(r) and p.startswith(os.path.realpath(r) + os.sep)
+                for r in local_roots()):
+            return {"error": "非法路径，仅允许清理存储空间内的任务目录"}
         if not os.path.isdir(p):
             return {"error": "目录不存在（可能已清理过）"}
         freed = 0
@@ -5204,30 +5427,33 @@ def api(action, body):
             except Exception:
                 pass
             return {"error": "新账号回读失败，已回滚：%s" % str(e)[:120]}
-        # 身份表：sub / 邮箱跟着改名迁移，否则下次导入会对不上号
+        # 身份表与任务记录的改写必须持 LOCK：jobs 轮询 / worker 线程随时可能并发写盘，
+        # 裸奔的整表覆盖写会把别人刚写的进度/新任务回滚掉（v3.57 修复的丢数据竞态）
         try:
-            m = load_meta()
-            if old in m:
-                m[new] = m.pop(old)
-                save_meta(m)
+            with LOCK:
+                m = load_meta()
+                if old in m:
+                    m[new] = m.pop(old)
+                    save_meta(m)
         except Exception:
             pass
         # 任务记录：remote 和 src 的「账号:路径」前缀同步替换，避免历史任务指向空配置
         try:
-            jobs = load_jobs()
-            changed = False
-            for j in jobs if isinstance(jobs, list) else []:
-                if not isinstance(j, dict):
-                    continue
-                if str(j.get("remote") or "") == old:
-                    j["remote"] = new
-                    changed = True
-                src = str(j.get("src") or "")
-                if src.startswith(old + ":"):
-                    j["src"] = new + src[len(old):]
-                    changed = True
-            if changed:
-                save_jobs(jobs)
+            with LOCK:
+                jobs = load_jobs()
+                changed = False
+                for j in jobs if isinstance(jobs, list) else []:
+                    if not isinstance(j, dict):
+                        continue
+                    if str(j.get("remote") or "") == old:
+                        j["remote"] = new
+                        changed = True
+                    src = str(j.get("src") or "")
+                    if src.startswith(old + ":"):
+                        j["src"] = new + src[len(old):]
+                        changed = True
+                if changed:
+                    save_jobs(jobs)
         except Exception:
             pass
         try:
@@ -5477,15 +5703,25 @@ def api(action, body):
                 "okCount": sum(1 for r in results if r["ok"]), "total": len(results)}
 
     if action == "urldl":
-        # URL 直链下载：rclone 直接抓取到 NAS（/data/<folder>/），走任务队列展示
+        # URL 直链下载：rclone 直接抓取到 NAS（/<卷根>/<folder>/），走任务队列展示
         url = str(body.get("url") or "").strip()
         sub = str(body.get("folder") or "URL下载").strip("/")
         if not re.match(r'^https?://\S+$', url):
             return {"error": "仅支持 http(s) 直链"}
         if "/" in sub or sub in (".", "..") or not sub:
             return {"error": "保存目录需为单层文件夹名"}
+        # v3.57：可选存储空间（volume 传 localdirs 返回的 rclone 根，缺省主卷）
+        vol_req = str(body.get("volume") or "").strip().rstrip("/")
+        vols = STATE.get("volumePairs") or [LEGACY_VOLUME]
+        if vol_req:
+            uvol = next((p for p in vols if p["rclone"] == vol_req), None)
+            if not uvol:
+                return {"error": "未知存储空间：%s" % vol_req}
+        else:
+            uvol = vols[0]
+        uroot = uvol["rclone"]
         try:
-            r = rc("operations/copyurl", fs="/data/" + sub, remote="",
+            r = rc("operations/copyurl", fs=uroot + "/" + sub, remote="",
                    url=url, autoFilename="true", _async="true")
         except Exception as e:
             return {"error": "提交失败: %s" % str(e)[:150]}
@@ -5495,7 +5731,7 @@ def api(action, body):
         guess = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1] or "url-file"
         job = {"id": int(time.time() * 1000), "jobid": jid, "remote": "URL",
                "subpath": guess, "src": url, "mode": "copy",
-               "dest": "/data/" + sub, "state": "running",
+               "dest": uroot + "/" + sub, "state": "running",
                "started": time.strftime("%m-%d %H:%M"),
                "bytes": 0, "total": 0, "speed": 0, "eta": None, "error": ""}
         with LOCK:
@@ -5647,8 +5883,9 @@ def api(action, body):
         else:
             return {"error": "phase 只能是 direct / proxy / both"}
         src = remote + ":" + path
-        tmp_local = "/vol2/download/__speedtest.tmp"
-        tmp_cont = "/data/__speedtest.tmp"
+        # 测速临时文件放主卷（对比测速本身与存储空间无关，只是需要一个落盘点）
+        tmp_local = primary_root().rstrip("/") + "/__speedtest.tmp"
+        tmp_cont = (STATE.get("volumePairs") or [LEGACY_VOLUME])[0]["rclone"].rstrip("/") + "/__speedtest.tmp"
         # 硬超时必须放在容器内：PikPak captcha / TLS 连接被重置时 rclone 会一直等远端，
         # --max-duration 只是软限制（等 API 响应期间不检查），只靠 Python 超时杀掉
         # docker exec 客户端又会让容器内 rclone 残留，下一次测速两个进程互踩同一临时文件。
@@ -5717,16 +5954,22 @@ def api(action, body):
         return localfiles_listing(str(body.get("path") or ""))
 
     if action == "localdirs":
-        # /vol2/download 下的现有目录（供保存目录下拉点选）
-        try:
-            names = sorted(
-                n for n in os.listdir("/vol2/download")
-                if os.path.isdir(os.path.join("/vol2/download", n))
-                and not n.startswith(".") and n != "__speedtest.tmp"
-            )
-        except Exception as e:
-            return {"dirs": [], "error": str(e)[:150]}
-        return {"dirs": names}
+        # 各存储空间下的现有目录（供保存目录下拉点选）。
+        # v3.57 返回分组 volumes（root=rclone 侧根，下载时随 start/urldl 传回 volume）；
+        # dirs 保留主卷平铺列表，兼容旧前端。
+        def _vol_dirs(root):
+            try:
+                return sorted(
+                    n for n in os.listdir(root)
+                    if os.path.isdir(os.path.join(root, n))
+                    and not n.startswith(".") and n != "__speedtest.tmp"
+                )
+            except Exception as e:
+                return []
+        vols = storages()
+        volumes = [{"root": v["rclone"], "console": v["console"], "name": v["name"],
+                    "dirs": _vol_dirs(v["console"])} for v in vols]
+        return {"dirs": volumes[0]["dirs"] if volumes else [], "volumes": volumes}
 
     if action == "health":
         try:
@@ -6089,6 +6332,15 @@ if __name__ == "__main__":
     if _moved:
         print("%s 已从旧路径 %s 迁移数据: %s" % (time.strftime("%F %T"), LEGACY_DATA_DIR, ", ".join(_moved)))
     print("%s 数据目录: %s" % (time.strftime("%F %T"), DATA_DIR))
+    # v3.57：启动即识别存储空间（docker inspect 配对失败会在 scheduler 里重试），
+    # 保证第一个请求就能看到正确的卷列表与容量
+    try:
+        _stors = refresh_storages()
+        print("%s 存储空间: %s" % (time.strftime("%F %T"),
+              ", ".join("%s(%s→%s, 剩余 %s GB)" % (st["name"], st["rclone"], st["console"], st["freeGB"])
+                        for st in _stors) or "未识别到，回退内置单卷"))
+    except Exception as e:
+        print("%s 存储空间识别失败: %s" % (time.strftime("%F %T"), e))
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=cred_keepalive_loop, daemon=True).start()
     print("PikPak 多账号下载器（云梭 CloudShuttle）%s (按任务选择 mihomo 代理 · 凭证保活 · 测速每路 %ss): "

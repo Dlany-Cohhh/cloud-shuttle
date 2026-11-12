@@ -3,6 +3,7 @@
   "autoStart": "",
   "autoPause": "",
   "diskMinGB": 20,
+  "diskQuotaGB": 0,
   "transfers": 6,
   "checkers": 8,
   "proxy": false,
