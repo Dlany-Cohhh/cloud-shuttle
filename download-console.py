@@ -4,6 +4,7 @@
    前端在 ./static/（Vue3 + Tailwind v4 + DaisyUI v5 全部自托管，无外网 CDN 依赖）；
    API 与 v2.2 完全兼容，任务/设置数据路径不变"""
 import base64, hashlib, io, json, os, re, select, shutil, socket, ssl, stat as statmod, subprocess, sys, tarfile, threading, time
+from datetime import datetime as _dt
 import unicodedata, urllib.error, urllib.parse, urllib.request, uuid, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -52,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.60"
+APP_VERSION = "v3.61"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1448,14 +1449,30 @@ def _pk_cfg(name):
     return c, tok
 
 
+def _rfc3339_ts(v):
+    """RFC3339 时间串 → epoch 秒（v3.61）。rclone 写回的 expiry 可能带小数秒或
+    时区偏移，老版本直接字符串比较，非 UTC 时区下会误判 token 未过期。
+    解析失败返回 None，由调用方退回旧的字典序比较兜底。"""
+    txt = str(v or "").strip()
+    if not txt:
+        return None
+    iso = txt[:-1] + "+00:00" if txt.endswith(("Z", "z")) else txt
+    try:
+        return _dt.fromisoformat(iso).timestamp()
+    except Exception:
+        return None
+
 def _pk_token(name):
     """access_token + device_id。快过期时先让 rclone 自己刷一次——rclone 会把
     轮换后的 refresh_token 写回配置，避免我们自己换发导致两边凭证分叉。"""
     c, tok = _pk_cfg(name)
     at = str(tok.get("access_token") or "")
     exp = str(tok.get("expiry") or "")
+    exp_ts = _rfc3339_ts(exp)
     soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 150))
-    if (not at) or exp < soon:
+    # 优先按时间戳判断；expiry 无法解析时退回旧字典序比较（总比不检查强）
+    expired = (exp_ts is not None and exp_ts < time.time() + 150) or               (exp_ts is None and exp and exp < soon)
+    if (not at) or expired:
         try:
             subprocess.run(["docker", "exec", RCLONE_CONTAINER, "rclone", "about", name + ":"],
                            capture_output=True, text=True, timeout=90)
@@ -1900,6 +1917,17 @@ def rename_batch(remote, folder, items):
                dstFs=remote + ":", dstRemote=_cloud_join(folder, b))
             ok += 1
         except Exception as e:
+            # v3.61：第二步失败时把临时名挪回原名，云端不再留 __ren_tmp_* 孤儿
+            # （与本地版 rename_batch 的回滚对称；回滚也失败则明确告知手动处理）
+            if src != a:
+                try:
+                    rc("operations/movefile", _strict=True,
+                       srcFs=remote + ":", srcRemote=_cloud_join(folder, src),
+                       dstFs=remote + ":", dstRemote=_cloud_join(folder, a))
+                except Exception:
+                    failed.append({"name": a, "error": "改名失败，且临时名 %s 回滚失败（请手动改回）：%s"
+                                   % (src, mask_secret(str(e))[:90])})
+                    continue
             failed.append({"name": a, "error": mask_secret(str(e))[:120]})
     return {"ok": ok, "failed": failed, "total": len(clean)}
 
@@ -4600,7 +4628,7 @@ def api(action, body):
             hit = QUOTA_CACHE.get(key)
             if hit and now - hit[0] < QUOTA_TTL:
                 return hit[1]
-        code, out, err = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=60)
+        code, out, err = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=120)
         if code != 0:
             return {"error": "目录大小统计失败：%s" % (err or out)[:150]}
         try:
@@ -5295,6 +5323,12 @@ def api(action, body):
     if action == "cleanup":
         # 清理落盘文件（危险操作：仅允许存储空间内的任务目录，防止路径逃逸或整卷删除）
         dest = str(body.get("dest") or "")
+        # v3.61：该目录还有任务在排队/下载时拒绝清理，避免边下边删
+        with LOCK:
+            busy = sum(1 for j in load_jobs()
+                       if j.get("dest") == dest and j.get("state") in ("running", "queued"))
+        if busy:
+            return {"error": "该目录还有 %d 个任务在排队或下载中，请先暂停/等任务结束再清理" % busy}
         lp = local_dest(dest)
         p = os.path.realpath(lp) if lp else ""
         if not lp or not any(
@@ -6396,13 +6430,19 @@ if __name__ == "__main__":
             if ctx is None:
                 return sock, addr
             try:
+                # v3.61：静默连接（端口扫描/健康探测）最多等 10s 首字节，
+                # 超时走下面 OSError 分支返回，不再挂死整个 accept 循环
+                sock.settimeout(10)
                 head = sock.recv(1, socket.MSG_PEEK)
             except OSError:
                 return sock, addr
             if not head or head[0] != 0x16:
+                sock.settimeout(None)      # 明文连接恢复阻塞，避免拖慢慢速客户端
                 return sock, addr
             try:
-                return ctx.wrap_socket(sock, server_side=True), addr
+                tls = ctx.wrap_socket(sock, server_side=True)
+                tls.settimeout(None)
+                return tls, addr
             except (ssl.SSLError, OSError):
                 try:
                     sock.close()

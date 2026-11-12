@@ -294,7 +294,8 @@
                       <span class="badge-pill bg-base-content/8 text-base-content/50 tabular-nums">{{remotes.length}}</span>
                       <i class="ti ti-chevron-down shrink-0 text-xs text-base-content/40"></i>
                     </button>
-                    <div v-if="acctMenuOpen" class="picker-panel pop-in absolute right-0 top-11 z-50 w-80">
+                    <!-- v3.61：手机端固定全宽贴边（原 absolute right-0 w-80 会在窄屏左缘溢出屏幕），桌面恢复右对齐 320px -->
+                    <div v-if="acctMenuOpen" class="picker-panel pop-in fixed inset-x-2 top-20 z-50 sm:absolute sm:inset-x-auto sm:right-0 sm:top-11 sm:w-80">
                       <div class="picker-head flex items-center justify-between">
                         <span>账号列表 · 共 {{remotes.length}} 个</span>
                         <button class="btn-icon always" title="到账号页管理" @click="acctMenuOpen=false; go('accounts')"><i class="ti ti-settings"></i></button>

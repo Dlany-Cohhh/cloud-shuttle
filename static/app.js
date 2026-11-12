@@ -346,7 +346,10 @@ Vue.createApp({
           dirs++;
           const key = this.dirSizeKey(name);
           const v = this.dirSizes[key];
-          if (typeof v === "number") bytes += v; else pending = true;
+          /* v3.61：null=统计中（计入 pending 提示），undefined=统计失败（不计 pending，
+             旧版会把失败永远显示成"统计中"） */
+          if (typeof v === "number") bytes += v;
+          else if (v === null) pending = true;
         } else {
           bytes += Math.max(0, Number(it.size) || 0);
         }
@@ -780,7 +783,8 @@ Vue.createApp({
         this.api("dirsize", { remote: this.curRemote,
                               path: this.curPath ? this.curPath + "/" + name : name }, 90000)
           .then(d => {
-            if (typeof (d || {}).bytes === "number") this.dirSizes[key] = d.bytes;
+            if (d && typeof d.bytes === "number") this.dirSizes[key] = d.bytes;
+            else if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 后端报错：清掉"统计中"占位，可重新勾选重试
           })
           .catch(() => {
             if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 失败清占位，别让总大小永远"统计中"
@@ -810,7 +814,7 @@ Vue.createApp({
       const LONG = { verify: 120000, speedtest: 30000, dirs: 60000, cloudlink: 60000,
                      cloudmv: 60000, cloudrm: 60000, start: 60000, urldl: 60000,
                      accttest: 60000, acctident: 60000, acctimporttext: 60000,
-                     acctrepair: 60000, localfiles: 60000, cleanup: 60000, dirsize: 90000,
+                     acctrepair: 60000, localfiles: 60000, cleanup: 60000, dirsize: 150000,
                      scanpath: 240000, quota: 120000,
                      renamebatch: 120000, localrenamebatch: 120000, acctpurge: 60000,
                      trashlist: 90000, trashop: 120000,
