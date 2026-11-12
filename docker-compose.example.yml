@@ -27,6 +27,12 @@ services:
       UPDATE_REPO: ${UPDATE_REPO:-Dlany-Cohhh/cloud-shuttle}
       UPDATE_CONTAINER: download-console
       UPDATE_AUTO_RESTART: ${UPDATE_AUTO_RESTART:-1}
+      # 可选：自定义容器名 / 端口（多套部署或端口冲突时）。改这里要同步改
+      # rclone-backend 的 container_name，并设置对应环境变量；默认值即本文件的约定。
+      # RCLONE_CONTAINER: rclone-backend
+      # PORT: 5566            # 控制台监听端口（Windows bridge 映射同步改 WEB_PORT）
+      # RC_PORT: 5572         # rclone 主守护进程（直连）
+      # PROXY_RC_PORT: 5573   # 代理下载守护进程
       # GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     volumes:
       # 代码目录同时是数据目录：jobs.json / settings.json 等直接落在这里

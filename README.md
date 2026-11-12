@@ -2,9 +2,9 @@
 
 > **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
-![version](https://img.shields.io/badge/version-v3.58-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
+![version](https://img.shields.io/badge/version-v3.59-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
-**当前版本 v3.58** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
+**当前版本 v3.59** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 
@@ -240,7 +240,8 @@ docker compose -f docker-compose.example.yml up -d --build
 | `RCLONE_RC_USER` / `RCLONE_RC_PASS` | 控制台 + rclone-backend | RC 接口凭据，两边必须一致；**仓库源码不含默认值** |
 | `CONSOLE_DATA_DIR` | 控制台 | 运行时 JSON 的存放目录，默认与脚本同目录（容器内 `/app`） |
 | `PROXY_URL` | 控制台 | 自定义代理地址（http(s)/socks5），`off` = 不走代理；设置页的值优先于它 |
-| `WEB_PORT` | compose（Windows） | bridge 模式对外端口，默认 5566；Linux host 网络下固定 5566 |
+| `WEB_PORT` | compose（Windows） | bridge 模式对外端口，默认 5566；Linux host 网络下改监听端口请同时设 `PORT` |
+| `RCLONE_CONTAINER` / `PORT` / `RC_PORT` / `PROXY_RC_PORT` | 控制台 | 可选（v3.59）：自定义 rclone 容器名与各端口，默认 `rclone-backend` / 5566 / 5572 / 5573；多套部署或端口冲突时才需要 |
 | `CONSOLE_PUBLIC_HOST` | 控制台 | 生成 Windows 采集脚本时的兜底回推地址（默认 `localhost:5566`）；正常请求按 `Host` 头自动判断，反代场景可显式指定 |
 | `RCLONE_CONF` / `TOKEN_LOG` | 续期脚本 | `rclone.conf` 路径与日志路径 |
 | `PROJECT_ROOT` / `DOWNLOAD_ROOT` / `RCLONE_CONFIG_DIR` | compose | 挂载路径，见 `.env.example` |

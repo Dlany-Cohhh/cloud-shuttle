@@ -3,6 +3,15 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.59 — 容器名与端口可自定义（2026-11-13）
+
+**新增：部署可调项环境化**
+
+- `RCLONE_CONTAINER`（默认 `rclone-backend`）：rclone 后端容器名，全部 `docker exec` / `logs` / `inspect` 调用跟随；多套部署或自定义容器名时不再需要改源码；
+- `PORT`（默认 5566）：控制台 HTTP 监听端口；`RC_PORT`（默认 5572）与 `PROXY_RC_PORT`（默认 5573）：rclone 主守护进程与代理守护进程的 rc 端口；
+- `rclone rc` 改为显式 `--rc-addr`，不再依赖 rclone 内置默认端口；启动横幅 / HTTPS 提示 / 任务报错全部跟随实际端口与容器名；
+- `docker-compose.example.yml` / `.env.example` / README 环境变量表同步；默认值与官方 compose 完全一致，现有部署零改动。
+
 ## v3.58 — 升级感知与本地文件页修补（2026-11-13）
 
 **修复：升级后页面新旧混搭的怪状态（v3.57 用户实测反馈）**

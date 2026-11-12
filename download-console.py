@@ -52,7 +52,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.58"
+APP_VERSION = "v3.59"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -119,8 +119,15 @@ RCLONE_RC_USER = os.environ.get("RCLONE_RC_USER", "")
 RCLONE_RC_PASS = os.environ.get("RCLONE_RC_PASS", "")
 # 生成 Windows 采集脚本时若请求没有 Host 头，用这个地址拼「回推 URL」。
 # 正常浏览器请求一定带 Host；需要固定域名（如反代后）可设 CONSOLE_PUBLIC_HOST。
+# v3.59：容器名与端口可随部署自定义（多套部署 / 端口冲突场景），默认值即
+# docker-compose.example.yml 的约定；改 compose 时同步设这两个环境变量即可。
+RCLONE_CONTAINER = os.environ.get("RCLONE_CONTAINER", "rclone-backend")
+CONSOLE_PORT = int(os.environ.get("PORT") or 5566)             # 控制台 HTTP 监听端口
+RC_PORT = int(os.environ.get("RC_PORT") or 5572)               # rclone 主守护进程（直连 rc）
+PROXY_RC_PORT = int(os.environ.get("PROXY_RC_PORT") or 5573)   # 代理下载守护进程
 CONSOLE_PUBLIC_HOST = os.environ.get("CONSOLE_PUBLIC_HOST", "localhost:5566")
-RC = ["docker", "exec", "rclone-backend", "rclone", "rc", "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS]
+RC = ["docker", "exec", RCLONE_CONTAINER, "rclone", "rc", "--rc-addr", "127.0.0.1:%d" % RC_PORT,
+      "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS]
 LOCK = threading.RLock()
 STATE = {"diskLow": False, "diskFree": None, "diskTotal": None, "storages": [],
          "volumePairs": None, "firedStart": None, "firedPause": None}
@@ -231,15 +238,15 @@ def proxy_http_url():
 # 主守护进程 5572 直连；5573 启动时注入 HTTP(S)_PROXY。两个进程各有
 # 独立的 Fs 缓存 / jobid 空间 / stats 分组，因此可以逐任务选择路径，
 # 不必改 compose、不必重建容器，也不会影响已运行的直连任务。
-RC_PROXY = ["docker", "exec", "rclone-backend", "rclone", "rc",
-            "--rc-addr", "127.0.0.1:5573", "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS]
+RC_PROXY = ["docker", "exec", RCLONE_CONTAINER, "rclone", "rc",
+            "--rc-addr", "127.0.0.1:%d" % PROXY_RC_PORT, "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS]
 PROXY_RC_STATE = {"ok": False, "ts": 0.0, "url": ""}
 
 
 def proxy_rcd_cmd():
     """按当前配置的代理地址拼出 5573 的启动命令（docker exec -d）。"""
     return ["docker", "exec", "-d"] + proxy_env_args() + [
-        "rclone-backend", "rclone", "rcd", "--rc-addr", "127.0.0.1:5573",
+        RCLONE_CONTAINER, "rclone", "rcd", "--rc-addr", "127.0.0.1:%d" % PROXY_RC_PORT,
         "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS, "--log-level", "INFO"]
 
 
@@ -255,8 +262,8 @@ def _proxy_rc_ping():
 def _stop_proxy_rc():
     """只停 5573，不碰主守护进程。[r] 技巧避免 pkill 匹配到执行它的 shell 自身。"""
     try:
-        subprocess.run(["docker", "exec", "rclone-backend", "sh", "-c",
-                        "pkill -f '[r]clone rcd --rc-addr 127.0.0.1:5573' || true"],
+        subprocess.run(["docker", "exec", RCLONE_CONTAINER, "sh", "-c",
+                        "pkill -f '[r]clone rcd --rc-addr 127.0.0.1:%d' || true" % PROXY_RC_PORT],
                        capture_output=True, text=True, timeout=10)
     except Exception:
         pass
@@ -318,7 +325,7 @@ def refresh_proxy_rc():
         time.sleep(0.5)
         if _proxy_rc_ping():
             PROXY_RC_STATE.update(ok=True, ts=time.time(), url=proxy_url())
-            return True, "代理地址已生效（5573 已按新地址重启）"
+            return True, "代理地址已生效（%d 已按新地址重启）" % PROXY_RC_PORT
     return False, "地址已保存，但代理守护进程未就绪，首次代理下载时会自动重试"
 
 
@@ -1030,7 +1037,7 @@ def rclone_cli(args, proxy=False, timeout=120):
     cmd = ["docker", "exec"]
     if proxy:
         cmd += proxy_env_args()
-    cmd += ["rclone-backend", "rclone"] + args
+    cmd += [RCLONE_CONTAINER, "rclone"] + args
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
@@ -1279,7 +1286,7 @@ def launch_job(job, s):
     proxy = bool(job.get("proxy"))
     if proxy and not ensure_proxy_rc():
         job["state"] = "error"
-        job["error"] = "代理守护进程（5573）启动失败，请检查 mihomo 与 rclone-backend 容器"
+        job["error"] = "代理守护进程（%d）启动失败，请检查代理客户端与 %s 容器" % (PROXY_RC_PORT, RCLONE_CONTAINER)
         return False
     move = job["mode"] == "move"
     if job.get("single_file"):
@@ -1450,7 +1457,7 @@ def _pk_token(name):
     soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 150))
     if (not at) or exp < soon:
         try:
-            subprocess.run(["docker", "exec", "rclone-backend", "rclone", "about", name + ":"],
+            subprocess.run(["docker", "exec", RCLONE_CONTAINER, "rclone", "about", name + ":"],
                            capture_output=True, text=True, timeout=90)
         except Exception:
             pass
@@ -2434,7 +2441,7 @@ def _xfer_cmd(job, argv):
     cmd = ["docker", "exec"]
     if job.get("proxy"):
         cmd += proxy_env_args()
-    return cmd + ["rclone-backend", "rclone"] + list(argv)
+    return cmd + [RCLONE_CONTAINER, "rclone"] + list(argv)
 
 
 def _xfer_run(job, argv, timeout=1800):
@@ -2473,7 +2480,7 @@ def _xfer_kill(job):
         pass
     # docker exec 的客户端进程被杀，容器内的 rclone 未必跟着退，再用唯一 UA 精确补刀
     try:
-        subprocess.run(["docker", "exec", "rclone-backend", "pkill", "-f", ent["marker"]],
+        subprocess.run(["docker", "exec", RCLONE_CONTAINER, "pkill", "-f", ent["marker"]],
                        capture_output=True, text=True, timeout=10)
     except Exception:
         pass
@@ -3047,7 +3054,7 @@ def storage_pairs():
     rclone=/data 的主卷排最前（历史 dest 约定）；识别失败回退内置单卷。"""
     try:
         rmap = {}
-        for src, dst in _inspect_mounts("rclone-backend"):
+        for src, dst in _inspect_mounts(RCLONE_CONTAINER):
             rmap.setdefault(src, dst)
         pairs, seen = [], set()
         for src, cdst in _inspect_mounts(SELF_CONTAINER):
@@ -3175,7 +3182,7 @@ def completed_transfers(since_ts):
     # localtime 拼无时区字符串会让 --since 偏 8 小时（落到未来 → 永远取不到日志）。
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(secs))
     try:
-        pr = subprocess.run(["docker", "logs", "rclone-backend", "--since", since],
+        pr = subprocess.run(["docker", "logs", RCLONE_CONTAINER, "--since", since],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
         txt = (pr.stdout or b"").decode("utf-8", "replace")
     except Exception:
@@ -3820,7 +3827,7 @@ VERIFY_FULL_FILES  = 5
 VERIFY_FULL_TOTAL  = 1024 ** 3             # 单次完整校验最多 1 GiB
 VERIFY_FULL_SINGLE = 300 * 1024 ** 2       # 单文件最多 300 MiB
 VERIFY_TIMEOUT     = 300                   # 整次校验软上限（秒）
-RCLONE_BASE = ["docker", "exec", "rclone-backend", "rclone"]
+RCLONE_BASE = ["docker", "exec", RCLONE_CONTAINER, "rclone"]
 
 
 def _rclone_run(args, timeout=90):
@@ -4578,7 +4585,7 @@ def api(action, body):
         return update_rollback()
 
     if action == "remotes":
-        p = subprocess.run(["docker", "exec", "rclone-backend", "rclone", "listremotes"],
+        p = subprocess.run(["docker", "exec", RCLONE_CONTAINER, "rclone", "listremotes"],
                            capture_output=True, text=True, timeout=60)
         return {"remotes": [x.strip().rstrip(":") for x in p.stdout.splitlines() if x.strip()]}
 
@@ -5904,7 +5911,7 @@ def api(action, body):
                     pass
                 cmd = ["docker", "exec"] + (
                     proxy_env_args() if pv else []
-                ) + ["rclone-backend"] + cont_cmd
+                ) + [RCLONE_CONTAINER] + cont_cmd
                 t0 = time.time()
                 p = None
                 try:
@@ -6346,8 +6353,8 @@ if __name__ == "__main__":
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=cred_keepalive_loop, daemon=True).start()
     print("PikPak 多账号下载器（云梭 CloudShuttle）%s (按任务选择 mihomo 代理 · 凭证保活 · 测速每路 %ss): "
-          "http://0.0.0.0:5566  ·  static: %s"
-          % (APP_VERSION, SPEEDTEST_SECONDS, STATIC_DIR))
+          "http://0.0.0.0:%d  ·  static: %s"
+          % (APP_VERSION, SPEEDTEST_SECONDS, CONSOLE_PORT, STATIC_DIR))
     class ConsoleHTTPServer(ThreadingHTTPServer):
         daemon_threads = True
         request_queue_size = 128   # 默认 5，8 并发时偶发连接被拒；放宽队列
@@ -6375,10 +6382,10 @@ if __name__ == "__main__":
                     pass
                 raise        # socketserver 只捕 OSError/SSLError，不会打 traceback
 
-    srv = ConsoleHTTPServer(("0.0.0.0", 5566), Handler)
+    srv = ConsoleHTTPServer(("0.0.0.0", CONSOLE_PORT), Handler)
     srv.ssl_ctx = tls_make_context()
     if srv.ssl_ctx:
-        print("%s HTTPS 已启用（同端口 5566 · 自签证书）：在线播放需要它" % time.strftime("%F %T"))
+        print("%s HTTPS 已启用（同端口 %d · 自签证书）：在线播放需要它" % (time.strftime("%F %T"), CONSOLE_PORT))
     else:
         print("%s 没有证书（%s），只提供 HTTP；在线播放会被浏览器安全策略拦" %
               (time.strftime("%F %T"), TLS_DIR))
