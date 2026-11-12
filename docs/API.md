@@ -49,6 +49,7 @@ curl -s -X POST http://<控制台地址>/api \
 - `cloudrm`
 - `credcheck`
 - `dirs`
+- `dirsize`
 - `health`
 - `history`
 - `jobdetail`
@@ -113,6 +114,8 @@ grep -n 'action ==' download-console.py
 | `start` / `urldl` | `volume` | 可选，传 `localdirs.volumes[].root`，缺省 = 主卷（`/data` 对应卷） |
 
 磁盘空间保护按任务的目标卷判断（`start` / `resume` 的报错会指明具体哪块空间不足）。
+
+`dirsize`（v3.60+）：入参 `remote` + `path`（云端目录），返回 `{bytes, count}`——`rclone size` 递归统计，结果缓存 5 分钟；云盘页勾选文件夹时按需调用。
 
 ### 自定义代理地址（v3.55+）
 

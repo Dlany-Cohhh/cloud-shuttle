@@ -41,6 +41,7 @@ Vue.createApp({
       state: { diskLow: false, diskFree: null, diskTotal: null, storages: [] },
       bootVer: "",                // v3.58 页面加载时的后端版本，用于升级检测
       newVer: "",                 // v3.58 检测到的新版本号（非空 = 提示刷新）
+      dirSizes: {},               // v3.60 勾选的文件夹大小统计结果，key = remote:绝对路径
       stats: { speed: 0, bytes: 0, transferring: [] },
       hist: [],
 
@@ -334,6 +335,23 @@ Vue.createApp({
       const names = this.dirFiles.map(f => f.name);
       const bag = this.cleanupMode ? this.cleanupPicked : this.picked;
       return names.length > 0 && names.every(n => bag.includes(n));
+    },
+    /* v3.60 选中项总大小：文件用列表 size；文件夹异步统计（dirSizes），没统计完的部分不计入 */
+    pickedSize() {
+      let bytes = 0, dirs = 0, pending = false;
+      for (const name of this.picked) {
+        const it = (this.dirs || []).find(x => x.name === name);
+        if (!it) continue;
+        if (it.isdir) {
+          dirs++;
+          const key = this.dirSizeKey(name);
+          const v = this.dirSizes[key];
+          if (typeof v === "number") bytes += v; else pending = true;
+        } else {
+          bytes += Math.max(0, Number(it.size) || 0);
+        }
+      }
+      return { bytes, dirs, pending };
     },
     /* 本地文件页：v3.57 顶层是存储空间列表，卷内为绝对路径导航 */
     lfCrumbs() {
@@ -736,6 +754,44 @@ Vue.createApp({
            : b > 1048576    ? (b / 1048576).toFixed(1) + " MB"
                             : (b / 1024).toFixed(0) + " KB";
     },
+    /* ---------- v3.60 云端文件夹大小（勾选时按需统计，后端缓存 5 分钟） ---------- */
+    dirSizeKey(name) {
+      return (this.curRemote || "") + ":" + (this.curPath ? this.curPath + "/" + name : name);
+    },
+    dirSizeText(name) {
+      const v = this.dirSizes[this.dirSizeKey(name)];
+      return typeof v === "number" ? this.fmt(v) : "--";
+    },
+    statDirSizes(names) {
+      if (!this.curRemote) return;
+      const todo = [];
+      for (const name of names) {
+        const it = (this.dirs || []).find(x => x.name === name && x.isdir);
+        if (!it) continue;
+        const key = this.dirSizeKey(name);
+        if (typeof this.dirSizes[key] !== "number") todo.push({ name, key });
+      }
+      if (!todo.length) return;
+      /* 并发 2 个队列逐个统计；结果进 dirSizes 触发 pickedSize 重算 */
+      const run = (queue) => {
+        if (!queue.length) return;
+        const { name, key } = queue.shift();
+        if (typeof this.dirSizes[key] === "number") { run(queue); return; }
+        this.api("dirsize", { remote: this.curRemote,
+                              path: this.curPath ? this.curPath + "/" + name : name }, 90000)
+          .then(d => {
+            if (typeof (d || {}).bytes === "number") this.dirSizes[key] = d.bytes;
+          })
+          .catch(() => {
+            if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 失败清占位，别让总大小永远"统计中"
+          })
+          .finally(() => run(queue));
+      };
+      run([...todo]);
+      for (const { key } of todo) {
+        if (this.dirSizes[key] === undefined) this.dirSizes[key] = null;  // 占位：统计中
+      }
+    },
     /* 配额数值可达 TB 级，单独用 TB 显示，避免写成 40960.00 GB */
     fmtQ(b) {
       const v = Number(b) || 0;
@@ -754,7 +810,7 @@ Vue.createApp({
       const LONG = { verify: 120000, speedtest: 30000, dirs: 60000, cloudlink: 60000,
                      cloudmv: 60000, cloudrm: 60000, start: 60000, urldl: 60000,
                      accttest: 60000, acctident: 60000, acctimporttext: 60000,
-                     acctrepair: 60000, localfiles: 60000, cleanup: 60000,
+                     acctrepair: 60000, localfiles: 60000, cleanup: 60000, dirsize: 90000,
                      scanpath: 240000, quota: 120000,
                      renamebatch: 120000, localrenamebatch: 120000, acctpurge: 60000,
                      trashlist: 90000, trashop: 120000,
@@ -1207,6 +1263,10 @@ Vue.createApp({
           this.dirs = d.dirs || [];
           this.thumbFailed = {};                            // 换目录重置封面失败记录
           if (d.listError) this.dirsError = d.listError;   // 加载失败 ≠ 目录为空
+          /* v3.60：进入目录即清空上一目录的勾选。旧版保留会导致
+             「根目录勾选文件夹 → 点进该文件夹勾文件 → 下载时两份任务重复」 */
+          this.picked = [];
+          this.cleanupPicked = [];
         }
       } catch (e) {
         if (seq !== this._dirsSeq) return;
@@ -3394,6 +3454,8 @@ Vue.createApp({
 
   watch: {
     themeOpen(v) { if (v) this.probeSwatches(); },
+    /* v3.60 勾选变化时统计新勾入文件夹的大小（文件夹行的"—"与下载按钮总大小共用） */
+    picked(names) { this.statDirSizes(names || []); },
   },
 
   mounted() {

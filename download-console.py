@@ -52,7 +52,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.59"
+APP_VERSION = "v3.60"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -4584,6 +4584,34 @@ def api(action, body):
     if action == "updaterollback":
         return update_rollback()
 
+    if action == "dirsize":
+        # v3.60 目录总大小：rclone size 递归统计。前端勾选文件夹时按需调用，
+        # 结果缓存（QUOTA_CACHE 同池，key 前缀隔离）——浏览列表绝不触发，
+        # 同一目录反复勾选 / 下载预检不重复递归。
+        remote = str(body.get("remote") or "").strip()
+        sub = str(body.get("path") or "").strip("/")
+        if not remote:
+            return {"error": "缺少账号"}
+        if any(seg == ".." for seg in sub.split("/")) or "\x00" in sub:
+            return {"error": "路径不合法"}
+        key = "dirsize|%s|%s" % (remote, sub)
+        now = time.time()
+        with QUOTA_LOCK:
+            hit = QUOTA_CACHE.get(key)
+            if hit and now - hit[0] < QUOTA_TTL:
+                return hit[1]
+        code, out, err = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=60)
+        if code != 0:
+            return {"error": "目录大小统计失败：%s" % (err or out)[:150]}
+        try:
+            d = json.loads(out)
+        except Exception:
+            return {"error": "解析 rclone size 输出失败"}
+        r = {"bytes": int(d.get("bytes") or 0), "count": int(d.get("count") or 0)}
+        with QUOTA_LOCK:
+            QUOTA_CACHE[key] = (now, r)
+        return r
+
     if action == "remotes":
         p = subprocess.run(["docker", "exec", RCLONE_CONTAINER, "rclone", "listremotes"],
                            capture_output=True, text=True, timeout=60)
@@ -4876,7 +4904,7 @@ def api(action, body):
         return {"jobs": jobs, "settings": load_settings(),
                 "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
                         "diskTotal": STATE.get("diskTotal"), "storages": storages(),
-                        "version": APP_VERSION},
+                        "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "stop":
@@ -4982,7 +5010,7 @@ def api(action, body):
         return {"settings": load_settings(),
                 "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
                         "diskTotal": STATE.get("diskTotal"), "storages": storages(),
-                        "version": APP_VERSION},
+                        "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "savesettings":

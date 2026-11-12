@@ -481,6 +481,9 @@
                       <i class="ti ti-folder text-base leading-none text-base-content/40 transition-transform duration-200 ease-[var(--ease-spring)] group-hover:scale-110"></i>
                       <span class="truncate text-sm" :title="hideNames ? '' : d.name">{{hideNames ? '••••••••' : d.name}}</span>
                     </button>
+                    <!-- v3.60 文件夹大小：勾选后自动递归统计（rclone size），未统计显示 -- -->
+                    <span class="shrink-0 text-xs tabular-nums text-base-content/50"
+                          :title="dirSizes[dirSizeKey(d.name)] === null ? '大小统计中…' : '目录总大小（勾选后自动统计）'">{{dirSizeText(d.name)}}</span>
                     <template v-if="!cleanupMode">
                       <button class="btn-icon danger" title="删除云端文件夹（含全部内容，不可恢复）" @click="cloudRm(d.name, false)"><i class="ti ti-trash"></i></button>
                       <button class="btn-icon" title="把这个文件夹转存到另一个账号" @click="openXfer(curPath ? curPath + '/' + d.name : d.name)"><i class="ti ti-switch-horizontal"></i></button>
@@ -624,6 +627,11 @@
                     <button class="btn-primary btn-press" :disabled="!picked.length" @click="batchStart">
                       <i class="ti ti-download"></i>下载选中（{{picked.length}}）
                     </button>
+                    <!-- v3.60 已选总大小：文件为列表真实大小，文件夹勾选后自动统计 -->
+                    <span v-if="picked.length" class="text-xs tabular-nums text-base-content/60"
+                          :title="pickedSize.dirs ? '文件夹大小为递归统计值；统计中则暂不计入' : ''">
+                      已选 {{fmt(pickedSize.bytes)}}<template v-if="pickedSize.dirs"> · 含 {{pickedSize.dirs}} 个文件夹<template v-if="pickedSize.pending">（大小统计中…）</template></template>
+                    </span>
                     <!-- v3.43 下载过滤：规则随任务下发给 rclone（--min-size / --exclude） -->
                     <button class="btn-sm" :class="dlFilterOn ? 'filter-on' : ''" @click="openDlFilter"
                             :title="dlFilterOn ? '当前过滤：' + dlFilterText() + '（点此修改）' : '设置下载过滤：跳过 0 字节 / 大小区间 / 扩展名 / 关键词'">
@@ -1326,7 +1334,7 @@
                   <span class="text-xs text-base-content/50">当前生效：<b class="font-mono">{{effectiveProxyUrl || '读取中…'}}</b></span>
                 </div>
                 <div class="text-xs leading-relaxed text-base-content/50">
-                  <strong class="text-base-content/70">下载开关按任务生效</strong>：切换后只影响之后提交的任务，已有任务保持不变；想给某一条任务换路径，点它的「详情」→ 切换路径重试（会停掉旧任务并重新下载）。代理由一个独立的 rclone 守护进程（127.0.0.1:5573）承担，按需自动拉起，<strong class="text-base-content/70">不用改 compose、不用重建容器，也不会中断直连任务</strong>；代理地址可在上方自定义，也可部署时用 <code>PROXY_URL</code> 指定（填 <code>off</code> = 不走代理，<code>socks5://</code> 仅对下载生效），具体路由规则在代理客户端里控制。<br>
+                  <strong class="text-base-content/70">下载开关按任务生效</strong>：切换后只影响之后提交的任务，已有任务保持不变；想给某一条任务换路径，点它的「详情」→ 切换路径重试（会停掉旧任务并重新下载）。代理由一个独立的 rclone 守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}）承担，按需自动拉起，<strong class="text-base-content/70">不用改 compose、不用重建容器，也不会中断直连任务</strong>；代理地址可在上方自定义，也可部署时用 <code>PROXY_URL</code> 指定（填 <code>off</code> = 不走代理，<code>socks5://</code> 仅对下载生效），具体路由规则在代理客户端里控制。<br>
                   分享开关<strong class="text-base-content/70">只影响「分享链接」</strong>的尝试顺序，切换即自动保存。<br>
                   「云盘预览」文件行的仪表盘图标 = 直连 / 经 mihomo 代理各下载 5 秒（共约 10 秒）对比速度，<strong class="text-base-content/70">固定两条路都跑</strong>，不受以上两个开关影响；进度与结果显示在目录浏览器顶部，结果仅供参考，且会真实下载文件、消耗云盘下游流量。
                 </div>
