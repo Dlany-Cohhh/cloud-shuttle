@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.61"
+APP_VERSION = "v3.62"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1931,6 +1931,50 @@ def rename_batch(remote, folder, items):
             failed.append({"name": a, "error": mask_secret(str(e))[:120]})
     return {"ok": ok, "failed": failed, "total": len(clean)}
 
+
+PK_SIZE_DEADLINE = 110          # 目录大小统计的软时限（秒），前端超时 150s
+PK_SIZE_MAX_FILES = 20000       # 条目数上限，防失控
+PK_SIZE_MAX_DEPTH = 10          # 嵌套深度上限
+
+def _pk_folder_size(name, folder_id, deadline, depth=0, seen=None):
+    """递归统计 PikPak 文件夹总字节数（v3.62，逻辑对齐 PikPak_Enhancement_Master）：
+    逐层 /drive/v1/files?parent_id=<id> 分页拉全。文件夹对象自带 size 时直接采信
+    （>0 免递归，与参考脚本 getShareParseFolderSummary 一致），为 0 才下钻求和。
+    深度 / 条目数 / 时限三重上限，超限抛 RuntimeError 由调用方兜底。"""
+    fid = str(folder_id or "")
+    if seen is None:
+        seen = set()
+    key = fid or "__root__"
+    if key in seen or depth > PK_SIZE_MAX_DEPTH:
+        return 0
+    seen.add(key)
+    total, next_tok, files_seen = 0, "", 0
+    while True:
+        if time.time() > deadline:
+            raise RuntimeError("目录太大，统计超时（上限 %d 秒）" % PK_SIZE_DEADLINE)
+        q = ("/drive/v1/files?parent_id=%s&limit=1000&phase=PHASE_TYPE_COMPLETE"
+             "&thumbnail_size=SIZE_SMALL%s" % (urllib.parse.quote(fid),
+                                               ("&page_token=" + urllib.parse.quote(next_tok)) if next_tok else ""))
+        code, d = pk_api(name, "GET", q)
+        if code >= 400:
+            raise RuntimeError(_pk_err(code, d))
+        for e in (d.get("files") or []):
+            files_seen += 1
+            if files_seen > PK_SIZE_MAX_FILES:
+                raise RuntimeError("目录条目超过 %d 个，已停止统计" % PK_SIZE_MAX_FILES)
+            try:
+                sz = int(e.get("size") or 0)
+            except Exception:
+                sz = 0
+            if e.get("kind") == "drive#folder":
+                # PikPak 有时直接给出文件夹累计大小（>0 采信，免递归）
+                total += sz if sz > 0 else _pk_folder_size(name, str(e.get("id") or ""), deadline, depth + 1, seen)
+            else:
+                total += max(0, sz)
+        next_tok = str(d.get("next_page_token") or "")
+        if not next_tok:
+            break
+    return total
 
 def pk_trash_list(name, max_pages=TRASH_MAX_PAGES, limit=TRASH_PAGE_LIMIT):
     """回收站列表。parent_id=* 表示不限父目录；某些账号的陈旧条目只会出现在
@@ -4628,14 +4672,23 @@ def api(action, body):
             hit = QUOTA_CACHE.get(key)
             if hit and now - hit[0] < QUOTA_TTL:
                 return hit[1]
-        code, out, err = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=120)
-        if code != 0:
-            return {"error": "目录大小统计失败：%s" % (err or out)[:150]}
+        fid = str(body.get("id") or "").strip()
+        r = None
+        # v3.62：优先走 PikPak 原生 API 递归（直读文件对象 size，不依赖 rclone 递归，
+        # 参考 PikPak_Enhancement_Master）；失败再回退 rclone size。
         try:
-            d = json.loads(out)
-        except Exception:
-            return {"error": "解析 rclone size 输出失败"}
-        r = {"bytes": int(d.get("bytes") or 0), "count": int(d.get("count") or 0)}
+            if not fid:
+                fid = pk_walk(remote, sub)
+            r = {"bytes": int(_pk_folder_size(remote, fid, time.time() + PK_SIZE_DEADLINE)), "count": -1}
+        except Exception as e:
+            code, out, err = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=120)
+            if code != 0:
+                return {"error": "目录大小统计失败：%s / %s" % (str(e)[:100], (err or out)[:100])}
+            try:
+                d = json.loads(out)
+            except Exception:
+                return {"error": "解析 rclone size 输出失败"}
+            r = {"bytes": int(d.get("bytes") or 0), "count": int(d.get("count") or 0)}
         with QUOTA_LOCK:
             QUOTA_CACHE[key] = (now, r)
         return r
@@ -4657,7 +4710,7 @@ def api(action, body):
             nm = str(e.get("Name") or "")
             size = int(e.get("Size") or 0)
             is_dir = bool(e.get("IsDir", False))
-            it = {"name": nm, "isdir": is_dir, "size": size,
+            it = {"name": nm, "isdir": is_dir, "size": size, "id": str(e.get("ID") or ""),
                   # v3.43：带修改时间，导出 CSV / 目录树时用得上，列表页也可排序
                   "mtime": str(e.get("ModTime") or "")[:19],
                   # 目录不打标（要判「整个目录都下过」得递归列云端，太重）；

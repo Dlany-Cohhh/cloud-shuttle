@@ -772,16 +772,17 @@ Vue.createApp({
         const it = (this.dirs || []).find(x => x.name === name && x.isdir);
         if (!it) continue;
         const key = this.dirSizeKey(name);
-        if (typeof this.dirSizes[key] !== "number") todo.push({ name, key });
+        if (typeof this.dirSizes[key] !== "number") todo.push({ name, key, id: it.id || "" });
       }
       if (!todo.length) return;
       /* 串行队列逐个统计（不打爆 PikPak 接口）；结果进 dirSizes 触发 pickedSize 重算 */
       const run = (queue) => {
         if (!queue.length) return;
-        const { name, key } = queue.shift();
+        const { name, key, id } = queue.shift();
         if (typeof this.dirSizes[key] === "number") { run(queue); return; }
-        this.api("dirsize", { remote: this.curRemote,
-                              path: this.curPath ? this.curPath + "/" + name : name }, 90000)
+        /* v3.62：带文件夹 id 走 PikPak 原生 API 递归（后端 rclone size 仅兜底） */
+        this.api("dirsize", { remote: this.curRemote, id: id || undefined,
+                              path: this.curPath ? this.curPath + "/" + name : name }, 150000)
           .then(d => {
             if (d && typeof d.bytes === "number") this.dirSizes[key] = d.bytes;
             else if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 后端报错：清掉"统计中"占位，可重新勾选重试
