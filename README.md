@@ -2,9 +2,9 @@
 
 > **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
-![version](https://img.shields.io/badge/version-v3.57-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
+![version](https://img.shields.io/badge/version-v3.58-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
-**当前版本 v3.57** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
+**当前版本 v3.58** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 

@@ -169,6 +169,11 @@
               <i class="ti ti-alert-triangle mt-0.5 text-lg leading-none"></i>
               <div>磁盘空间保护已触发 —— {{(state.storages || []).filter(s => s.low).map(s => s.name + ' 剩余 ' + s.freeGB + ' GB').join('；') || '剩余 ' + (state.diskFree ?? '--') + ' GB'}}，低于阈值 {{settings.diskMinGB}} GB，目标在该空间的任务已暂停。清理空间后到「设置」调低阈值或点继续。</div>
             </div>
+            <!-- v3.58：后端已升级而页面还是旧 JS 时提示刷新，避免新旧混搭出怪状态 -->
+            <div v-if="newVer" class="pop-in flex items-start gap-3 rounded-xl border border-info/30 bg-info/10 px-4 py-3 text-sm text-info">
+              <i class="ti ti-rocket mt-0.5 text-lg leading-none"></i>
+              <div>控制台已升级到 <b>{{newVer}}</b>，当前页面仍是旧版界面。<button class="btn-sm primary ml-2" @click="reloadNow">刷新页面</button></div>
+            </div>
             <!-- 后端不可达横幅 -->
             <div v-if="apiErr" class="flex items-start gap-3 rounded-xl border border-warning/30 bg-warning/10 px-4 py-3 text-sm text-warning">
               <i class="ti ti-plug-connected mt-0.5 text-lg leading-none"></i>
@@ -499,7 +504,7 @@
                       <div class="flex min-w-0 flex-1 items-center gap-2">
                         <span class="min-w-0 truncate text-sm" :title="hideNames ? '' : f.name">{{hideNames ? '••••••••' : f.name}}</span>
                         <span v-if="f.downloaded" class="badge-pill b-done shrink-0"
-                              title="NAS 的 /vol2/download 下已有同名且大小一致的文件">
+                              title="NAS 下载目录下已有同名且大小一致的文件">
                           <i class="ti ti-check"></i>已下载
                         </span>
                       </div>
@@ -624,7 +629,7 @@
                             :title="dlFilterOn ? '当前过滤：' + dlFilterText() + '（点此修改）' : '设置下载过滤：跳过 0 字节 / 大小区间 / 扩展名 / 关键词'">
                       <i class="ti ti-filter"></i>过滤<span v-if="dlFilterCount" class="tabular-nums">{{dlFilterCount}}</span>
                     </button>
-                    <span class="text-xs text-base-content/50">落盘到 /vol2/download/保存目录</span>
+                    <span class="text-xs text-base-content/50">落盘到所选存储空间/保存目录</span>
                     <span v-if="dlFilterOn" class="text-xs text-warning/90"
                           :title="'按当前规则，本目录 ' + dirFiles.length + ' 个文件中 ' + dlFilterPreview.skip + ' 个会被跳过'">
                       过滤中：预计下载 {{dlFilterPreview.pass}} / {{dirFiles.length}} 个 · {{fmt(dlFilterPreview.bytes)}}
@@ -829,7 +834,8 @@
                       <button class="lf-crumb" :class="i===lfCrumbs.length-1 ? 'is-current' : ''" @click="goLf(c.path)">{{c.label}}</button>
                     </template>
                   </div>
-                  <span class="text-xs tabular-nums text-base-content/50">/vol2/download{{lfPath ? '/' + lfPath : ''}}</span>
+                  <!-- v3.58：显示当前真实路径（顶层 = 各存储空间，卷内 = 绝对路径），不再写死 /vol2/download -->
+                  <span class="text-xs tabular-nums text-base-content/50">{{lfPath || '各存储空间'}}</span>
                 </div>
                 <div class="flex flex-wrap items-center gap-2 border-t border-base-content/10 pt-3">
                   <div class="relative min-w-48 flex-1">
@@ -912,7 +918,7 @@
                 <i class="ti ti-folder-off"></i>{{lfQuery ? '没有匹配的文件' : '这个目录是空的'}}
               </div>
               <div class="px-1 text-xs leading-relaxed text-base-content/45">
-                文件来自 NAS 的 <code class="rounded bg-base-content/8 px-1">/vol2/download</code>，即任务里「目标 /data/…」对应的真实落盘位置。播放支持拖动进度；不支持的格式请点「下载」用本机播放器打开。每行右侧的铅笔按钮可单独重命名文件或文件夹；「批量改名」会真实改动 NAS 上的名字（含文件夹），先预览再执行，改名后旧的播放 / 下载链接会失效。
+                文件来自 NAS 上自动识别的各存储空间，即任务里「目标 /data/…」对应的真实落盘位置。播放支持拖动进度；不支持的格式请点「下载」用本机播放器打开。每行右侧的铅笔按钮可单独重命名文件或文件夹；「批量改名」会真实改动 NAS 上的名字（含文件夹），先预览再执行，改名后旧的播放 / 下载链接会失效。
               </div>
             </div>
 
@@ -2014,7 +2020,7 @@ os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
         <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
           <i class="ti ti-shield-check text-lg leading-none text-primary"></i>
           <span class="min-w-0 flex-1 truncate text-lg font-bold">一致性校验</span>
-          <span class="hidden text-xs text-base-content/50 sm:inline">云盘 ↔ /vol2/download · 全程只读</span>
+          <span class="hidden text-xs text-base-content/50 sm:inline">云盘 ↔ 本地存储空间 · 全程只读</span>
           <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeVerify" aria-label="关闭"><i class="ti ti-x"></i></button>
         </div>
 
@@ -2041,7 +2047,7 @@ os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
               </div>
             </label>
             <label class="flex flex-col gap-1 text-xs sm:col-span-2">
-              <span class="font-medium text-base-content/60">本地路径（相对 /vol2/download；留空＝下载根目录，可填单个文件）</span>
+              <span class="font-medium text-base-content/60">本地路径（相对主卷或绝对路径；留空＝主卷根目录，可填单个文件）</span>
               <input class="fld w-full" v-model.trim="verifyForm.localPath" list="vf-local-dirs" placeholder="kz 或 kz/0501.mp4">
               <datalist id="vf-local-dirs"><option v-for="d in localDirs" :key="d" :value="d"></option></datalist>
             </label>
@@ -2415,7 +2421,7 @@ os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
 
           <div class="text-[11px] leading-relaxed text-base-content/45">
             <template v-if="renameCtx === 'local'">
-              改的是 <b>NAS 上 /vol2/download/{{lfPath || ''}}</b> 里的真实文件与文件夹名字，立即生效、不进回收站；
+              改的是 <b>NAS 上 {{lfPath || '主卷根目录'}}</b> 里的真实文件与文件夹名字，立即生效、不进回收站；
               改名后旧的播放 / 下载 / 外链地址会失效。不处理隐藏文件与传输中的 .part 临时文件。
               目标名已存在或彼此重名时整批拒绝执行，不会改到一半停下来。
             </template>

@@ -39,6 +39,8 @@ Vue.createApp({
       effectiveProxyUrl: "",
       /* v3.57 storages 由后端自动识别（不再写死磁盘总量），每项含 name/totalGB/freeGB/low */
       state: { diskLow: false, diskFree: null, diskTotal: null, storages: [] },
+      bootVer: "",                // v3.58 页面加载时的后端版本，用于升级检测
+      newVer: "",                 // v3.58 检测到的新版本号（非空 = 提示刷新）
       stats: { speed: 0, bytes: 0, transferring: [] },
       hist: [],
 
@@ -817,6 +819,13 @@ Vue.createApp({
         this.settings = d.settings || {};
         this.effectiveProxyUrl = d.effectiveProxyUrl || "";
         this.state = d.state || this.state;
+        /* v3.58：后端升级检测。页面不刷新时 JS 永远是旧代码，新后端 + 旧前端
+           混搭会出现"目录不存在"之类的怪状态——版本变了就提示用户刷新。 */
+        const ver = String((this.state || {}).version || "");
+        if (ver) {
+          if (!this.bootVer) this.bootVer = ver;
+          else if (ver !== this.bootVer && ver !== this.newVer) this.newVer = ver;
+        }
         this.apiErr = "";
       } catch (e) {
         /* 后端不可达横幅：成功时清空、失败时点亮。abort = 8 秒超时，给中文提示 */
@@ -2852,10 +2861,14 @@ Vue.createApp({
         { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
     },
     async loadLocalFiles(path) {
+      /* v3.58：请求序号防竞态——快速连点 / 上一级与子目录并发时，
+         晚到的旧响应不得覆盖新目录（旧版会让错误横幅与正确列表同屏） */
+      const seq = (this._lfSeq = (this._lfSeq || 0) + 1);
       this.lfLoading = true;
       this.lfError = "";
       try {
         const d = await this.api("localfiles", { path: path || "" });
+        if (seq !== this._lfSeq) return;
         if (d.error) {
           this.lfError = d.error;
         } else {
@@ -2868,11 +2881,13 @@ Vue.createApp({
           this.lfPicked = [];          // v3.44 换目录后旧的勾选不再对应任何文件
         }
       } catch (e) {
+        if (seq !== this._lfSeq) return;
         this.lfError = "读取失败：" + e.message;
       } finally {
-        this.lfLoading = false;
+        if (seq === this._lfSeq) this.lfLoading = false;
       }
     },
+    reloadNow() { location.reload(); },   // v3.58 升级提示横幅用
     /* 控制台挂载点 → 卷显示名（面包屑/提示用） */
     volumeNameOf(consolePath) {
       const v = (this.lfVolumes.length ? this.lfVolumes : this.state.storages)

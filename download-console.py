@@ -52,7 +52,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.57"
+APP_VERSION = "v3.58"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -4868,7 +4868,8 @@ def api(action, body):
                 save_jobs(jobs)
         return {"jobs": jobs, "settings": load_settings(),
                 "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
-                        "diskTotal": STATE.get("diskTotal"), "storages": storages()},
+                        "diskTotal": STATE.get("diskTotal"), "storages": storages(),
+                        "version": APP_VERSION},
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "stop":
@@ -4973,7 +4974,8 @@ def api(action, body):
     if action == "settings":
         return {"settings": load_settings(),
                 "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
-                        "diskTotal": STATE.get("diskTotal"), "storages": storages()},
+                        "diskTotal": STATE.get("diskTotal"), "storages": storages(),
+                        "version": APP_VERSION},
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "savesettings":
