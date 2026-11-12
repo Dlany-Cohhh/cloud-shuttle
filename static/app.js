@@ -772,7 +772,7 @@ Vue.createApp({
         if (typeof this.dirSizes[key] !== "number") todo.push({ name, key });
       }
       if (!todo.length) return;
-      /* 并发 2 个队列逐个统计；结果进 dirSizes 触发 pickedSize 重算 */
+      /* 串行队列逐个统计（不打爆 PikPak 接口）；结果进 dirSizes 触发 pickedSize 重算 */
       const run = (queue) => {
         if (!queue.length) return;
         const { name, key } = queue.shift();
@@ -1249,6 +1249,11 @@ Vue.createApp({
         p = this.curPath + "/" + p;
       }
       this.curPath = p;
+      /* v3.60：换目录即清空上一目录勾选（放在请求前，加载失败也不会残留）。
+         旧版保留会导致「根目录勾选文件夹 → 点进该文件夹勾文件 → 下载时两份任务重复」；
+         只放成功分支会漏掉「加载失败后 curPath 已变、勾选还在」的边缘场景。 */
+      this.picked = [];
+      this.cleanupPicked = [];
       this.dirsLoading = true;
       this.dirsError = "";
       /* 连点两下目录（或切账号后旧请求才回来）时，晚到的响应会把新目录的内容
@@ -1263,10 +1268,6 @@ Vue.createApp({
           this.dirs = d.dirs || [];
           this.thumbFailed = {};                            // 换目录重置封面失败记录
           if (d.listError) this.dirsError = d.listError;   // 加载失败 ≠ 目录为空
-          /* v3.60：进入目录即清空上一目录的勾选。旧版保留会导致
-             「根目录勾选文件夹 → 点进该文件夹勾文件 → 下载时两份任务重复」 */
-          this.picked = [];
-          this.cleanupPicked = [];
         }
       } catch (e) {
         if (seq !== this._dirsSeq) return;
