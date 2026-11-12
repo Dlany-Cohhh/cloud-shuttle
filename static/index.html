@@ -484,7 +484,7 @@
                     </button>
                     <!-- v3.60 文件夹大小：勾选后自动递归统计（rclone size），未统计显示 -- -->
                     <span class="shrink-0 text-xs tabular-nums text-base-content/50"
-                          :title="dirSizes[dirSizeKey(d.name)] === null ? '大小统计中…' : '目录总大小（勾选后自动统计）'">{{dirSizeText(d.name)}}</span>
+                          :title="dirSizes[dirSizeKey(d.name)] === null ? '大小统计中…' : '目录总大小（进入目录自动统计，5 分钟缓存）'">{{dirSizeText(d.name)}}</span>
                     <template v-if="!cleanupMode">
                       <button class="btn-icon danger" title="删除云端文件夹（含全部内容，不可恢复）" @click="cloudRm(d.name, false)"><i class="ti ti-trash"></i></button>
                       <button class="btn-icon" title="把这个文件夹转存到另一个账号" @click="openXfer(curPath ? curPath + '/' + d.name : d.name)"><i class="ti ti-switch-horizontal"></i></button>

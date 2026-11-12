@@ -765,35 +765,41 @@ Vue.createApp({
       const v = this.dirSizes[this.dirSizeKey(name)];
       return typeof v === "number" ? this.fmt(v) : "--";
     },
-    statDirSizes(names) {
+    statDirSizes(names, opts) {
+      const o = opts || {};
       if (!this.curRemote) return;
+      const limit = o.limit || 0;           // >0 时只自动统计前 N 个（其余勾选时补齐）
       const todo = [];
       for (const name of names) {
         const it = (this.dirs || []).find(x => x.name === name && x.isdir);
         if (!it) continue;
         const key = this.dirSizeKey(name);
-        if (typeof this.dirSizes[key] !== "number") todo.push({ name, key, id: it.id || "" });
+        /* 已有结果（number）或在统计中（null 占位）都不再入队，避免重复请求 */
+        if (typeof this.dirSizes[key] !== "number" && this.dirSizes[key] !== null) {
+          todo.push({ name, key, id: it.id || "" });
+        }
       }
       if (!todo.length) return;
-      /* 串行队列逐个统计（不打爆 PikPak 接口）；结果进 dirSizes 触发 pickedSize 重算 */
-      const run = (queue) => {
-        if (!queue.length) return;
-        const { name, key, id } = queue.shift();
-        if (typeof this.dirSizes[key] === "number") { run(queue); return; }
-        /* v3.62：带文件夹 id 走 PikPak 原生 API 递归（后端 rclone size 仅兜底） */
+      const queue = limit > 0 ? todo.slice(0, limit) : todo;
+      /* v3.63：并发 3 的任务池，统计完一个立刻显示一个；结果进 dirSizes 触发重算 */
+      let idx = 0;
+      const worker = () => {
+        if (idx >= queue.length) return;
+        const { name, key, id } = queue[idx++];
+        /* 带文件夹 id 走 PikPak 原生 API 递归（后端 rclone size 仅兜底） */
         this.api("dirsize", { remote: this.curRemote, id: id || undefined,
                               path: this.curPath ? this.curPath + "/" + name : name }, 150000)
           .then(d => {
             if (d && typeof d.bytes === "number") this.dirSizes[key] = d.bytes;
-            else if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 后端报错：清掉"统计中"占位，可重新勾选重试
+            else if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 后端报错：清占位，重勾/重进目录可重试
           })
           .catch(() => {
-            if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 失败清占位，别让总大小永远"统计中"
+            if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 失败清占位
           })
-          .finally(() => run(queue));
+          .finally(() => worker());
       };
-      run([...todo]);
-      for (const { key } of todo) {
+      for (let i = 0; i < 3; i++) worker();
+      for (const { key } of queue) {
         if (this.dirSizes[key] === undefined) this.dirSizes[key] = null;  // 占位：统计中
       }
     },
@@ -1273,6 +1279,9 @@ Vue.createApp({
           this.dirs = d.dirs || [];
           this.thumbFailed = {};                            // 换目录重置封面失败记录
           if (d.listError) this.dirsError = d.listError;   // 加载失败 ≠ 目录为空
+          /* v3.63：进入目录自动统计各子文件夹的总大小（并发 3 渐进填充，最多 40 个；
+             超出的仍会在勾选时按需统计）。结果缓存 5 分钟，重复进入不重复请求。 */
+          this.statDirSizes((this.dirs || []).filter(x => x.isdir).map(x => x.name), { limit: 40 });
         }
       } catch (e) {
         if (seq !== this._dirsSeq) return;
