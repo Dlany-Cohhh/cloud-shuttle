@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.63"
+APP_VERSION = "v3.64"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1931,6 +1931,31 @@ def rename_batch(remote, folder, items):
             failed.append({"name": a, "error": mask_secret(str(e))[:120]})
     return {"ok": ok, "failed": failed, "total": len(clean)}
 
+
+LOCAL_SIZE_DEADLINE = 55        # 本地目录统计软时限（秒），前端超时 60s
+LOCAL_SIZE_MAX_FILES = 200000   # 条目数上限
+
+def _local_dir_size(real_path, deadline):
+    """本地目录递归求和（v3.64）。只统计普通文件，跳过隐藏/临时文件与软链接。
+    超时或条目超限抛 RuntimeError（调用方转错误响应）。"""
+    total, count = 0, 0
+    for cur, dnames, fnames in os.walk(real_path, followlinks=False):
+        dnames[:] = [x for x in dnames if not _junk_name(x)]
+        for fn in fnames:
+            if _junk_name(fn):
+                continue
+            try:
+                st = os.stat(os.path.join(cur, fn))
+            except OSError:
+                continue
+            if statmod.S_ISREG(st.st_mode):
+                total += st.st_size
+                count += 1
+                if count > LOCAL_SIZE_MAX_FILES:
+                    raise RuntimeError("目录条目超过 %d 个，已停止统计" % LOCAL_SIZE_MAX_FILES)
+        if time.time() > deadline:
+            raise RuntimeError("目录太大，统计超时")
+    return {"bytes": total, "count": count}
 
 PK_SIZE_DEADLINE = 110          # 目录大小统计的软时限（秒），前端超时 150s
 PK_SIZE_MAX_FILES = 20000       # 条目数上限，防失控
@@ -4655,6 +4680,30 @@ def api(action, body):
         return update_state()
     if action == "updaterollback":
         return update_rollback()
+
+    if action == "localsize":
+        # v3.64 本地目录总大小：os.walk 实时求和（NAS 本地盘，不涉及 PikPak 请求）。
+        # 结果缓存 60s，避免连续刷新重复扫描大目录；隐藏项与临时文件不计入。
+        try:
+            p = safe_local_path(str(body.get("path") or ""))
+        except ValueError as e:
+            return {"error": mask_secret(str(e))}
+        rp = os.path.realpath(p)
+        if not os.path.isdir(rp):
+            return {"error": "目录不存在或已被移动"}
+        key = "localsize|" + rp
+        now = time.time()
+        with QUOTA_LOCK:
+            hit = QUOTA_CACHE.get(key)
+            if hit and now - hit[0] < 60:
+                return hit[1]
+        try:
+            r = _local_dir_size(rp, time.time() + 55)
+        except RuntimeError as e:
+            return {"error": str(e)}
+        with QUOTA_LOCK:
+            QUOTA_CACHE[key] = (now, r)
+        return r
 
     if action == "dirsize":
         # v3.60 目录总大小：rclone size 递归统计。前端勾选文件夹时按需调用，

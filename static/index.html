@@ -885,7 +885,12 @@
                     <span class="min-w-0 flex-1 truncate text-sm font-medium">{{d.name}}</span>
                   </button>
                   <span v-if="d.volumeRoot" class="text-xs tabular-nums" :class="d.freeGB <= 0 ? 'text-error' : 'text-base-content/50'">剩余 {{d.freeGB}} / 共 {{d.totalGB}} GB</span>
-                  <span v-else class="text-xs tabular-nums text-base-content/50">{{d.count}} 项</span>
+                  <!-- v3.64 本地文件夹磁盘占用：进入目录自动统计（60 秒缓存），与云盘页同款体验 -->
+                  <template v-else>
+                    <span class="text-xs tabular-nums" :class="lfSizes[lfSizeKey(d.name)] === null ? 'text-base-content/40' : 'text-base-content/60'"
+                          :title="lfSizes[lfSizeKey(d.name)] === null ? '大小统计中…' : '文件夹占用磁盘大小（自动统计，60 秒缓存）'">{{lfSizeText(d.name)}}</span>
+                    <span class="text-xs tabular-nums text-base-content/50">{{d.count}} 项</span>
+                  </template>
                   <span class="hidden text-xs tabular-nums text-base-content/40 sm:inline">{{fmtTime(d.mtime)}}</span>
                   <button class="btn-icon always" :title="'重命名此文件夹：'+d.name" @click="localRenameOne(d.name)"><i class="ti ti-pencil"></i></button>
                   <button class="btn-sm" :title="'校验此文件夹与云端：'+d.name" @click="openVerify({localPath: lfPath ? lfPath + '/' + d.name : d.name})"><i class="ti ti-shield-check"></i>校验</button>

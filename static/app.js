@@ -42,6 +42,7 @@ Vue.createApp({
       bootVer: "",                // v3.58 页面加载时的后端版本，用于升级检测
       newVer: "",                 // v3.58 检测到的新版本号（非空 = 提示刷新）
       dirSizes: {},               // v3.60 勾选的文件夹大小统计结果，key = remote:绝对路径
+      lfSizes: {},                // v3.64 本地文件夹磁盘占用，key = 绝对路径
       stats: { speed: 0, bytes: 0, transferring: [] },
       hist: [],
 
@@ -360,13 +361,28 @@ Vue.createApp({
     lfCrumbs() {
       const out = [{ label: "存储空间", path: "" }];
       if (!this.lfPath) return out;
-      const segs = this.lfPath.split("/").filter(Boolean);
-      const rootName = this.volumeNameOf("/" + segs.join("/")) || segs[0];
-      let cur = "";
-      segs.forEach((s, i) => {
-        cur = cur ? cur + "/" + s : "/" + s;
-        const isRoot = this.lfVolumes.some(v => v.console === cur);
-        out.push({ label: isRoot ? rootName : s, path: cur });
+      const vols = this.lfVolumes.length ? this.lfVolumes : (this.state.storages || []);
+      const vol = vols.find(v => {
+        const root = String(v.console || "").replace(/\/+$/, "");
+        return root && (this.lfPath === root || this.lfPath.indexOf(root + "/") === 0);
+      });
+      if (!vol) {
+        /* 不在任何卷内（理论少见）：退回逐段渲染 */
+        let cur = "";
+        this.lfPath.split("/").filter(Boolean).forEach(seg => {
+          cur = cur ? cur + "/" + seg : "/" + seg;
+          out.push({ label: seg, path: cur });
+        });
+        return out;
+      }
+      /* v3.64：卷感知面包屑——卷根显示卷名，其后才是卷内真实层级。
+         旧版把挂载路径段（如 /vol2/download 的 "vol2"）也渲染成目录。 */
+      const root = vol.console.replace(/\/+$/, "");
+      out.push({ label: vol.name, path: root });
+      let cur = root;
+      this.lfPath.slice(root.length).split("/").filter(Boolean).forEach(seg => {
+        cur = cur + "/" + seg;
+        out.push({ label: seg, path: cur });
       });
       return out;
     },
@@ -803,6 +819,42 @@ Vue.createApp({
         if (this.dirSizes[key] === undefined) this.dirSizes[key] = null;  // 占位：统计中
       }
     },
+    /* ---------- v3.64 本地文件页：文件夹磁盘占用（进入目录自动统计，60s 缓存） ---------- */
+    lfSizeKey(name) {
+      return (this.lfPath || "").replace(/\/+$/, "") + "/" + name;
+    },
+    lfSizeText(name) {
+      const v = this.lfSizes[this.lfSizeKey(name)];
+      return typeof v === "number" ? this.fmt(v) : "--";
+    },
+    statLocalSizes() {
+      const todo = (this.lfDirs || [])
+        .filter(d => !d.volumeRoot)
+        .filter(d => {
+          const k = this.lfSizeKey(d.name);
+          return typeof this.lfSizes[k] !== "number" && this.lfSizes[k] !== null;
+        })
+        .map(d => ({ name: d.name, key: this.lfSizeKey(d.name) }));
+      if (!todo.length) return;
+      let idx = 0;
+      const worker = () => {
+        if (idx >= todo.length) return;
+        const { name, key } = todo[idx++];
+        this.api("localsize", { path: key }, 60000)
+          .then(d => {
+            if (d && typeof d.bytes === "number") this.lfSizes[key] = d.bytes;
+            else if (this.lfSizes[key] === null) delete this.lfSizes[key];
+          })
+          .catch(() => {
+            if (this.lfSizes[key] === null) delete this.lfSizes[key];
+          })
+          .finally(() => worker());
+      };
+      for (let i = 0; i < 3; i++) worker();
+      for (const { key } of todo) {
+        if (this.lfSizes[key] === undefined) this.lfSizes[key] = null;  // 占位：统计中
+      }
+    },
     /* 配额数值可达 TB 级，单独用 TB 显示，避免写成 40960.00 GB */
     fmtQ(b) {
       const v = Number(b) || 0;
@@ -821,7 +873,7 @@ Vue.createApp({
       const LONG = { verify: 120000, speedtest: 30000, dirs: 60000, cloudlink: 60000,
                      cloudmv: 60000, cloudrm: 60000, start: 60000, urldl: 60000,
                      accttest: 60000, acctident: 60000, acctimporttext: 60000,
-                     acctrepair: 60000, localfiles: 60000, cleanup: 60000, dirsize: 150000,
+                     acctrepair: 60000, localfiles: 60000, cleanup: 60000, dirsize: 150000, localsize: 60000,
                      scanpath: 240000, quota: 120000,
                      renamebatch: 120000, localrenamebatch: 120000, acctpurge: 60000,
                      trashlist: 90000, trashop: 120000,
@@ -2946,6 +2998,24 @@ Vue.createApp({
         if (seq !== this._lfSeq) return;
         if (d.error) {
           this.lfError = d.error;
+          /* v3.64：失败不再保留上一目录的列表（旧版错误横幅与旧内容同屏），
+             并自动回退一次——先试所属卷根，再不行回顶层（_lfFalling 防循环） */
+          this.lfDirs = [];
+          this.lfFiles = [];
+          this.lfPicked = [];
+          if (path && !this._lfFalling) {
+            this._lfFalling = true;
+            const vol = (this.state.storages || []).find(v => {
+              const root = String(v.console || "").replace(/\/+$/, "");
+              return root && (path === root || path.indexOf(root + "/") === 0);
+            });
+            const target = vol ? vol.console.replace(/\/+$/, "") : "";
+            const from = path;
+            this.loadLocalFiles(target).finally(() => { this._lfFalling = false; });
+            this.toast("目录不可访问（" + d.error + "），已回到 " + (vol ? vol.name : "存储空间顶层"), "warning");
+            void from;
+            return;
+          }
         } else {
           this.lfPath = d.path || "";
           this.lfVolumes = d.volumes || this.state.storages || [];
@@ -2954,6 +3024,9 @@ Vue.createApp({
           this.lfTruncated = !!d.truncated;
           this.lfQuery = "";
           this.lfPicked = [];          // v3.44 换目录后旧的勾选不再对应任何文件
+          /* v3.64：进入目录自动统计各子文件夹占用的磁盘大小（并发 3 渐进填充，
+             结果缓存到 lfSizes，重复进入不重复扫描） */
+          this.statLocalSizes();
         }
       } catch (e) {
         if (seq !== this._lfSeq) return;
