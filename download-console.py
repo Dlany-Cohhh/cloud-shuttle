@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.67"
+APP_VERSION = "v3.68"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -347,6 +347,7 @@ def merged_stats(_timeout=8):
 
 # 「添加账号」支持的 rclone 后端（非 OAuth 类型；OAuth 型需交互授权，暂不支持网页添加）
 PROVIDERS = [
+    {"type": "pikpak", "label": "PikPak 网盘（一键浏览器登录采集）", "params": []},
     {"type": "webdav", "label": "OpenList / WebDAV（Alist/坚果云等）", "params": [
         {"name": "url", "label": "WebDAV 地址", "required": True, "ph": "http://NAS_IP:5244/dav"},
         {"name": "user", "label": "用户名"},
@@ -5524,6 +5525,12 @@ def api(action, body):
             rc("config/delete", name=name)
         except Exception as e:
             return {"error": str(e)[:150]}
+        # v3.68：代理 rcd（5573）内存里也删一份 —— 只删主进程时，代理进程的下一次
+        # SaveConfig 会把已删段落写回 rclone.conf，账号就在云盘浏览列表里"复活"
+        try:
+            rc("config/delete", name=name, _proxy=True)
+        except Exception:
+            pass
         # v3.51：两个 rcd 各清一次，否则另一个进程的下一次 SaveConfig 会把它写回来
         try:
             purge_ghost_sections([name])
@@ -5533,7 +5540,27 @@ def api(action, body):
 
     if action == "acctpurge":
         # v3.51 手动清理无 type 的残留空壳段（改名 / 删除后 rclone 的 captcha 回写）
-        return {"ok": True, "removed": purge_ghost_sections()}
+        removed = purge_ghost_sections()
+        # v3.68 双进程对账：代理 rcd（5573）内存里比主进程多出来的段（含有效段）同步删除。
+        # 根治「账号删除后云盘浏览列表又冒出来」——旧版只删主进程，代理侧写回即复活。
+        ghost = []
+        try:
+            main = rc("config/dump", _timeout=20)
+        except Exception:
+            main = {}
+        try:
+            pconf = rc("config/dump", _proxy=True, _timeout=20)
+        except Exception:
+            pconf = {}
+        if isinstance(main, dict) and isinstance(pconf, dict):
+            for k in pconf:
+                if k not in main:
+                    try:
+                        rc("config/delete", name=k, _proxy=True, _timeout=20)
+                        ghost.append(k)
+                    except Exception:
+                        pass
+        return {"ok": True, "removed": removed, "resynced": ghost}
 
     if action == "acctrename":
         # rclone RC 没有 config/rename，只能「读整段 → 建新段 → 删旧段」。

@@ -164,6 +164,7 @@ Vue.createApp({
       providers: [],
       acctForm: { name: "", type: "pikpak", params: {} },
       acctAdding: false,
+      purgeBusy: false,           // v3.68 清残留进行中
       testingAll: false,
       testDone: 0,
       testTotal: 0,
@@ -2137,6 +2138,19 @@ Vue.createApp({
       const e = this.safeMsg((a && a.error) || "");
       if (/no username/i.test(e)) return "no username · 凭证缺失，请点「重新登录」重新采集";
       return e;
+    },
+    /* v3.68 双进程对账清理：空壳段 + 代理侧多出的残留段（账号删除后复活的根源） */
+    async purgeResidual() {
+      if (this.purgeBusy) return;
+      this.purgeBusy = true;
+      try {
+        const d = await this.api("acctpurge", {}, 60000);
+        if (d.error) { this.toast(d.error, "error"); return; }
+        const n = (d.removed || []).length + (d.resynced || []).length;
+        this.toast(n ? "已清理 " + n + " 个残留段：" + [...(d.removed || []), ...(d.resynced || [])].join("、") : "没有发现残留段", "ok");
+        this.loadAccounts();
+      } catch (e) { this.toast("清理失败：" + e.message, "error"); }
+      this.purgeBusy = false;
     },
     async acctAdd() {
       const f = this.acctForm;

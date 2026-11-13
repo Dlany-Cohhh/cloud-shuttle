@@ -1037,6 +1037,10 @@
                           title="下载一次性采集器（任意 Windows 双击），或直接粘贴 refresh_token 导入">
                     <i class="ti ti-cloud-download"></i>导入 / 采集 Token
                   </button>
+                  <button class="btn-sm" @click="purgeResidual"
+                          title="两个后端进程配置对账：清掉空壳段与一侧多出的残留段（账号删除后又冒出来就用它）">
+                    <i class="ti ti-eraser"></i>清残留
+                  </button>
                   <button class="btn-icon always" title="刷新账号列表" @click="loadAccounts"><i class="ti ti-refresh"></i></button>
                   <div class="relative">
                     <button class="btn-icon always" title="更多账号操作" @click="moreOpen = !moreOpen">
@@ -1106,7 +1110,7 @@
                   </select>
                   <input class="fld w-44" v-model.trim="acctForm.name" placeholder="账号名（自定义）">
                 </div>
-                <div class="flex flex-wrap items-center gap-3">
+                <div v-if="(curProvider.params || []).length" class="flex flex-wrap items-center gap-3">
                   <template v-for="pd in curProvider.params" :key="pd.name">
                     <label class="text-xs text-base-content/60">{{pd.label}}</label>
                     <input class="fld min-w-48 flex-1" :type="pd.secret ? 'password' : 'text'"
@@ -1116,11 +1120,29 @@
                     <i class="ti ti-plus" :class="acctAdding ? 'animate-spin' : ''"></i>{{acctAdding ? '验证中…' : '添加并验证'}}
                   </button>
                 </div>
+                <!-- v3.68 PikPak：登录采集入口（临时 profile 一键浏览器），无手动表单 -->
+                <div v-else class="flex flex-col gap-2">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <a class="btn-primary btn-press w-fit" href="/login-collector.bat">
+                      <i class="ti ti-download"></i>下载采集器（双击运行）
+                    </a>
+                    <a class="btn-sm" href="/login-collector-setup.bat" title="运行一次后，可直接点「打开干净浏览器」">
+                      <i class="ti ti-settings"></i>一键协议安装
+                    </a>
+                    <a class="btn-sm primary" href="pkcollect:" title="需先运行过「一键协议安装」；提示没有关联应用 = 还没安装">
+                      <i class="ti ti-player-play"></i>打开干净浏览器
+                    </a>
+                    <button class="btn-sm" @click="openTokenImport()"><i class="ti ti-cloud-download"></i>导入 / 采集 Token</button>
+                  </div>
+                  <div class="text-xs leading-relaxed text-base-content/50">
+                    双击采集器会自动弹出<b>全新的浏览器窗口</b>（不读取现有浏览器数据，用完即删）并打开 PikPak 登录页；
+                    登录后凭证<b>自动回传导入</b>，无需手动填 token / 密码。
+                  </div>
+                </div>
                 <div class="text-xs leading-relaxed text-base-content/50">
                   添加后立即连接验证，失败自动回滚删除；本页永不回显 token / 密码。
                   <b>OpenList</b>：地址填 <code class="rounded bg-base-300 px-1">http://NAS_IP:5244/dav</code>
-                  （OpenList 后台默认开启 WebDAV），用户名 / 密码为 OpenList 的登录凭据，厂商留空即 other。
-                  <b>PikPak 账号请用上方「导入 / 采集 Token」采集添加</b>（支持批量与自动对号，本表单不再提供）。
+                  （后台默认开启 WebDAV），用户名 / 密码为 OpenList 的登录凭据，厂商留空即 other。
                 </div>
               </div>
 
@@ -1879,10 +1901,16 @@
               </a>
               <button class="btn-sm" @click="openPikPakLogin()"><i class="ti ti-external-link"></i>打开登录页</button>
             </div>
-            <div class="text-xs leading-relaxed text-base-content/60">
-              进阶（可选，一次）：运行 <a class="link" href="/login-collector-setup.bat">一键协议安装</a> 后，
-              点 <a class="link font-semibold" href="pkcollect:" title="需先运行过一键协议安装">打开干净浏览器</a>
-              即可直接弹出采集窗口，不用每次下载 bat。
+            <div class="rounded-xl border border-base-content/10 bg-base-content/5 px-4 py-3 text-xs leading-relaxed text-base-content/70">
+              <b>进阶（可选，只需一次）</b>：下载并运行「一键协议安装」，之后点下面的按钮就能直接弹出采集窗口，不用每次下载 bat。
+              卸载 = 删除 <code class="rounded bg-base-300 px-1">%LOCALAPPDATA%\PikPakCollector</code>
+              并运行 <code class="rounded bg-base-300 px-1">reg delete HKCU\Software\Classes\pkcollect /f</code>。
+              <div class="mt-2 flex flex-wrap items-center gap-2">
+                <a class="btn-sm" href="/login-collector-setup.bat"><i class="ti ti-settings"></i>下载一键协议安装</a>
+                <a class="btn-sm primary" href="pkcollect:" title="需先运行过「一键协议安装」；浏览器提示没有关联应用 = 还没安装">
+                  <i class="ti ti-player-play"></i>打开干净浏览器
+                </a>
+              </div>
             </div>
           </div>
 
