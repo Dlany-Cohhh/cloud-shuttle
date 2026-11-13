@@ -780,7 +780,9 @@ Vue.createApp({
     },
     dirSizeText(name) {
       const v = this.dirSizes[this.dirSizeKey(name)];
-      return typeof v === "number" ? this.fmt(v) : "--";
+      /* v3.73：占位期显示进度，别让人误以为「这个文件夹没有大小数据」 */
+      return typeof v === "number" ? this.fmt(v)
+           : v === null ? "统计中…" : "--";
     },
     statDirSizes(names, opts) {
       const o = opts || {};
@@ -798,27 +800,48 @@ Vue.createApp({
       }
       if (!todo.length) return;
       const queue = limit > 0 ? todo.slice(0, limit) : todo;
-      /* v3.63：并发 3 的任务池，统计完一个立刻显示一个；结果进 dirSizes 触发重算 */
+      /* v3.73：先置占位，页面显示「统计中…」而不是 "--" */
+      for (const { key } of queue) {
+        if (this.dirSizes[key] === undefined) this.dirSizes[key] = null;
+      }
+      const settle = (key, d) => {
+        if (d && typeof d.bytes === "number") { this.dirSizes[key] = d.bytes; return true; }
+        return false;
+      };
+      const drop = key => { if (this.dirSizes[key] === null) delete this.dirSizes[key]; };
+      /* v3.73：失败 / 超时的大目录走独立低并发通道，不占住主通道的快任务 */
+      const retry = [];
+      let ridx = 0, running = 0;
+      const pumpRetry = () => {
+        while (running < 2 && ridx < retry.length) {
+          const job = retry[ridx++];
+          running++;
+          this.api("dirsize", job.body, 90000)
+            .then(d => { if (!settle(job.key, d)) drop(job.key); })
+            .catch(() => drop(job.key))
+            .finally(() => { running--; pumpRetry(); });
+        }
+      };
+      /* v3.73：主通道并发 5，统计完一个立刻显示一个 */
       let idx = 0;
       const worker = () => {
         if (idx >= queue.length) return;
         const { name, key, id } = queue[idx++];
         /* 带文件夹 id 走 PikPak 原生 API 递归（后端 rclone size 仅兜底） */
-        this.api("dirsize", { remote: this.curRemote, id: id || undefined,
-                              path: this.curPath ? this.curPath + "/" + name : name }, 150000)
+        const body = { remote: this.curRemote, id: id || undefined,
+                       path: this.curPath ? this.curPath + "/" + name : name };
+        this.api("dirsize", body, 150000)
           .then(d => {
-            if (d && typeof d.bytes === "number") this.dirSizes[key] = d.bytes;
-            else if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 后端报错：清占位，重勾/重进目录可重试
+            if (!settle(key, d)) throw new Error((d && d.error) || "统计失败");
           })
           .catch(() => {
-            if (this.dirSizes[key] === null) delete this.dirSizes[key];  // 失败清占位
+            /* 后端算完仍会写 5 分钟缓存，稍等后自动重试一次通常秒回 */
+            retry.push({ key, body });
+            setTimeout(pumpRetry, 800);
           })
           .finally(() => worker());
       };
-      for (let i = 0; i < 3; i++) worker();
-      for (const { key } of queue) {
-        if (this.dirSizes[key] === undefined) this.dirSizes[key] = null;  // 占位：统计中
-      }
+      for (let i = 0; i < 5; i++) worker();
     },
     /* ---------- v3.64 本地文件页：文件夹磁盘占用（进入目录自动统计，60s 缓存） ---------- */
     lfSizeKey(name) {
@@ -826,7 +849,8 @@ Vue.createApp({
     },
     lfSizeText(name) {
       const v = this.lfSizes[this.lfSizeKey(name)];
-      return typeof v === "number" ? this.fmt(v) : "--";
+      return typeof v === "number" ? this.fmt(v)
+           : v === null ? "统计中…" : "--";
     },
     statLocalSizes() {
       const todo = (this.lfDirs || [])
@@ -851,10 +875,11 @@ Vue.createApp({
           })
           .finally(() => worker());
       };
-      for (let i = 0; i < 3; i++) worker();
+      /* v3.73：先置占位（显示「统计中…」），并发提到 5 */
       for (const { key } of todo) {
-        if (this.lfSizes[key] === undefined) this.lfSizes[key] = null;  // 占位：统计中
+        if (this.lfSizes[key] === undefined) this.lfSizes[key] = null;
       }
+      for (let i = 0; i < 5; i++) worker();
     },
     /* 配额数值可达 TB 级，单独用 TB 显示，避免写成 40960.00 GB */
     fmtQ(b) {

@@ -482,9 +482,9 @@
                       <i class="ti ti-folder text-base leading-none text-base-content/40 transition-transform duration-200 ease-[var(--ease-spring)] group-hover:scale-110"></i>
                       <span class="truncate text-sm" :title="hideNames ? '' : d.name">{{hideNames ? '••••••••' : d.name}}</span>
                     </button>
-                    <!-- v3.60 文件夹大小：勾选后自动递归统计（rclone size），未统计显示 -- -->
+                    <!-- v3.73 文件夹大小：进目录自动统计，占位显示「统计中…」，失败自动重试一次 -->
                     <span class="shrink-0 text-xs tabular-nums text-base-content/50"
-                          :title="dirSizes[dirSizeKey(d.name)] === null ? '大小统计中…' : '目录总大小（进入目录自动统计，5 分钟缓存）'">{{dirSizeText(d.name)}}</span>
+                          :title="dirSizes[dirSizeKey(d.name)] === null ? '大小统计中…' : (dirSizes[dirSizeKey(d.name)] === undefined ? '统计未完成，勾选该文件夹可重试' : '目录总大小（进入目录自动统计，5 分钟缓存）')">{{dirSizeText(d.name)}}</span>
                     <template v-if="!cleanupMode">
                       <button class="btn-icon danger" title="删除云端文件夹（含全部内容，不可恢复）" @click="cloudRm(d.name, false)"><i class="ti ti-trash"></i></button>
                       <button class="btn-icon" title="把这个文件夹转存到另一个账号" @click="openXfer(curPath ? curPath + '/' + d.name : d.name)"><i class="ti ti-switch-horizontal"></i></button>
@@ -888,7 +888,7 @@
                   <!-- v3.64 本地文件夹磁盘占用：进入目录自动统计（60 秒缓存），与云盘页同款体验 -->
                   <template v-else>
                     <span class="text-xs tabular-nums" :class="lfSizes[lfSizeKey(d.name)] === null ? 'text-base-content/40' : 'text-base-content/60'"
-                          :title="lfSizes[lfSizeKey(d.name)] === null ? '大小统计中…' : '文件夹占用磁盘大小（自动统计，60 秒缓存）'">{{lfSizeText(d.name)}}</span>
+                          :title="lfSizes[lfSizeKey(d.name)] === null ? '大小统计中…' : (lfSizes[lfSizeKey(d.name)] === undefined ? '统计未完成，重新进入目录可重试' : '文件夹占用磁盘大小（自动统计，60 秒缓存）')">{{lfSizeText(d.name)}}</span>
                     <span class="text-xs tabular-nums text-base-content/50">{{d.count}} 项</span>
                   </template>
                   <span class="hidden text-xs tabular-nums text-base-content/40 sm:inline">{{fmtTime(d.mtime)}}</span>
