@@ -3,6 +3,12 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.78 — 修复「代理」按钮点击无反应（2026-11-13）
+
+- **阻断性缺陷**：v3.77 把代理地址校验 `proxyAddrValid` 放在 Vue 的 `computed:` 块里，却在 `setNetMode()` / `applyProxySuggestion()`（均在 `methods:` 块）中写成 `this.proxyAddrValid()` 调用。Vue 会把 computed 自动解包为布尔值，调用时抛 `TypeError: this.proxyAddrValid is not a function`，点击「代理」后既无提示也无反应。现把该校验移入 `methods:`，模板相应改为 `proxyAddrValid()`。
+- **补充提示**：地址填 `https://` 时行内提醒「本机 / 局域网代理端口通常是明文 http://，填 https:// 会连接失败」，避免切到代理后仍连不上。
+- 新增 `test_v378.py` 离线回归（含 Vue computed 解包语义的 Node 复现）；`docs/DEV-LOG-2026-11-13.md` 补充第十五节。
+
 ## v3.77 — 全局网络模式二选一与诊断一致性修复（2026-11-13）
 
 - **撤销 v3.74 的作用域拆分**：下载任务、PikPak 原生 API、封面 CDN 不再各有代理配置，改为一个全局 `netMode` 二选一 —— **直连 / 代理**，切换即对三条路径同时生效。设置页移除两个独立开关、三路径明细卡片与三态下拉。

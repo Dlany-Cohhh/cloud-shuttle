@@ -423,10 +423,6 @@ Vue.createApp({
           ? "抽样：对前 N 个大小一致的文件，比对头 / 中 / 尾各 32 KB 字节，能发现截断、错版、串文件"
           : "快速：只比对文件名清单与大小，秒级完成，不读取文件内容";
     },
-    /* v3.77：代理地址是否为可用于代理模式的合法 URL */
-    proxyAddrValid() {
-      return /^(?:https?|socks5h?):\/\/\S+$/i.test(String(this.form.proxyUrl || "").trim());
-    },
     /* 兼容保留：老配置里的关闭词判定（v3.77 由 netMode 控制，此处仅供展示） */
     proxyAddressOff() {
       const v = String(this.form.proxyUrl || "").trim().toLowerCase();
@@ -1450,6 +1446,11 @@ Vue.createApp({
       await this.saveSettings();
       this.toast("已应用建议：全局" + (r === "direct" ? "直连" : "代理"), "ok");
       await this.testProxy();
+    },
+    /* v3.78：必须是 methods 而不是 computed —— Vue 会把 computed 解包为布尔值，
+       在 setNetMode 里把 computed 当函数调用会抛 TypeError，导致「代理」按钮点了没反应。 */
+    proxyAddrValid() {
+      return /^(?:https?|socks5h?):\/\/\S+$/i.test(String(this.form.proxyUrl || "").trim());
     },
     /* v3.77：全局模式二选一，点即保存；代理模式必须已有合法地址 */
     async setNetMode(m) {

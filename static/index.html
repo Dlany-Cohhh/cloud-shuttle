@@ -1359,8 +1359,12 @@
                     <button class="btn-sm" :disabled="saving" @click="saveSettings()"><i class="ti ti-device-floppy"></i>保存地址</button>
                   </div>
                   <div v-if="form.netMode === 'direct'" class="mt-2 text-base-content/50">当前全局直连；填好地址后点上方「代理」即可切换。留空不影响直连。</div>
-                  <div v-else-if="!proxyAddrValid" class="mt-2 text-warning">代理模式需要有效地址：须以 http://、https:// 或 socks5:// 开头；未填写时会自动回落到直连。</div>
+                  <div v-else-if="!proxyAddrValid()" class="mt-2 text-warning">代理模式需要有效地址：须以 http://、https:// 或 socks5:// 开头；未填写时会自动回落到直连。</div>
                   <div v-else class="mt-2 text-base-content/50">当前地址：<b class="font-mono">{{form.proxyUrl}}</b> · 下载、云盘数据与封面都走它。</div>
+                  <!-- v3.78：本机 7890 等代理通常是明文 HTTP，填 https:// 会连不上 -->
+                  <div v-if="String(form.proxyUrl || '').trim().toLowerCase().startsWith('https://')" class="mt-2 text-warning">
+                    注意：本机 / 局域网代理端口通常是明文 <b>http://</b>；填 https:// 会导致连接失败。若代理未启用 TLS，请改成 http://。
+                  </div>
                 </div>
                 <!-- v3.77：诊断圆点按「主路径是否失败」判定，与结论文字一致 -->
                 <div v-if="proxyCheck" class="rounded-xl border border-warning/30 bg-warning/8 px-4 py-3 text-xs">
