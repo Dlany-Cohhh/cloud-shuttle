@@ -37,6 +37,10 @@ Vue.createApp({
       jobs: [],
       settings: {},
       effectiveProxyUrl: "",
+      proxyScope: null,          // v3.74 三条路径各自生效的代理
+      proxyCheck: null,          // v3.74 只读连通性测试结果
+      proxyChecking: false,
+      folderCovers: {},          // v3.74 无封面文件夹的异步补齐结果
       /* v3.57 storages 由后端自动识别（不再写死磁盘总量），每项含 name/totalGB/freeGB/low */
       state: { diskLow: false, diskFree: null, diskTotal: null, storages: [] },
       bootVer: "",                // v3.58 页面加载时的后端版本，用于升级检测
@@ -191,7 +195,7 @@ Vue.createApp({
       /* 设置页 */
       defaultNasHomeUrl: DEFAULT_NAS_HOME,
       form: { maxConcurrent: 2, autoStart: "", autoPause: "", diskMinGB: 20, diskQuotaGB: 0,
-              nasHomeUrl: DEFAULT_NAS_HOME, proxyUrl: "",
+              nasHomeUrl: DEFAULT_NAS_HOME, proxyUrl: "", pkProxyMode: "follow",
               transfers: 6, checkers: 8, proxy: false, downloadProxy: true,
               advancedMode: false,
               multiThreadStreams: 8, multiThreadCutoffMB: 64, orderBy: "size,descending",
@@ -963,6 +967,7 @@ Vue.createApp({
         this.jobs = d.jobs || [];
         this.settings = d.settings || {};
         this.effectiveProxyUrl = d.effectiveProxyUrl || "";
+        if (d.proxyScope !== undefined) this.proxyScope = d.proxyScope;
         this.state = d.state || this.state;
         /* v3.58：后端升级检测。页面不刷新时 JS 永远是旧代码，新后端 + 旧前端
            混搭会出现"目录不存在"之类的怪状态——版本变了就提示用户刷新。 */
@@ -1343,6 +1348,7 @@ Vue.createApp({
          只放成功分支会漏掉「加载失败后 curPath 已变、勾选还在」的边缘场景。 */
       this.picked = [];
       this.cleanupPicked = [];
+      this.folderCovers = {};                          // v3.74 换目录清空异步封面
       this.dirsLoading = true;
       this.dirsError = "";
       /* 连点两下目录（或切账号后旧请求才回来）时，晚到的响应会把新目录的内容
@@ -1360,6 +1366,7 @@ Vue.createApp({
           /* v3.63：进入目录自动统计各子文件夹的总大小（并发 3 渐进填充，最多 40 个；
              超出的仍会在勾选时按需统计）。结果缓存 5 分钟，重复进入不重复请求。 */
           this.statDirSizes((this.dirs || []).filter(x => x.isdir).map(x => x.name), { limit: 40 });
+          this.fetchCovers();                              // v3.74 无封面文件夹异步补齐
         }
       } catch (e) {
         if (seq !== this._dirsSeq) return;
@@ -1367,6 +1374,35 @@ Vue.createApp({
         this.dirsError = "目录加载失败：" + (e.message || e);
       }
       this.dirsLoading = false;
+    },
+    /* v3.74：PikPak 顶层文件夹常没有 thumbnail_link，单独取内部第一张封面，
+       不阻塞 dirs；用 _dirsSeq 丢弃切目录前的过期响应。 */
+    async fetchCovers() {
+      if (this.viewMode !== "grid" || !this.curRemote) return;
+      const missing = (this.dirs || [])
+        .filter(x => x.isdir && !x.thumb && x.id && !this.folderCovers[x.name])
+        .slice(0, 12)
+        .map(x => ({ name: x.name, id: x.id }));
+      if (!missing.length) return;
+      const seq = this._dirsSeq;
+      try {
+        const d = await this.api("foldercovers", {
+          remote: this.curRemote, path: this.curPath, items: missing }, 90000);
+        if (seq !== this._dirsSeq) return;
+        if (d && d.covers && Object.keys(d.covers).length)
+          this.folderCovers = { ...this.folderCovers, ...d.covers };
+      } catch (e) { /* 封面补齐失败：回退文件类型图标，不打断浏览 */ }
+    },
+    /* v3.74：只读连通性测试，不带任何账号凭证、不写配置 */
+    async testProxy() {
+      this.proxyChecking = true;
+      this.proxyCheck = null;
+      try {
+        this.proxyCheck = await this.api("proxycheck", {}, 60000);
+      } catch (e) {
+        this.proxyCheck = { ok: false, hint: "测试失败：" + (e.message || e), items: [] };
+      }
+      this.proxyChecking = false;
     },
     setMode(m) {
       if (m === this.mode) return;
@@ -2586,6 +2622,7 @@ Vue.createApp({
         diskQuotaGB: s.diskQuotaGB ?? 0,   // v3.57 存储空间配额（0 = 跟随实际容量）
         nasHomeUrl: s.nasHomeUrl || DEFAULT_NAS_HOME,
         proxyUrl: s.proxyUrl || "",
+        pkProxyMode: s.pkProxyMode || "follow",
         transfers: s.transfers ?? 6,
         checkers: s.checkers ?? 8,
         proxy: !!s.proxy,
@@ -2612,6 +2649,7 @@ Vue.createApp({
         if (!d.ok) { this.toast("恢复失败", "error"); return; }
         this.settings = d.settings;
         this.effectiveProxyUrl = d.effectiveProxyUrl || "";
+        if (d.proxyScope !== undefined) this.proxyScope = d.proxyScope;
         this.fillForm();
         this.toast("已恢复全部默认设置", "ok");
       } catch (e) { this.toast("恢复失败：" + e.message, "error"); }
@@ -2662,6 +2700,7 @@ Vue.createApp({
           this.toast("已保存 ✓（定时状态已重新武装）" + (d.proxyNote ? " · " + d.proxyNote : ""), "ok");
           this.settings = d.settings;
           this.effectiveProxyUrl = d.effectiveProxyUrl || "";
+          if (d.proxyScope !== undefined) this.proxyScope = d.proxyScope;
         } else this.toast("保存失败", "error");
       } catch (e) { this.toast("保存失败：" + e.message, "error"); }
       this.saving = false;

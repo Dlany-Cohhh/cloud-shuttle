@@ -463,8 +463,11 @@
                   </template>
                 </div>
 
-                <!-- 加载骨架 -->
-                <div v-if="dirsLoading" class="flex flex-col gap-1">
+                <!-- v3.74 加载中：明确文字 + 当前路径，不再只有淡骨架 -->
+                <div v-if="dirsLoading" class="flex flex-col gap-2">
+                  <div class="flex items-center justify-center gap-2 py-3 text-sm text-base-content/60">
+                    <i class="ti ti-loader-2 animate-spin"></i>正在加载{{curRemote ? ' ' + curRemote + (curPath ? ' / ' + curPath : '') : ''}} …
+                  </div>
                   <div v-for="i in 5" :key="i" class="h-9 animate-pulse rounded-lg bg-base-content/5"></div>
                 </div>
 
@@ -557,7 +560,8 @@
                       <div class="relative overflow-hidden bg-base-content/5" style="aspect-ratio:4/3"
                            :class="it.isdir ? 'cursor-pointer' : ''"
                            @click="it.isdir && loadDirs(fullPath(it.name))">
-                        <img v-if="it.thumb && !thumbFailed[it.name]" :src="thumbUrl(it.thumb)" loading="lazy"
+                        <img v-if="(it.thumb || folderCovers[it.name]) && !thumbFailed[it.name]"
+                             :src="thumbUrl(it.thumb || folderCovers[it.name])" loading="lazy" referrerpolicy="no-referrer"
                              class="h-full w-full object-cover" @error="onThumbError(it.name)">
                         <div v-else class="flex h-full w-full items-center justify-center" :class="fileIconCls(it)">
                           <i class="ti text-4xl leading-none" :class="fileIcon(it)"></i>
@@ -1327,8 +1331,11 @@
 
               <!-- 代理与测速 -->
               <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:120ms">
-                <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                <div class="flex flex-wrap items-center gap-2 text-sm font-medium text-base-content/80">
                   <i class="ti ti-shield-lock text-info"></i>代理下载 · 可自定义代理地址
+                  <button class="btn-sm ml-auto" :disabled="proxyChecking" @click="testProxy()">
+                    <i class="ti" :class="proxyChecking ? 'ti-loader-2 animate-spin' : 'ti-activity'"></i>{{proxyChecking ? '测试中…' : '测试连通性'}}
+                  </button>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sDownloadProxy">下载任务走 mihomo 代理</label>
@@ -1344,13 +1351,48 @@
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxyUrl">自定义代理地址</label>
                   <input id="sProxyUrl" type="text" class="input input-sm input-bordered w-80 font-mono text-xs" v-model.trim="form.proxyUrl" placeholder="留空用部署默认值；可填 http://、socks5:// 或 off">
                   <button class="btn-sm" :disabled="saving" @click="saveSettings()"><i class="ti ti-device-floppy"></i>保存</button>
-                  <span class="text-xs text-base-content/50">当前生效：<b class="font-mono">{{effectiveProxyUrl || '读取中…'}}</b></span>
+                  <span class="text-xs text-base-content/50">off / none / direct / disabled / no 均表示强制直连</span>
                 </div>
-                <div class="text-xs leading-relaxed text-base-content/50">
-                  <strong class="text-base-content/70">下载开关按任务生效</strong>：切换后只影响之后提交的任务，已有任务保持不变；想给某一条任务换路径，点它的「详情」→ 切换路径重试（会停掉旧任务并重新下载）。代理由一个独立的 rclone 守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}）承担，按需自动拉起，<strong class="text-base-content/70">不用改 compose、不用重建容器，也不会中断直连任务</strong>；代理地址可在上方自定义，也可部署时用 <code>PROXY_URL</code> 指定（填 <code>off</code> = 不走代理，<code>socks5://</code> 仅对下载生效），具体路由规则在代理客户端里控制。<br>
-                  分享开关<strong class="text-base-content/70">只影响「分享链接」</strong>的尝试顺序，切换即自动保存。<br>
-                  「云盘预览」文件行的仪表盘图标 = 直连 / 经 mihomo 代理各下载 5 秒（共约 10 秒）对比速度，<strong class="text-base-content/70">固定两条路都跑</strong>，不受以上两个开关影响；进度与结果显示在目录浏览器顶部，结果仅供参考，且会真实下载文件、消耗云盘下游流量。
+                <!-- v3.74：把 PikPak 原生 API / 封面 CDN 从下载代理里独立出来 -->
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sPkProxyMode">PikPak 请求 / 封面</label>
+                  <select id="sPkProxyMode" class="fld w-64" v-model="form.pkProxyMode" @change="saveSettings()">
+                    <option value="follow">跟随下载代理（旧行为）</option>
+                    <option value="direct">强制直连（大小统计最快）</option>
+                    <option value="proxy">强制走代理（直连被拦时）</option>
+                  </select>
+                  <span class="text-xs text-base-content/50">与上面两个开关相互独立</span>
                 </div>
+                <div class="rounded-xl border border-base-content/10 bg-base-content/5 px-4 py-3 text-xs">
+                  <div class="mb-1.5 font-medium text-base-content/70">当前生效 · 三条独立路径</div>
+                  <div class="grid gap-1 sm:grid-cols-3">
+                    <div>下载任务：<b class="font-mono">{{(proxyScope && proxyScope.download) || effectiveProxyUrl || '读取中…'}}</b></div>
+                    <div>PikPak API：<b class="font-mono">{{(proxyScope && proxyScope.pk) || '读取中…'}}</b></div>
+                    <div>封面 CDN：<b class="font-mono">{{(proxyScope && proxyScope.thumb) || '读取中…'}}</b></div>
+                  </div>
+                  <div v-if="form.pkProxyMode === 'direct'" class="mt-2 text-warning">
+                    注意：强制直连下没有「直连失败自动回代理」兜底；若网络拦截 PikPak，大小统计与封面会失败，请先用「测试连通性」确认。
+                  </div>
+                </div>
+                <div v-if="proxyCheck" class="rounded-xl border border-base-content/10 px-4 py-3 text-xs">
+                  <div class="mb-1.5 font-medium text-base-content/70">连通性测试 <span class="font-normal text-base-content/50">{{proxyCheck.hint}}</span></div>
+                  <div v-for="r in (proxyCheck.items || [])" :key="r.name" class="flex flex-wrap items-center gap-2 py-0.5">
+                    <span :class="r.ok ? 'text-success' : 'text-error'">●</span>
+                    <span class="min-w-40">{{r.name}}</span>
+                    <span class="font-mono tabular-nums text-base-content/60">{{r.ms}} ms</span>
+                    <span class="text-base-content/50">{{r.detail}}</span>
+                  </div>
+                  <div v-if="!(proxyCheck.items || []).length" class="text-error">{{proxyCheck.hint}}</div>
+                </div>
+                <details class="text-xs leading-relaxed text-base-content/50">
+                  <summary class="cursor-pointer text-base-content/70">详细说明（影响范围 / 注意事项）</summary>
+                  <div class="mt-2 space-y-1.5">
+                    <div><b>下载开关按任务生效</b>：切换只影响之后提交的任务；代理由独立 rclone 守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}）承担，不用改 compose、不中断直连任务。</div>
+                    <div><b>分享开关只影响「分享链接」</b>的尝试顺序，切换即自动保存。</div>
+                    <div><b>PikPak 请求 / 封面</b>控制大小统计、token 换发与封面 CDN，默认「跟随下载代理」保持旧行为；选「强制直连」可绕开慢代理加速大小统计，选「强制走代理」可在直连被拦时恢复。</div>
+                    <div>「云盘预览」文件行的仪表盘图标 = 直连 / 代理各下载 5 秒对比速度，固定两条路都跑，不受以上设置影响，会真实消耗下游流量。</div>
+                  </div>
+                </details>
               </div>
               <!-- 实时限速 -->
               <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:120ms">

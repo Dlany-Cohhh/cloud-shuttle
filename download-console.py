@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.73"
+APP_VERSION = "v3.74"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -161,7 +161,10 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             "shareAutoCancel": False,       # v3.42 提取次数到上限自动取消分享（总开关）
             "nasHomeUrl": "http://127.0.0.1:8080/",  # v3.49 「返回 NAS 主页」跳转地址
             # v3.55 自定义代理地址：空 = 用部署时 PROXY_URL / 默认 mihomo；off = 不走代理
-            "proxyUrl": ""}
+            "proxyUrl": "",
+            # v3.74：PikPak 原生 API / 封面 CDN 的代理模式（与下载代理解耦）
+            # follow = 跟随 proxy_url()（旧行为）；direct = 强制直连；proxy = 强制走代理
+            "pkProxyMode": "follow"}
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
 ORDER_BY_OPTIONS = ("", "size,descending", "size,ascending", "name,ascending",
@@ -233,6 +236,86 @@ def proxy_http_url():
     """Python urllib 只认 http(s) 代理；socks5 仅用于 rclone 下载，这里退回直连。"""
     p = proxy_url()
     return p if p.lower().startswith(("http://", "https://")) else ""
+
+
+def pk_proxy_url():
+    """v3.74：PikPak 原生 API / 封面 CDN 专用代理（与下载代理解耦）。
+    follow = 跟随 proxy_url()（升级前的旧行为，保证兼容）；
+    direct = 强制直连（大小统计最快，但直连被拦时没有代理兜底）；
+    proxy  = 强制走部署代理（即使下载开关关闭、proxyUrl 填了 off）。
+    返回空串表示直连。"""
+    mode = str(load_settings().get("pkProxyMode") or "follow")
+    if mode == "direct":
+        return ""
+    if mode == "proxy":
+        raw = str(os.environ.get("PROXY_URL") or "").strip() or DEFAULT_PROXY_URL
+        if raw.lower() in PROXY_OFF_WORDS:
+            return ""
+        return raw if raw.lower().startswith(("http://", "https://")) else ""
+    return proxy_http_url()
+
+
+def _probe_url(url, proxy, timeout=8):
+    """只读连通性探测：401 / 404 也算「到达了服务器」，不带任何账号凭证。"""
+    req = urllib.request.Request(url, headers={"User-Agent": PK_UA})
+    ph = {"http": proxy, "https": proxy} if proxy else {}
+    t0 = time.time()
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler(ph)).open(req, timeout=timeout) as r:
+            r.read(64)
+            return True, int((time.time() - t0) * 1000), "HTTP %s" % r.status
+    except urllib.error.HTTPError as e:
+        return True, int((time.time() - t0) * 1000), "HTTP %s" % e.code
+    except Exception as e:
+        return False, int((time.time() - t0) * 1000), "%s: %s" % (type(e).__name__, str(e)[:70])
+
+
+def proxy_scope():
+    """设置页展示用：三条路径当前各自走什么。"""
+    d = proxy_url() or "直连"
+    p = pk_proxy_url() or "直连"
+    return {"download": d, "pk": p, "thumb": p,
+            "mode": str(load_settings().get("pkProxyMode") or "follow")}
+
+
+def api_proxy_check():
+    """v3.74 只读连通性测试：PikPak API 直连/代理、封面 CDN、代理端口。"""
+    from concurrent.futures import ThreadPoolExecutor
+    url = PK_API + "/drive/v1/files"
+    pxy, pk = proxy_url(), pk_proxy_url()
+    jobs = [("PikPak API · 直连", url, "")]
+    if pk:
+        jobs.append(("PikPak API · 代理", url, pk))
+    jobs.append(("封面 CDN · 直连", "https://sg-thumbnail-drive.mypikpak.com/", ""))
+
+    def add(label, target, proxy):
+        ok, ms, detail = _probe_url(target, proxy)
+        return {"name": label, "ok": ok, "ms": ms, "detail": detail}
+
+    def port_probe():
+        u = urllib.parse.urlparse(pxy)
+        host, port = u.hostname or "", u.port or (443 if u.scheme == "https" else 80)
+        t0 = time.time()
+        try:
+            with socket.create_connection((host, port), timeout=4):
+                return {"name": "代理端口 %s:%s" % (host, port), "ok": True,
+                        "ms": int((time.time() - t0) * 1000), "detail": "TCP 可连"}
+        except Exception as e:
+            return {"name": "代理端口 %s:%s" % (host, port), "ok": False,
+                    "ms": int((time.time() - t0) * 1000), "detail": type(e).__name__}
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [ex.submit(add, *j) for j in jobs]
+        pf = ex.submit(port_probe) if pxy else None
+        items = [f.result() for f in futs] + ([pf.result()] if pf else [])
+    direct = next((x for x in items if x["name"] == "PikPak API · 直连"), None)
+    via = next((x for x in items if x["name"] == "PikPak API · 代理"), None)
+    hint = "直连可用；大小统计与封面会按上方模式选路"
+    if direct and not direct["ok"] and via and via["ok"]:
+        hint = "直连不通、代理可用 → 建议把 PikPak 请求设为「强制走代理」"
+    elif direct and direct["ok"] and via and via["ok"] and via["ms"] > direct["ms"] * 1.5:
+        hint = "直连明显快于代理 → 可把 PikPak 请求设为「强制直连」加速大小统计"
+    return {"ok": True, "items": items, "scope": proxy_scope(), "hint": hint}
 
 
 # ── 隔离的「代理下载」守护进程 ─────────────────────────────────────
@@ -1055,6 +1138,9 @@ def _norm_settings(raw):
     d["downloadProxy"] = bool(d.get("downloadProxy", True))
     d["advancedMode"] = _truthy(d.get("advancedMode", False))
     d["shareAutoCancel"] = _truthy(d.get("shareAutoCancel", False))
+    d["pkProxyMode"] = str(d.get("pkProxyMode") or "follow")
+    if d["pkProxyMode"] not in ("follow", "direct", "proxy"):
+        d["pkProxyMode"] = "follow"
     d["bwLimitOn"] = bool(d.get("bwLimitOn"))
     d["createEmptySrcDirs"] = bool(d.get("createEmptySrcDirs", True))
     d["autoStart"] = str(d.get("autoStart") or "")[:5]
@@ -1390,7 +1476,7 @@ def _pk_http(url, body=None, headers=None, method="GET", timeout=45, proxy=True)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     handlers = []
-    p = proxy_http_url() if proxy else ""
+    p = pk_proxy_url() if proxy else ""
     if p:
         handlers.append(urllib.request.ProxyHandler({"http": p, "https": p}))
     else:
@@ -1484,12 +1570,12 @@ def _pk_session(name, action):
     return ent
 
 
-def pk_api(name, method, path, body=None, _retry=True):
+def pk_api(name, method, path, body=None, _retry=True, _timeout=45):
     action = "%s:%s" % (method, path.split("?")[0])
     s = _pk_session(name, action)
     h = {"Content-Type": "application/json", "Authorization": "Bearer " + s["at"],
          "x-device-id": s["dev"], "x-captcha-token": s["cap"], "User-Agent": PK_UA}
-    code, raw = _pk_http(PK_API + path, body, h, method)
+    code, raw = _pk_http(PK_API + path, body, h, method, timeout=_timeout)
     try:
         d = json.loads(raw)
     except Exception:
@@ -1626,7 +1712,7 @@ def _thumb_fetch(url):
         "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"})
     for use_proxy in (True, False):
         try:
-            p = proxy_http_url() if use_proxy else ""
+            p = pk_proxy_url() if use_proxy else ""
             ph = {"http": p, "https": p} if p else {}
             with urllib.request.build_opener(urllib.request.ProxyHandler(ph)).open(req, timeout=15) as r:
                 ct = str(r.headers.get("Content-Type") or "image/jpeg")
@@ -4719,6 +4805,43 @@ def api(action, body):
                            capture_output=True, text=True, timeout=60)
         return {"remotes": [x.strip().rstrip(":") for x in p.stdout.splitlines() if x.strip()]}
 
+    if action == "proxycheck":
+        return api_proxy_check()
+
+    if action == "foldercovers":
+        # v3.74：PikPak 顶层文件夹常没有 thumbnail_link，异步取内部第一张封面补齐。
+        # 单独接口、不阻塞 dirs；前端在缩略图视图加载完后请求并渐进填充。
+        name = str(body.get("remote") or "").strip()
+        raw = body.get("items") if isinstance(body.get("items"), list) else []
+        todo = [(str(x.get("name") or ""), str(x.get("id") or ""))
+                for x in raw[:12] if isinstance(x, dict) and x.get("name") and x.get("id")]
+        covers = {}
+        if name and todo:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def one(pair):
+                nm, fid = pair
+                try:
+                    q = ("/drive/v1/files?parent_id=%s&limit=30&phase=PHASE_TYPE_COMPLETE"
+                         "&thumbnail_size=SIZE_SMALL" % urllib.parse.quote(fid))
+                    code, d = pk_api(name, "GET", q, _timeout=6)
+                    if code >= 400:
+                        return nm, ""
+                    for f in (d.get("files") or []):
+                        u = str(f.get("thumbnail_link") or "")
+                        host = urllib.parse.urlparse(u).netloc.lower() if u.startswith("https://") else ""
+                        if host == "mypikpak.com" or host.endswith(".mypikpak.com"):
+                            return nm, u
+                except Exception:
+                    pass
+                return nm, ""
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                for nm, u in ex.map(one, todo):
+                    if u:
+                        covers[nm] = u
+        return {"covers": covers}
+
     if action == "dirs":
         name = body["remote"]
         sub = body.get("path", "").strip("/")
@@ -5113,7 +5236,8 @@ def api(action, body):
                 "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
                         "diskTotal": STATE.get("diskTotal"), "storages": storages(),
                         "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
-                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
+                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
+                "proxyScope": proxy_scope()}
 
     if action == "savesettings":
         with LOCK:
@@ -5123,7 +5247,7 @@ def api(action, body):
                       "multiThreadStreams", "multiThreadCutoffMB", "retries",
                       "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
                       "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
-                      "transfersClearedAt", "nasHomeUrl", "proxyUrl"):
+                      "transfersClearedAt", "nasHomeUrl", "proxyUrl", "pkProxyMode"):
                 if k in body:
                     s[k] = body[k]
             s["proxy"] = bool(body.get("proxy", s["proxy"]))
@@ -5138,7 +5262,8 @@ def api(action, body):
         # 只在地址真的变了时重启 5573，且避开正在传输的任务
         _, proxy_note = refresh_proxy_rc() if changed else (True, "")
         return {"ok": True, "settings": s,
-                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）", "proxyNote": proxy_note}
+                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
+                "proxyScope": proxy_scope(), "proxyNote": proxy_note}
 
     if action == "resetsettings":
         with LOCK:
