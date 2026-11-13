@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.75"
+APP_VERSION = "v3.76"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -287,8 +287,10 @@ def _friendly_net_err(e):
 
 
 def _probe_connect(proxy, host="api-drive.mypikpak.com", port=443, timeout=6):
-    """v3.75：HTTP CONNECT 探测代理是否真能转发 HTTPS。
-    TCP 端口通 ≠ 代理可用；socks5 / https 代理不支持此探测，返回 None 跳过。"""
+    """v3.76：CONNECT + TLS 握手 + 一个 HEAD，验证代理真能转发 HTTPS。
+    只到「CONNECT 200」不够：代理可以回 200 后立刻断开隧道，此时 API 请求仍会
+    卡在 TLS 握手（真机实测 1 ms CONNECT 成功、5.1 s TLS 中断）。
+    socks5 / https 代理不支持此探测，返回 None 跳过。"""
     u = urllib.parse.urlparse(proxy)
     if u.scheme not in ("http", ""):
         return None
@@ -306,9 +308,20 @@ def _probe_connect(proxy, host="api-drive.mypikpak.com", port=443, timeout=6):
                     break
                 buf += chunk
             status = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
-            ok = " 200 " in (" " + status + " ")
-            return {"ok": ok, "ms": int((time.time() - t0) * 1000),
-                    "detail": ("CONNECT 已建立" if ok else status[:60] or "代理无响应")}
+            if " 200 " not in (" " + status + " "):
+                return {"ok": False, "ms": int((time.time() - t0) * 1000),
+                        "detail": "代理拒绝隧道：" + (status[:50] or "无响应")}
+            try:
+                with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
+                    tls.settimeout(timeout)
+                    tls.sendall(("HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+                                 % host).encode())
+                    tls.recv(256)
+                return {"ok": True, "ms": int((time.time() - t0) * 1000),
+                        "detail": "CONNECT + TLS 通过"}
+            except Exception as e:
+                return {"ok": False, "ms": int((time.time() - t0) * 1000),
+                        "detail": "隧道已建立，但 TLS 握手失败：" + _friendly_net_err(e)}
     except Exception as e:
         return {"ok": False, "ms": int((time.time() - t0) * 1000),
                 "detail": _friendly_net_err(e)}
@@ -365,7 +378,7 @@ def api_proxy_check():
 
     def connect_probe():
         r = _probe_connect(pk or pxy) if (pk or pxy) else None
-        return ({"name": "代理 CONNECT 隧道", "ok": r["ok"], "ms": r["ms"],
+        return ({"name": "代理 CONNECT + TLS", "ok": r["ok"], "ms": r["ms"],
                  "detail": r["detail"]} if r else None)
 
     with ThreadPoolExecutor(max_workers=5) as ex:
@@ -380,7 +393,7 @@ def api_proxy_check():
 
     direct = next((x for x in items if x["name"] == "PikPak API · 直连"), None)
     via = next((x for x in items if x["name"] == "PikPak API · 代理"), None)
-    conn = next((x for x in items if x["name"] == "代理 CONNECT 隧道"), None)
+    conn = next((x for x in items if x["name"] == "代理 CONNECT + TLS"), None)
     direct_ok = bool(direct and direct["ok"])
     via_ok = bool(via and via["ok"])
     conn_ok = bool(conn and conn["ok"]) if conn else via_ok

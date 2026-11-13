@@ -422,6 +422,11 @@ Vue.createApp({
           ? "抽样：对前 N 个大小一致的文件，比对头 / 中 / 尾各 32 KB 字节，能发现截断、错版、串文件"
           : "快速：只比对文件名清单与大小，秒级完成，不读取文件内容";
     },
+    /* v3.76：代理地址填了 off / none 等关闭词时，两个开关实际不生效 */
+    proxyAddressOff() {
+      const v = String(this.form.proxyUrl || "").trim().toLowerCase();
+      return ["off", "none", "direct", "disabled", "no"].includes(v);
+    },
     /* v3.75：设置页状态行——一句话结论，替代原来三行重复状态 */
     proxyStateText() {
       const s = this.proxyScope;

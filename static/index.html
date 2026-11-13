@@ -1350,17 +1350,19 @@
                     <div>封面 CDN：<b class="font-mono">{{(proxyScope && proxyScope.thumb) || '读取中…'}}</b></div>
                   </div>
                   <div v-if="proxyScope && proxyScope.hint" class="mt-2 text-base-content/50">{{proxyScope.hint}}</div>
+                  <div class="mt-1 text-base-content/40">云盘数据使用独立模式，不受上方代理地址影响（当前：{{proxyScope && proxyScope.mode === 'proxy' ? '强制走代理' : (proxyScope && proxyScope.mode === 'direct' ? '强制直连' : '跟随下载代理')}}）。</div>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sDownloadProxy">下载任务走代理</label>
-                  <input id="sDownloadProxy" type="checkbox" class="toggle toggle-primary" :checked="form.downloadProxy" @change="toggleDownloadProxy($event.target.checked)">
+                  <input id="sDownloadProxy" type="checkbox" class="toggle toggle-primary" :disabled="proxyAddressOff" :checked="form.downloadProxy" @change="toggleDownloadProxy($event.target.checked)">
+                  <span v-if="proxyAddressOff" class="text-xs text-warning">代理地址已关闭，开关暂不生效</span>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sPkProxyMode">云盘数据与封面</label>
                   <select id="sPkProxyMode" class="fld w-64" v-model="form.pkProxyMode" @change="saveSettings()">
                     <option value="follow">跟随下载代理（旧行为）</option>
                     <option value="direct">直连（推荐，更快）</option>
-                    <option value="proxy">走代理（直连不通时）</option>
+                    <option value="proxy">强制走代理（仅直连被拦时用）</option>
                   </select>
                 </div>
                 <!-- v3.75：诊断改为一行结论，明细折叠、可关闭、可一键应用 -->
@@ -1393,8 +1395,9 @@
                     </div>
                     <div class="flex flex-wrap items-center gap-3">
                       <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxy">分享链接优先走代理</label>
-                      <input id="sProxy" type="checkbox" class="toggle toggle-primary" :checked="form.proxy" @change="toggleProxy($event.target.checked)">
-                      <span class="text-xs text-base-content/50">只影响分享链接的尝试顺序，切换即自动保存</span>
+                      <input id="sProxy" type="checkbox" class="toggle toggle-primary" :disabled="proxyAddressOff" :checked="form.proxy" @change="toggleProxy($event.target.checked)">
+                      <span v-if="proxyAddressOff" class="text-xs text-warning">代理地址已关闭，开关暂不生效</span>
+                      <span v-else class="text-xs text-base-content/50">只影响分享链接的尝试顺序，切换即自动保存</span>
                     </div>
                     <div class="space-y-1.5">
                       <div><b>下载开关按任务生效</b>：切换只影响之后提交的任务；代理由独立守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}）承担，失败自动改走另一条，不用改 compose、不中断直连任务。</div>
