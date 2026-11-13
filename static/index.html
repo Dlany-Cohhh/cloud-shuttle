@@ -1866,18 +1866,15 @@
               <button v-if="relinkTarget.email" class="btn-sm" @click="copyRelinkEmail"><i class="ti ti-copy"></i>复制邮箱</button>
               <button class="btn-sm ml-auto" @click="relinkTarget=null">取消定向</button>
             </div>
-            <div class="mt-2">
-              这个 refresh_token 已被别处刷新或已失效，<b>服务端重试救不回来</b>，必须在浏览器里重新登录拿一份新的。
-              已为你打开 PikPak 登录页（没弹出就点上方的「打开登录页」），请登录<b>同一个账号</b>，再用书签 / 采集器 / 粘贴新 token 任一种方式采集；
-              控制台会按 PikPak 身份<b>自动覆盖这个账号</b>，不用删除重建，也不会动其它账号；若登录成了别的账号，后端会拒绝写入。
+            <div class="mt-1">
+              请登录<b>同一个账号</b>（按邮箱核对），采集成功后自动覆盖该账号，不用删除重建；登录成别的账号会被拒绝写入。
             </div>
           </div>
           <!-- ① 一键干净浏览器（v3.65 推荐）：临时 profile + 内置 CDP 采集，登录后自动回传 -->
           <div v-if="importTab==='oneclick'" class="flex flex-col gap-3">
             <div class="rounded-xl border border-success/25 bg-success/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
-              <b>全自动流程</b>：点「下载采集器」→ 双击运行 → 自动弹出一个<b>全新的浏览器窗口</b>
-              （独立临时配置，<b>不读取你现有浏览器的任何数据</b>，用完即删），已自动打开 PikPak 登录页。
-              登录完成后凭证<b>自动回传控制台并导入</b>，浏览器自动关闭——不用拖书签、不用复制粘贴。
+              双击「采集器」→ 自动弹出<b>全新浏览器窗口</b>（不读取现有浏览器数据，用完即删）→
+              登录后凭证<b>自动回传导入</b>，浏览器自动关闭。
             </div>
             <div class="flex flex-wrap items-center gap-2">
               <a class="btn-primary btn-press w-fit" href="/login-collector.bat">
@@ -1885,29 +1882,17 @@
               </a>
               <button class="btn-sm" @click="openPikPakLogin()"><i class="ti ti-external-link"></i>打开登录页</button>
             </div>
-            <div class="rounded-xl border border-base-content/10 bg-base-content/5 px-4 py-3 text-xs leading-relaxed text-base-content/70">
-              <b>进阶（可选，只需一次）</b>：下载并运行「一键协议安装」，之后点下面的按钮就能<b>直接弹出采集窗口</b>，不用每次下载 bat。
-              安装只写当前用户的注册表键，卸载 = 删除 <code class="rounded bg-base-300 px-1">%LOCALAPPDATA%\PikPakCollector</code>
-              并运行 <code class="rounded bg-base-300 px-1">reg delete HKCU\Software\Classes\pkcollect /f</code>。
-              <div class="mt-2 flex flex-wrap items-center gap-2">
-                <a class="btn-sm" href="/login-collector-setup.bat"><i class="ti ti-settings"></i>下载一键协议安装</a>
-                <a class="btn-sm primary" href="pkcollect:" title="需先运行过「一键协议安装」；浏览器提示没有关联应用 = 还没安装">
-                  <i class="ti ti-player-play"></i>打开干净浏览器
-                </a>
-              </div>
-            </div>
-            <div class="text-xs leading-relaxed text-base-content/50">
-              登录的账号必须与要修复的账号一致（按邮箱核对）；采集成功后账号列表会自动刷新，重新登录采集一次即可恢复，账号名与云端文件都不变。
+            <div class="text-xs leading-relaxed text-base-content/60">
+              进阶（可选，一次）：运行 <a class="link" href="/login-collector-setup.bat">一键协议安装</a> 后，
+              点 <a class="link font-semibold" href="pkcollect:" title="需先运行过一键协议安装">打开干净浏览器</a>
+              即可直接弹出采集窗口，不用每次下载 bat。
             </div>
           </div>
 
           <!-- ② 书签一键导入 -->
           <div v-if="importTab==='login'" class="flex flex-col gap-3">
             <div class="rounded-xl border border-info/25 bg-info/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
-              <b>零脚本、零浏览器控制</b>：把下面这个按钮<b>拖到书签栏</b>（只做一次）。以后在
-              <code class="rounded bg-base-300 px-1">https://mypikpak.com/drive/login</code> 登录完点一下书签，
-              它读取<b>当前 PikPak 页面</b>的登录态，打开一个小窗口把凭证送回控制台自动导入。
-              <b>不扫描你其他浏览器的数据</b>，也不用下载或运行任何 .bat。
+              把下面的按钮<b>拖到书签栏</b>（Ctrl+Shift+B 显示，只做一次）。登录 PikPak 后点书签，凭证自动送回控制台导入；不读取你其他浏览器的数据。
             </div>
             <div class="flex flex-wrap items-center gap-2">
               <a class="btn-primary btn-press w-fit select-none" :href="bmHref()"
@@ -1923,52 +1908,17 @@
               <li>显示书签栏（<b>Ctrl + Shift + B</b>），把上面这个按钮<b>拖进去</b>，名字随意；</li>
               <li>点「打开登录页」，在新的标签页里手动登录 PikPak（验证码 / 二次验证都能正常过）；</li>
               <li>登录完成、看到网盘内容后，在<b>同一个标签页</b>点刚拖进去的书签；</li>
-              <li>弹出的小窗口显示「✓ 成功写入 N 个账号」后会自动关闭，控制台账号列表同步自动刷新。</li>
+              <li>弹出「✓ 成功写入 N 个账号」后自动关闭，账号列表自动刷新。</li>
             </ol>
-            <div class="rounded-xl border border-base-content/10 bg-base-200/60 px-4 py-3 text-xs leading-relaxed text-base-content/60">
-              <b>为什么这样可以</b>：浏览器同源策略禁止控制台读取 PikPak 页面，但书签脚本是
-              <b>在 PikPak 页面里</b>运行的，能读该站点的 localStorage / sessionStorage / cookie / IndexedDB；
-              它把凭证放进新窗口 URL 的 <code class="rounded bg-base-300 px-1">#fragment</code>
-              （fragment 不会发送到任何服务器，打开后立刻抹掉），再由控制台同源的小窗口调
-              <code class="rounded bg-base-300 px-1">acctimport</code> 完成换发、实测、按
-              <code class="rounded bg-base-300 px-1">sub</code> 对号。已存在的账号更新，新账号自动新建。
-              <br>没抓到凭证时，PikPak 页面右上角会给出诊断与可见的存储键名；也可改用「粘贴导入」或「② 采集器」。
-              <br><b>换 NAS 地址 / 端口后需重新拖一次书签</b>（书签里固化了当前控制台地址）。
-            </div>
-          </div>
-
-          <!-- ② 采集器：干净浏览器登录脚本（打开全新浏览器、实时读取 token） -->
-          <div v-else-if="importTab==='kit'" class="flex flex-col gap-3">
-            <div class="rounded-xl border border-info/25 bg-info/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
-              下载一次性助手，它会<b>打开一个全新的独立浏览器窗口</b>，让你手动登录 PikPak；
-              登录成功后<b>实时读取该窗口的登录态</b>、采集 refresh_token 并直接推给 NAS，
-              <b>不读取你现有浏览器的任何数据</b>；结束时自动关闭浏览器并删除临时目录。
-              登录页固定为 <code class="rounded bg-base-300 px-1">https://mypikpak.com/drive/login</code>，
-              <b>不是</b>根路径的介绍页（介绍页不会写入登录态）。
-            </div>
-            <a class="btn-primary btn-press w-fit" href="/login-collector.bat" download>
-              <i class="ti ti-download"></i>下载登录采集器（PikPak-Clean-Login.bat）
-            </a>
-            <ol class="ml-1 list-decimal space-y-1.5 pl-4 text-xs leading-relaxed text-base-content/70">
-              <li>在任意一台 Windows 电脑上下载并双击运行（若弹「已保护你的电脑」→ 更多信息 → 仍要运行）；</li>
-              <li>会自动打开一个干净的浏览器窗口，在里面手动登录 PikPak，验证码 / 二次验证都能正常过；</li>
-              <li>看到「✓ 已采集并写入」即成功；要加下一个账号，就在该窗口退出后重新登录；</li>
-              <li>按 <b>Q</b> 结束后，助手会<b>先关闭浏览器再补扫一次</b>，请勿直接关掉黑色窗口；完成后回来点「刷新」。</li>
-              <li>若显示「0 写入」，临时目录与 <code class="rounded bg-base-300 px-1">%TEMP%\pikpak-collect-log.txt</code> 会保留用于排查。</li>
-            </ol>
-            <div class="rounded-xl border border-base-content/10 bg-base-200/60 px-4 py-3 text-xs leading-relaxed text-base-content/60">
-              服务端沿用现有 <code class="rounded bg-base-300 px-1">acctimport</code>：自动换发 token、实测连接，
-              并按 PikPak 的 <code class="rounded bg-base-300 px-1">sub</code> 对号。
-              已存在的账号会被更新，新账号自动新建；一次可连续登录多个账号。
+            <div class="text-xs leading-relaxed text-base-content/50">
+              <b>换 NAS 地址 / 端口后需重新拖一次书签</b>（书签里固化了当前控制台地址）。
             </div>
           </div>
 
           <!-- ③ 粘贴导入 -->
           <div v-else class="flex flex-col gap-3">
             <div class="text-xs leading-relaxed text-base-content/60">
-              每行一条，格式：<code class="rounded bg-base-300 px-1">账号名 + 空格 + refresh_token</code>
-              （也可以只贴 token，靠身份自动对号）。支持直接粘贴导出的 JSON。
-              <b>下面的账号名与 token 均为示例，请替换成你自己的。</b>
+              每行一条：<code class="rounded bg-base-300 px-1">账号名 + 空格 + refresh_token</code>（只贴 token 也行，按身份自动对号）；支持导出的 JSON。
             </div>
             <textarea class="textarea textarea-bordered h-48 w-full font-mono text-xs" spellcheck="false"
                       v-model="importText" placeholder="my-pikpak-1   os.EXAMPLE_TOKEN_A_REPLACE_ME

@@ -178,8 +178,7 @@ Vue.createApp({
       importTabs: [
         { id: "oneclick", label: "① 一键干净浏览器（推荐）" },
         { id: "login", label: "② 书签一键导入" },
-        { id: "kit", label: "③ 采集器" },
-        { id: "paste", label: "④ 粘贴导入" },
+        { id: "paste", label: "③ 粘贴导入" },
       ],
       importText: "",
       importCreate: true,
@@ -2191,8 +2190,8 @@ Vue.createApp({
       this.importResult = null;
       this.importText = "";
       this.importTab = "oneclick";   /* v3.65：重登默认走一键干净浏览器 */
-      this.importOpen = true;
-      this.openPikPakLogin(true);
+      this.importOpen = true;        /* v3.66：先看弹窗选项，登录页由弹窗内按钮打开 */
+      return
     },
     async copyRelinkEmail() {
       const e = this.relinkTarget && this.relinkTarget.email;
