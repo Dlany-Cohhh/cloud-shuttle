@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.78"
+APP_VERSION = "v3.79"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -3733,6 +3733,27 @@ def safe_local_path(rel):
     return full
 
 
+def media_local_path(rel):
+    """`/media/<rel>` 里的 <rel> → 绝对路径（v3.79）。
+
+    v3.57 起本地文件页按「控制台绝对路径」导航（/vol2/download/kz），前端据此
+    拼出的播放地址是 `/media/vol2/download/kz/x.mp4`。而 /media/ 之后的部分天然
+    没有前导斜杠，safe_local_path 会把它当「相对主卷」，去找
+    `/vol2/download/vol2/download/kz/x.mp4` —— 必然 404。
+    后果：所有本地视频都是黑屏卡在 0:00（video 收 404 直接 error），下载到本机
+    与 M3U 导出拿到的是同一批坏链接。
+    这里先把 <rel> 按卷根补回前导斜杠，再交给 safe_local_path 做越界校验。
+    """
+    r = str(rel or "").lstrip("/")
+    if r:
+        for root in local_roots():
+            root = str(root or "").rstrip("/")
+            bare = root.lstrip("/")
+            if bare and (r == bare or r.startswith(bare + "/")):
+                return safe_local_path("/" + r)
+    return safe_local_path(rel)
+
+
 # ---------------------------------------------------------------------------
 # v3.44 本地（NAS 侧）解压：PikPak 云端解压要会员，这条路径不需要任何会员，
 #   直接对 /vol2/download 里已下载的压缩包动手。
@@ -6636,7 +6657,7 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import unquote, quote
         head_only = self.command == "HEAD"
         try:
-            full = safe_local_path(unquote(rel or ""))
+            full = media_local_path(unquote(rel or ""))
         except ValueError as e:
             self._send(403, "text/plain; charset=utf-8", str(e).encode("utf-8"))
             return

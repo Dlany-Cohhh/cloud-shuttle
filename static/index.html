@@ -1355,7 +1355,7 @@
                 <div class="rounded-xl border border-base-content/10 px-4 py-3 text-xs">
                   <div class="flex flex-wrap items-center gap-3">
                     <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxyUrl">代理地址<span class="text-warning">*</span></label>
-                    <input id="sProxyUrl" type="text" class="input input-sm input-bordered w-80 font-mono text-xs" v-model.trim="form.proxyUrl" placeholder="http://127.0.0.1:7890 或 socks5://…">
+                    <input id="sProxyUrl" ref="proxyUrlInput" type="text" class="input input-sm input-bordered w-80 font-mono text-xs" v-model.trim="form.proxyUrl" placeholder="http://127.0.0.1:7890 或 socks5://…">
                     <button class="btn-sm" :disabled="saving" @click="saveSettings()"><i class="ti ti-device-floppy"></i>保存地址</button>
                   </div>
                   <div v-if="form.netMode === 'direct'" class="mt-2 text-base-content/50">当前全局直连；填好地址后点上方「代理」即可切换。留空不影响直连。</div>
@@ -1364,6 +1364,10 @@
                   <!-- v3.78：本机 7890 等代理通常是明文 HTTP，填 https:// 会连不上 -->
                   <div v-if="String(form.proxyUrl || '').trim().toLowerCase().startsWith('https://')" class="mt-2 text-warning">
                     注意：本机 / 局域网代理端口通常是明文 <b>http://</b>；填 https:// 会导致连接失败。若代理未启用 TLS，请改成 http://。
+                  </div>
+                  <!-- v3.79：socks5 的生效范围只在填了 socks5 时才说，避免常驻噪音 -->
+                  <div v-if="String(form.proxyUrl || '').trim().toLowerCase().startsWith('socks5')" class="mt-2 text-base-content/50">
+                    socks5 只对 rclone 下载生效；云盘数据与封面（Python 侧）仍走直连。
                   </div>
                 </div>
                 <!-- v3.77：诊断圆点按「主路径是否失败」判定，与结论文字一致 -->
@@ -1385,16 +1389,11 @@
                     </div>
                   </div>
                 </div>
-                <details class="text-xs leading-relaxed text-base-content/50" :open="netModeAdvancedOpen">
-                  <summary class="cursor-pointer text-base-content/70" @click.prevent="netModeAdvancedOpen = !netModeAdvancedOpen">› 进阶设置（地址格式 / 说明）</summary>
-                  <div class="mt-3 space-y-1.5">
-                    <div><b>全局生效</b>：v3.77 起不再拆分下载与封面，也不再有两个独立开关。选「直连」= 所有请求直连；选「代理」= 下载、PikPak API、封面 CDN 统一走同一个地址。</div>
-                    <div><b>代理地址必填</b>：支持 <code class="rounded bg-base-300 px-1">http://</code>、<code class="rounded bg-base-300 px-1">https://</code>、<code class="rounded bg-base-300 px-1">socks5://</code>。留空或非法时无法启用代理模式，会自动回落到直连；<code class="rounded bg-base-300 px-1">socks5://</code> 只对 rclone 下载生效，Python 侧仍直连。</div>
-                    <div><b>代理守护进程</b>：代理模式按需拉起独立守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}），不用改 compose；切回直连会自动停止。</div>
-                    <div>文件行的仪表盘图标会固定跑直连与代理各 5 秒对比速度，不受以上设置影响，会真实消耗下游流量。</div>
-                    <div>在他人的 NAS 上部署：见仓库内 <code class="rounded bg-base-300 px-1">docs/FOR-OTHERS.md</code>。</div>
-                  </div>
-                </details>
+                <!-- v3.79：进阶说明只保留「地址格式」这一句，其余（守护进程 / 仪表盘测速 /
+                     他人部署）属于实现细节，页面上不再铺开 -->
+                <div class="text-xs leading-relaxed text-base-content/45">
+                  <b>代理地址</b>：支持 <code class="rounded bg-base-300 px-1">http://</code>、<code class="rounded bg-base-300 px-1">https://</code>、<code class="rounded bg-base-300 px-1">socks5://</code>；留空或非法时无法切到代理模式，会自动回落到直连。
+                </div>
               </div>
               <!-- 实时限速 -->
               <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:120ms">

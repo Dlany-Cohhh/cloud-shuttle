@@ -41,7 +41,6 @@ Vue.createApp({
       proxyCheck: null,          // v3.74 只读连通性测试结果
       proxyChecking: false,
       proxyDetailsOpen: false,    // 兼容保留：v3.77 已不拆分路径
-      netModeAdvancedOpen: false,   // v3.77 代理地址编辑区
       proxyCheckDetails: false,   // v3.75 诊断明细折叠
       folderCovers: {},          // v3.74 无封面文件夹的异步补齐结果
       /* v3.57 storages 由后端自动识别（不再写死磁盘总量），每项含 name/totalGB/freeGB/low */
@@ -1438,7 +1437,7 @@ Vue.createApp({
       const r = this.proxyCheck && this.proxyCheck.recommend;
       if (!r) return;
       if (r === "proxy" && !this.proxyAddrValid()) {
-        this.netModeAdvancedOpen = true;
+        this.focusProxyUrl();
         this.toast("请先填写有效代理地址，再切换到代理模式", "error");
         return;
       }
@@ -1452,10 +1451,19 @@ Vue.createApp({
     proxyAddrValid() {
       return /^(?:https?|socks5h?):\/\/\S+$/i.test(String(this.form.proxyUrl || "").trim());
     },
+    /* v3.79：地址框常驻可见，缺地址时直接把光标放进输入框，比"自动展开说明"更直接 */
+    focusProxyUrl() {
+      const el = this.$refs && this.$refs.proxyUrlInput;
+      if (!el) return;
+      try {
+        el.focus();
+        if (el.scrollIntoView) el.scrollIntoView({ block: "center", behavior: "smooth" });
+      } catch (e) { /* 元素刚渲染/已卸载时忽略 */ }
+    },
     /* v3.77：全局模式二选一，点即保存；代理模式必须已有合法地址 */
     async setNetMode(m) {
       if (m === "proxy" && !this.proxyAddrValid()) {
-        this.netModeAdvancedOpen = true;
+        this.focusProxyUrl();
         this.toast("请先填写代理地址（http:// 或 socks5://）再选择代理模式", "error");
         return;
       }
@@ -3394,7 +3402,20 @@ Vue.createApp({
     async onPlayerError() {
       const p = this.player;
       const el = this.$refs.playerVideo || this.$refs.playerAudio;
-      if (!p || !p.cloud) return;
+      if (!p) return;
+      /* v3.79：本地文件（/media）走这里时旧版直接 return，用户只看到黑屏停在
+         0:00，既没提示也不知道为什么。先按 MediaError.code 说清原因。 */
+      if (!p.cloud) {
+        const code = el && el.error ? el.error.code : 0;
+        const why = {
+          1: "加载被中断（可能是链接失效）",
+          2: "读取中断（NAS 未响应或文件被移动）",
+          3: "解码失败（文件可能损坏）",
+          4: "格式或编码不受支持",
+        }[code] || "未知错误";
+        this.toast("这个文件播不了：" + why + "。可点「下载到本机」用本地播放器打开", "error");
+        return;
+      }
       /* 直链 24 小时过期：重新签发一次续播。只重试一次，避免坏文件死循环 */
       if (this._playRetried) {
         this.toast("播放失败：编码不受支持或链接失效，请下载后播放", "error");
