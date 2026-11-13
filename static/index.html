@@ -1132,7 +1132,6 @@
                     <a class="btn-sm primary" href="pkcollect:" title="需先运行过「一键协议安装」；提示没有关联应用 = 还没安装">
                       <i class="ti ti-player-play"></i>打开干净浏览器
                     </a>
-                    <button class="btn-sm" @click="openTokenImport()"><i class="ti ti-cloud-download"></i>导入 / 采集 Token</button>
                   </div>
                   <div class="text-xs leading-relaxed text-base-content/50">
                     双击采集器会自动弹出<b>全新的浏览器窗口</b>（不读取现有浏览器数据，用完即删）并打开 PikPak 登录页；
@@ -1915,7 +1914,7 @@
           </div>
 
           <!-- ② 书签一键导入 -->
-          <div v-if="importTab==='login'" class="flex flex-col gap-3">
+          <div v-else-if="importTab==='login'" class="flex flex-col gap-3">
             <div class="rounded-xl border border-info/25 bg-info/8 px-4 py-3 text-xs leading-relaxed text-base-content/70">
               把下面的按钮<b>拖到书签栏</b>（Ctrl+Shift+B 显示，只做一次）。登录 PikPak 后点书签，凭证自动送回控制台导入；不读取你其他浏览器的数据。
             </div>
