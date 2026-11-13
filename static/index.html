@@ -1108,7 +1108,7 @@
                   <select class="fld w-56" v-model="acctForm.type" @change="acctForm.params={}">
                     <option v-for="p in providers" :key="p.type" :value="p.type">{{p.label}}</option>
                   </select>
-                  <input class="fld w-44" v-model.trim="acctForm.name" placeholder="账号名（自定义）">
+                  <input class="fld w-44" v-model.trim="acctForm.name" placeholder="账号名（留空自动生成）">
                 </div>
                 <div v-if="(curProvider.params || []).length" class="flex flex-wrap items-center gap-3">
                   <template v-for="pd in curProvider.params" :key="pd.name">

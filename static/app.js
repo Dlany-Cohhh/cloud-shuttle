@@ -2154,7 +2154,22 @@ Vue.createApp({
     },
     async acctAdd() {
       const f = this.acctForm;
-      if (!f.name || this.acctAdding) return;
+      if (this.acctAdding) return;
+      /* v3.70：账号名留空不再静默失败（旧版直接 return，看起来像"点了没反应"）。
+         WebDAV 可根据地址自动生成名字（rclone 账号名不允许点号，替换为连字符）。 */
+      if (!f.name) {
+        let auto = "";
+        if (f.params && f.params.url) {
+          try {
+            const u = new URL(f.params.url);
+            auto = "webdav-" + u.hostname.replace(/\./g, "-") +
+                   (u.port && u.port !== "80" ? "-" + u.port : "");
+          } catch (e) { /* url 非法时走下面的必填提示 */ }
+        }
+        if (!auto) { this.toast("请先填写账号名（或先填好 WebDAV 地址，可自动命名）", "error"); return; }
+        f.name = auto;
+        this.toast("账号名已自动生成为 " + auto + "，可在添加后用「编辑」改名", "ok");
+      }
       const missing = (this.curProvider.params || []).filter(p => p.required && !f.params[p.name]);
       if (missing.length) { this.toast("请填写：" + missing.map(p => p.label).join("、"), "error"); return; }
       this.acctAdding = true;
