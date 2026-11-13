@@ -918,16 +918,19 @@
                          :value="f.name" v-model="lfPicked"
                          :title="(f.archive ? '勾选以便批量解压 / 改名：' : '勾选以便批量改名：') + f.name">
                   <i class="ti text-lg leading-none" :class="f.kind==='video' ? 'ti-movie text-primary' : f.kind==='audio' ? 'ti-music text-secondary' : f.kind==='image' ? 'ti-photo text-info' : (f.archive ? 'ti-file-zip text-warning' : 'ti-file text-base-content/50')"></i>
-                  <span class="min-w-0 flex-1 truncate text-sm" :title="f.name">{{f.name}}</span>
+                  <span class="min-w-0 flex-1 truncate text-sm" :title="f.badname ? '文件名含非法 UTF-8 字节（多为 Windows 拷入的 GBK 名），链接无法生成，请先重命名：' + f.name : f.name">{{f.name}}</span>
+                  <span v-if="f.badname" class="shrink-0 rounded-md bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning" title="文件名编码异常，播放 / 下载链接无法生成，请先用左侧铅笔重命名">编码异常</span>
                   <span class="w-20 shrink-0 text-right text-xs tabular-nums text-base-content/60">{{fmt(f.size)}}</span>
                   <span class="hidden w-28 shrink-0 text-right text-xs tabular-nums text-base-content/40 md:inline">{{fmtTime(f.mtime)}}</span>
                   <div class="flex shrink-0 items-center gap-1.5">
                     <button v-if="f.archive" class="btn-sm" :title="'解压到同目录下的同名文件夹：' + f.name" @click="openLocalUnzip([f.name])"><i class="ti ti-file-zip"></i>解压</button>
                     <button class="btn-icon always" :title="'重命名此文件：'+f.name" @click="localRenameOne(f.name)"><i class="ti ti-pencil"></i></button>
                     <button class="btn-sm" :title="'校验此文件与云端：'+f.name" @click="openVerify({localPath: lfPath ? lfPath + '/' + f.name : f.name})"><i class="ti ti-shield-check"></i>校验</button>
-                    <button v-if="f.playable" class="btn-sm primary" @click="openPlayer(f)"><i class="ti ti-player-play"></i>{{f.kind==='audio' ? '播放' : f.kind==='video' ? '播放' : '预览'}}</button>
+                    <button v-if="f.playable && !f.badname" class="btn-sm primary" @click="openPlayer(f)"><i class="ti ti-player-play"></i>{{f.kind==='audio' ? '播放' : f.kind==='video' ? '播放' : '预览'}}</button>
+                    <span v-else-if="f.playable && f.badname" class="rounded-md bg-base-content/8 px-2 py-1 text-[10px] text-base-content/50" title="文件名编码异常，链接无法生成，请先重命名">需改名</span>
                     <span v-else class="rounded-md bg-base-content/8 px-2 py-1 text-[10px] text-base-content/50" title="浏览器不支持直接播放，请下载到本机">仅下载</span>
-                    <a class="btn-sm" :href="lfUrl(f, true)" :download="f.name" :title="'下载到本机：'+f.name"><i class="ti ti-download"></i>下载</a>
+                    <a v-if="!f.badname" class="btn-sm" :href="lfUrl(f, true)" :download="f.name" :title="'下载到本机：'+f.name"><i class="ti ti-download"></i>下载</a>
+                    <span v-else class="rounded-md bg-base-content/8 px-2 py-1 text-[10px] text-base-content/50" title="文件名编码异常，无法生成下载链接，请先重命名"><i class="ti ti-download"></i></span>
                   </div>
                 </div>
               </div>

@@ -20,6 +20,38 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 SHARE_LIMITS_FILE = os.path.join(DATA_DIR, "share_limits.json")   # v3.42 分享提取上限
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 
+# ── v3.80：JSON 落盘统一走这两个函数 ───────────────────────────────────────
+# 旧写法 `json.load(open(f))` / `json.dump(o, open(f, "w"))` 有三个隐患：
+#   1) 文件对象不显式关闭，只在 GC 时回收；2 Hz 轮询下长期运行会堆积 fd；
+#   2) 不写 encoding，落盘/读取编码取决于容器 locale（alpine 镜像默认无 locale），
+#      中文任务名/设置项在极端 locale 下会 UnicodeEncodeError；
+#   3) `json.dump` 后立刻 `os.replace` 没有 flush/fsync，掉电可能留下空文件。
+# 现在统一 UTF-8 + flush/fsync + 原子替换，并用一把锁避免并发写互相踩 .tmp。
+_JSON_LOCK = threading.Lock()
+
+
+def _read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, obj, indent=1, quiet=False):
+    """原子写：临时文件 → fsync → os.replace。失败时按 quiet 决定是否抛出。"""
+    tmp = path + ".tmp"
+    try:
+        with _JSON_LOCK:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=indent)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+    except Exception:
+        if not quiet:
+            raise
+
 # ── v3.45 HTTPS（同一端口同时接 http / https）──────────────────────────────
 # 为什么需要：Chromium 在「非安全上下文」（http + 私网 IP）里不允许 media 元素
 # 加载跨源资源。实测同一个 PikPak 直链：https 页面里能播，http://192.168.x 页面
@@ -53,7 +85,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.79"
+APP_VERSION = "v3.80"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -201,7 +233,7 @@ def rc(method, _timeout=120, _strict=False, _proxy=False, **kv):
     以保持其余 action 的既有行为。"""
     base = RC_PROXY if _proxy else RC
     args = base + [method] + ["%s=%s" % (k, v) for k, v in kv.items()]
-    p = subprocess.run(args, capture_output=True, text=True, timeout=_timeout)
+    p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=_timeout)
     try:
         d = json.loads(p.stdout)
     except Exception:
@@ -466,7 +498,7 @@ def proxy_rcd_cmd():
 def _proxy_rc_ping():
     try:
         p = subprocess.run(RC_PROXY + ["core/version"], capture_output=True,
-                           text=True, timeout=6)
+                           text=True, encoding="utf-8", errors="replace", timeout=6)
         return p.returncode == 0 and "version" in (p.stdout or "")
     except Exception:
         return False
@@ -477,7 +509,7 @@ def _stop_proxy_rc():
     try:
         subprocess.run(["docker", "exec", RCLONE_CONTAINER, "sh", "-c",
                         "pkill -f '[r]clone rcd --rc-addr 127.0.0.1:%d' || true" % PROXY_RC_PORT],
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
     except Exception:
         pass
     PROXY_RC_STATE.update(ok=False, ts=0.0, url="")
@@ -505,7 +537,7 @@ def ensure_proxy_rc(force=False):
         PROXY_RC_STATE.update(ok=True, ts=now, url=PROXY_RC_STATE.get("url") or wanted)
         return True
     try:
-        subprocess.run(proxy_rcd_cmd(), capture_output=True, text=True, timeout=10)
+        subprocess.run(proxy_rcd_cmd(), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
     except Exception:
         pass
     for _ in range(10):
@@ -538,7 +570,7 @@ def refresh_proxy_rc():
     _stop_proxy_rc()
     time.sleep(0.4)
     try:
-        subprocess.run(proxy_rcd_cmd(), capture_output=True, text=True, timeout=10)
+        subprocess.run(proxy_rcd_cmd(), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
     except Exception:
         pass
     for _ in range(5):
@@ -825,19 +857,13 @@ def norm_acct(n):
 # rclone 的 pikpak 配置里没有 email 字段（写未知参数有风险），所以身份单独存这个 JSON。
 # 有了它就【不再依赖哪台电脑的浏览器环境名】：换电脑后 token 靠 sub 自动对上号。
 def load_meta():
-    try:
-        d = json.load(open(_meta_path(), encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    d = _read_json(_meta_path(), {})
+    return d if isinstance(d, dict) else {}
 
 
 def save_meta(m):
     try:
-        dst = _meta_path(write=True)
-        tmp = dst + ".tmp"
-        json.dump(m, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-        os.replace(tmp, dst)
+        _write_json(_meta_path(write=True), m, quiet=True)
     except Exception:
         pass
 
@@ -1229,19 +1255,15 @@ def rclone_cli(args, proxy=False, timeout=120):
     if proxy:
         cmd += proxy_env_args()
     cmd += [RCLONE_CONTAINER, "rclone"] + args
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
 def load_jobs():
-    try:
-        return json.load(open(JOBS_FILE))
-    except Exception:
-        return []
+    d = _read_json(JOBS_FILE, [])
+    return d if isinstance(d, list) else []
 
 def save_jobs(jobs):
-    tmp = JOBS_FILE + ".tmp"
-    json.dump(jobs, open(tmp, "w"), ensure_ascii=False, indent=1)
-    os.replace(tmp, JOBS_FILE)
+    _write_json(JOBS_FILE, jobs)
 
 def _truthy(v):
     """布尔字段兼容 0/1、true/false 字符串，避免 "false" 被 bool() 判成 True。"""
@@ -1317,24 +1339,20 @@ def _norm_settings(raw):
 
 
 def load_settings():
-    try:
-        s = json.load(open(SETTINGS_FILE))
-    except Exception:
-        s = {}
-    return _norm_settings(s)
+    s = _read_json(SETTINGS_FILE, {})
+    return _norm_settings(s if isinstance(s, dict) else {})
 
 def save_settings(s):
-    tmp = SETTINGS_FILE + ".tmp"
-    json.dump(s, open(tmp, "w"), ensure_ascii=False, indent=1)
-    os.replace(tmp, SETTINGS_FILE)
+    _write_json(SETTINGS_FILE, s)
 
 def basename_of(path):
     p = path.rstrip("/").split("/")[-1] if path.strip("/") else path.split(":")[0]
     return p or path.split(":")[0]
 
-def dedupe_dest(dest, fs="/data"):
+def dedupe_dest(dest, fs=None):
     """目标目录重名避让：列出 fs 根下已有目录名，撞名就追加 -2 / -3。
     v3.57 支持 fs 参数（多存储空间后每个卷各查各的根）。"""
+    fs = fs or RCLONE_DATA_ROOT
     try:
         r = rc("operations/list", fs=fs, remote="")
         names = {e.get("Name", "") for e in r.get("list", [])}
@@ -1677,7 +1695,7 @@ def _pk_token(name):
     if (not at) or expired:
         try:
             subprocess.run(["docker", "exec", RCLONE_CONTAINER, "rclone", "about", name + ":"],
-                           capture_output=True, text=True, timeout=90)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
         except Exception:
             pass
         c, tok = _pk_cfg(name)
@@ -1988,14 +2006,12 @@ def pk_share_delete(name, share_id):
 SHARE_LIMITS_LOCK = threading.Lock()
 MYSHARES_TTL = 60
 MYSHARES_CACHE = {}       # remote -> (ts, rows)
+FOLDERCOVERS_CACHE = {}   # (remote, fileId) -> (ts, coverUrl)；v3.80 封面补齐缓存
 
 
 def load_share_limits():
-    try:
-        d = json.load(open(SHARE_LIMITS_FILE))
-        if not isinstance(d, dict):
-            d = {}
-    except Exception:
+    d = _read_json(SHARE_LIMITS_FILE, {})
+    if not isinstance(d, dict):
         d = {}
     if not isinstance(d.get("limits"), dict):
         d["limits"] = {}
@@ -2005,9 +2021,7 @@ def load_share_limits():
 
 
 def save_share_limits(d):
-    tmp = SHARE_LIMITS_FILE + ".tmp"
-    json.dump(d, open(tmp, "w"), ensure_ascii=False, indent=1)
-    os.replace(tmp, SHARE_LIMITS_FILE)
+    _write_json(SHARE_LIMITS_FILE, d)
 
 
 def _as_int(v, default=0):
@@ -2746,7 +2760,7 @@ def _xfer_cmd(job, argv):
 def _xfer_run(job, argv, timeout=1800):
     """同步跑一条 rclone 子命令，返回 (code, stdout, stderr)。"""
     try:
-        p = subprocess.run(_xfer_cmd(job, argv), capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(_xfer_cmd(job, argv), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         return p.returncode, p.stdout or "", p.stderr or ""
     except Exception as e:
         return 1, "", str(e)
@@ -2780,7 +2794,7 @@ def _xfer_kill(job):
     # docker exec 的客户端进程被杀，容器内的 rclone 未必跟着退，再用唯一 UA 精确补刀
     try:
         subprocess.run(["docker", "exec", RCLONE_CONTAINER, "pkill", "-f", ent["marker"]],
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
     except Exception:
         pass
 
@@ -2832,7 +2846,7 @@ def _xfer_worker(job_id):
             "--user-agent", marker]
     try:
         proc = subprocess.Popen(_xfer_cmd(job, argv), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
     except Exception as e:
         return bail("error", "启动 rclone 失败：%s" % e)
     with XFER_LOCK:
@@ -3333,14 +3347,33 @@ def stop_job_entry(j):
 # Source 路径配对：同一个宿主目录在两个容器里的挂载点即构成一个「存储空间」，
 # 挂了几个就识别几个，容量全部实时读取，不再有任何写死的数字。
 # docker.sock 不可用等异常情况回退到内置的单卷约定，行为与旧版完全一致。
-LEGACY_VOLUME = {"rclone": "/data", "console": "/vol2/download", "host": ""}
-SELF_CONTAINER = os.environ.get("UPDATE_CONTAINER", "download-console")
+# v3.80：两个挂载点都改成可用环境变量覆盖 —— 群晖/威联通/rootless 经常不给
+# docker.sock，或者用户把下载目录挂到 /downloads 而不是 /vol2/download。此前这类
+# 部署只能靠 docker inspect 识别，sock 一不可用就整块功能失效（容量显示 0、
+# 本地文件页空白）。现在 CONSOLE_DOWNLOAD_ROOT / RCLONE_DATA_ROOT 直接给出约定值。
+# 注意别和 compose 里的 DOWNLOAD_ROOT（宿主机路径）混：那是 volume 左侧，这是容器内右侧。
+RCLONE_DATA_ROOT = (os.environ.get("RCLONE_DATA_ROOT") or "/data").strip().rstrip("/") or "/data"
+DOWNLOAD_ROOT = (os.environ.get("CONSOLE_DOWNLOAD_ROOT") or "").strip().rstrip("/") or "/vol2/download"
+LEGACY_VOLUME = {"rclone": RCLONE_DATA_ROOT, "console": DOWNLOAD_ROOT, "host": ""}
+
+
+def _self_container_candidates():
+    """控制台自身容器名的候选，按优先级：显式配置 → $HOSTNAME（Docker 默认把容器
+    短 ID 设成 hostname，`docker inspect` 同样认）→ 历史默认名。改过
+    container_name 又忘了设 UPDATE_CONTAINER 时，靠 HOSTNAME 仍能识别多卷。"""
+    out = []
+    for n in (os.environ.get("UPDATE_CONTAINER"), os.environ.get("HOSTNAME"), "download-console"):
+        n = str(n or "").strip()
+        if n and n not in out:
+            out.append(n)
+    return out
+
 
 def _inspect_mounts(container):
     """docker inspect 拿一个容器的 bind 挂载，返回 [(宿主Source, 容器内Destination)]"""
     pr = subprocess.run(["docker", "inspect", container,
                          "--format", "{{json .Mounts}}"],
-                        capture_output=True, text=True, timeout=15)
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
     out = []
     for m in json.loads(pr.stdout or "[]"):
         src, dst = str(m.get("Source") or ""), str(m.get("Destination") or "")
@@ -3355,14 +3388,22 @@ def storage_pairs():
         rmap = {}
         for src, dst in _inspect_mounts(RCLONE_CONTAINER):
             rmap.setdefault(src, dst)
+        self_mounts = []
+        for cand in _self_container_candidates():
+            try:
+                self_mounts = _inspect_mounts(cand)
+            except Exception:
+                self_mounts = []
+            if self_mounts:
+                break
         pairs, seen = [], set()
-        for src, cdst in _inspect_mounts(SELF_CONTAINER):
+        for src, cdst in self_mounts:
             rdst = rmap.get(src)
             if rdst and rdst != "/" and rdst not in seen and os.path.isdir(cdst):
                 seen.add(rdst)
                 pairs.append({"rclone": rdst.rstrip("/"), "console": cdst.rstrip("/") or "/", "host": src})
         if pairs:
-            pairs.sort(key=lambda p: (p["rclone"] != "/data", p["rclone"]))
+            pairs.sort(key=lambda p: (p["rclone"] != RCLONE_DATA_ROOT, p["rclone"]))
             return pairs
     except Exception:
         pass
@@ -3463,8 +3504,8 @@ def local_dest(dest):
     if best:
         tail = d[len(best["rclone"]):].lstrip("/")
         return best["console"].rstrip("/") + ("/" + tail if tail else "")
-    if d.startswith("/data/"):
-        return "/vol2/download/" + d[len("/data/"):]
+    if d.startswith(RCLONE_DATA_ROOT.rstrip("/") + "/"):
+        return DOWNLOAD_ROOT.rstrip("/") + "/" + d[len(RCLONE_DATA_ROOT.rstrip("/")) + 1:]
     return None
 
 def completed_transfers(since_ts):
@@ -3545,21 +3586,16 @@ def instant_speed(cur):
 
 
 def load_history():
-    try:
-        h = json.load(open(HISTORY_FILE))
-        if not isinstance(h, dict):
-            raise ValueError
-        h.setdefault("samples", [])
-        h.setdefault("daily", {})
-        return h
-    except Exception:
+    h = _read_json(HISTORY_FILE, None)
+    if not isinstance(h, dict):
         return {"samples": [], "daily": {}}
+    h.setdefault("samples", [])
+    h.setdefault("daily", {})
+    return h
 
 def save_history(h):
     try:
-        tmp = HISTORY_FILE + ".tmp"
-        json.dump(h, open(tmp, "w"))
-        os.replace(tmp, HISTORY_FILE)
+        _write_json(HISTORY_FILE, h, indent=None, quiet=True)
     except Exception:
         pass
 
@@ -3957,6 +3993,36 @@ def _local_unzip_worker(job_id, src, dest, password, delete_after, kind):
         UNZIP_ALIVE.discard(job_id)
 
 
+DIR_COUNT_LIMIT = 999   # 子目录条目数只数到这个值就停（显示 999+），避免大目录卡死列表
+
+
+def _fs_name(name):
+    """文件名兜底。NAS 上从 Windows 拷来的 GBK 文件名在 Linux 里是非法 UTF-8 字节，
+    Python 用 surrogateescape 解码成孤立代理字符：json 能序列化（ensure_ascii 会转成
+    \\udcxx），但前端 encodeURIComponent 遇到孤立代理会抛 URIError —— 整个播放/下载
+    按钮点下去直接异常。这里替换成 U+FFFD，并回报 badname 让前端提示改名。"""
+    s = str(name)
+    try:
+        s.encode("utf-8")
+        return s, False
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace"), True
+
+
+def _count_children(path):
+    """数一层子项，最多数到 DIR_COUNT_LIMIT；目录不可读时返回 0。"""
+    n = 0
+    try:
+        with os.scandir(path) as it:
+            for _ in it:
+                n += 1
+                if n >= DIR_COUNT_LIMIT:
+                    break
+    except OSError:
+        return 0
+    return n
+
+
 def localfiles_listing(rel):
     """列一个目录。path/parent 供前端面包屑；dirs/files 已按名称排序。
     v3.57：空路径返回存储空间顶层——每个卷作为一个目录条目（带 volumeRoot，
@@ -3965,8 +4031,16 @@ def localfiles_listing(rel):
         dirs = []
         for st in storages():
             try:
-                count = sum(1 for n in os.listdir(st["console"])
-                            if os.path.isdir(os.path.join(st["console"], n)))
+                count = 0
+                with os.scandir(st["console"]) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir():
+                                count += 1
+                        except OSError:
+                            continue
+                        if count >= DIR_COUNT_LIMIT:
+                            break
             except OSError:
                 count = 0
             dirs.append({"name": st["name"], "count": count, "mtime": 0,
@@ -3986,10 +4060,11 @@ def localfiles_listing(rel):
         names = sorted(os.listdir(p), key=lambda s: s.lower())
     except OSError as e:
         return {"error": "读取目录失败：%s" % str(e)[:120]}
-    for name in names:
-        if name.startswith("."):
+    for raw_name in names:
+        if raw_name.startswith("."):
             continue                      # 隐藏 .ytdlp 等内部目录
-        fp = os.path.join(p, name)
+        name, bad = _fs_name(raw_name)
+        fp = os.path.join(p, raw_name)
         try:
             st = os.stat(fp)
         except OSError:
@@ -3998,16 +4073,17 @@ def localfiles_listing(rel):
             truncated = True
             break
         if os.path.isdir(fp):
-            try:
-                count = sum(1 for _ in os.scandir(fp))
-            except OSError:
-                count = 0
-            dirs.append({"name": name, "count": count, "mtime": int(st.st_mtime)})
+            dirs.append({"name": name, "count": _count_children(fp), "mtime": int(st.st_mtime),
+                         "badname": bad})
         elif os.path.isfile(fp):
             ext = os.path.splitext(name)[1].lower()
-            files.append({"name": name, "size": st.st_size, "mtime": int(st.st_mtime),
-                          "ext": ext, "kind": local_kind(ext), "playable": ext in BROWSER_OK,
-                          "archive": bool(local_archive_kind(name))})
+            item = {"name": name, "size": st.st_size, "mtime": int(st.st_mtime),
+                    "ext": ext, "kind": local_kind(ext), "playable": ext in BROWSER_OK,
+                    "archive": bool(local_archive_kind(name))}
+            if bad:
+                # 名字编码坏了 → 拼出来的 URL 一定打不开，前端据此禁用播放/下载
+                item["badname"] = True
+            files.append(item)
     # v3.57 面包屑：绝对路径保持前导斜杠；卷根的上一级是顶层存储空间列表
     is_abs = str(rel or "").startswith("/")
     path = ("/" if is_abs else "") + "/".join(segs)
@@ -4647,11 +4723,31 @@ def _update_http(url, timeout=None, accept=None):
 
 
 def _update_restart():
-    """容器里延迟重启；裸机部署由用户手动重启（返回 False）。"""
+    """容器里延迟重启；裸机部署由用户手动重启（返回 False）。
+
+    v3.80：以前直接 `docker restart $UPDATE_CONTAINER`，容器名改过又没设这个环境
+    变量时 restart 会静默失败（Popen 不检查退出码）—— 文件已换新、进程还是旧的，
+    于是出现「页面版本号没变」「新 JS 配旧 Python」这类诡异状态。现在先按候选名
+    逐个 inspect 确认真的存在，再重启；一个都找不到就明确提示手动重启。"""
     if os.environ.get("UPDATE_AUTO_RESTART", "1") != "1" or not os.path.exists("/.dockerenv"):
         return False
+    target = ""
+    for cand in _self_container_candidates():
+        try:
+            p = subprocess.run(["docker", "inspect", "-f", "{{.Name}}", cand],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=10)
+            if p.returncode == 0 and (p.stdout or "").strip():
+                target = cand
+                break
+        except Exception:
+            continue
+    if not target:
+        print("%s 自动重启跳过：认不出自身容器名（可在 .env 设 UPDATE_CONTAINER）"
+              % time.strftime("%F %T"))
+        return False
     try:
-        subprocess.Popen(["sh", "-c", "sleep 3; docker restart %s" % UPDATE_CONTAINER],
+        subprocess.Popen(["sh", "-c", "sleep 3; docker restart %s" % target],
                          start_new_session=True, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
         return True
@@ -4968,7 +5064,7 @@ def api(action, body):
 
     if action == "remotes":
         p = subprocess.run(["docker", "exec", RCLONE_CONTAINER, "rclone", "listremotes"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         return {"remotes": [x.strip().rstrip(":") for x in p.stdout.splitlines() if x.strip()]}
 
     if action == "proxycheck":
@@ -4987,6 +5083,14 @@ def api(action, body):
 
             def one(pair):
                 nm, fid = pair
+                # v3.80：同一文件夹的封面 1 小时内复用。以前每次切目录/切视图都重新
+                # 打 12 个 PikPak 请求，来回点几次就可能触发风控（表现为封面全空）。
+                ck = (name, fid)
+                hit = FOLDERCOVERS_CACHE.get(ck)
+                # 有封面缓存 1 小时；「确实没有封面」只缓存 5 分钟 —— 否则用户传了新
+                # 缩略图、云端才开始生成，要干等一小时才可能看到。
+                if hit and time.time() - hit[0] < (3600 if hit[1] else 300):
+                    return nm, hit[1]
                 try:
                     q = ("/drive/v1/files?parent_id=%s&limit=30&phase=PHASE_TYPE_COMPLETE"
                          "&thumbnail_size=SIZE_SMALL" % urllib.parse.quote(fid))
@@ -4997,12 +5101,14 @@ def api(action, body):
                         u = str(f.get("thumbnail_link") or "")
                         host = urllib.parse.urlparse(u).netloc.lower() if u.startswith("https://") else ""
                         if host == "mypikpak.com" or host.endswith(".mypikpak.com"):
+                            FOLDERCOVERS_CACHE[ck] = (time.time(), u)
                             return nm, u
+                    FOLDERCOVERS_CACHE[ck] = (time.time(), "")   # 没有封面也记一笔，别反复问
                 except Exception:
                     pass
                 return nm, ""
 
-            with ThreadPoolExecutor(max_workers=4) as ex:
+            with ThreadPoolExecutor(max_workers=3) as ex:
                 for nm, u in ex.map(one, todo):
                     if u:
                         covers[nm] = u
@@ -5277,13 +5383,20 @@ def api(action, body):
         return {"job": job}
 
     if action == "jobs":
+        # v3.80：前端每 2s 轮询一次，而 job_live 单个任务最坏 8s+8s（job/status +
+        # core/stats）。同时跑 3 个任务时这里会串行 40s+，接口超过前端 8s 超时，
+        # 界面直接报「请求超时」，且长时间持 LOCK 把「停止/暂停」也堵住。
+        # 现在给整轮查询一个总预算，超预算的 running 任务本轮沿用上次状态。
         with LOCK:
             jobs = load_jobs()
             try:
                 before = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
             except Exception:
                 before = None
+            deadline = time.time() + 6.0
             for j in jobs:
+                if time.time() > deadline and j.get("state") == "running":
+                    continue          # 本轮跳过，保留上次落盘的状态
                 job_live(j)
             try:
                 after = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
@@ -6385,7 +6498,7 @@ def api(action, body):
                 t0 = time.time()
                 p = None
                 try:
-                    p = subprocess.run(cmd, capture_output=True, text=True,
+                    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                        timeout=SPEEDTEST_SECONDS + 6)
                 except subprocess.TimeoutExpired:
                     pass
@@ -6470,8 +6583,13 @@ def api(action, body):
 # ---------------------------------------------------------------------------
 # 前端静态资源（./static/，容器内即 /app/static）
 # ---------------------------------------------------------------------------
-STATIC_DIR_CANDIDATES = ("/app/static", "/vol1/@appshare/zcode/console/static")
-STATIC_DIR = next((p for p in STATIC_DIR_CANDIDATES if os.path.isdir(p)), STATIC_DIR_CANDIDATES[0])
+# v3.80：候选里必须带上「脚本所在目录」—— 之前只有 /app 与 /vol1 两个写死的路径，
+# 用户把仓库放到 /opt/cloud-shuttle 或任意 bind 目录时，两处都不存在，STATIC_DIR 就
+# 落回不存在的 /app/static，整站静态资源 404（表现为打开页面一片白）。
+_APP_HOME = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR_CANDIDATES = ("/app/static", "/vol1/@appshare/zcode/console/static",
+                         os.path.join(_APP_HOME, "static"))
+STATIC_DIR = next((p for p in STATIC_DIR_CANDIDATES if os.path.isdir(p)), STATIC_DIR_CANDIDATES[-1])
 COLLECTOR_PS_CANDIDATES = ("/app/collector.ps1", "/vol1/@appshare/zcode/console/collector.ps1",
                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "collector.ps1"))
 LOGIN_PS_CANDIDATES = ("/app/login-collector.ps1", "/vol1/@appshare/zcode/console/login-collector.ps1",
@@ -6574,8 +6692,14 @@ class Handler(BaseHTTPRequestHandler):
         o = self._origin()
         if not o:
             return True
-        host = (self.headers.get("Host") or "").strip().lower()
-        return bool(host) and o in ("http://" + host, "https://" + host)
+        hosts = {(self.headers.get("Host") or "").strip().lower()}
+        # v3.80：反向代理（nginx / 群晖反代 / Cloudflare Tunnel）若改写或丢了 Host，
+        # 浏览器带来的 Origin 就对不上，所有写操作会被 403 拦死。把部署时声明的
+        # 对外地址也算作同源，用户设了 CONSOLE_PUBLIC_HOST 就能正常用域名访问。
+        pub = str(os.environ.get("CONSOLE_PUBLIC_HOST") or "").strip().lower()
+        if pub:
+            hosts.add(pub)
+        return any(h and o in ("http://" + h, "https://" + h) for h in hosts)
 
     def _security_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -6874,8 +6998,10 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return   # 客户端已断开，别再回包（否则 stderr 打一串 traceback）
         except Exception as e:
+            # v3.80：兜底错误也要脱敏 —— PikPak 的 error_description 会把整个
+            # RefreshToken 拼进报错，直接回显等于把可用凭证贴到屏幕上。
             self._send(200, "application/json; charset=utf-8",
-                       json.dumps({"error": str(e)[:300]}).encode())
+                       json.dumps({"error": mask_secret(str(e))[:300]}).encode())
 
 
 if __name__ == "__main__":

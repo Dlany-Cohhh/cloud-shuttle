@@ -3,6 +3,62 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.80 — 全功能筛查：普适性与稳定性大修（2026-11-13）
+
+这一版把「换一台 NAS 能不能稳」当作唯一验收标准，做了一轮全功能筛查。后端 69 个 action
+逐个真机冒烟、前端 78 个 computed / 239 个 methods 静态交叉校验，修掉 10 处会在别人机器上
+炸掉的隐患。
+
+### 部署普适性（换机器最容易踩的）
+
+- **静态资源目录找不到就整站空白**：`STATIC_DIR` 只有 `/app/static` 与 `/vol1/@appshare/...`
+  两个写死路径，仓库放到 `/opt/cloud-shuttle` 或任意 bind 目录时两处都不存在，回落到不存在的
+  `/app/static` —— 打开页面一片白。现在候选里补上「脚本所在目录」，且兜底取最后一个候选。
+- **容器内挂载点可配置**：新增 `CONSOLE_DOWNLOAD_ROOT` / `RCLONE_DATA_ROOT`。此前下载目录
+  只能是 `/vol2/download` + `/data`，且完全依赖 `docker inspect` 识别；群晖/威联通/rootless
+  这类不给 `docker.sock` 的部署，本地文件页直接空白、容量显示 0。现在环境变量给出约定值即可。
+- **自身容器名按候选识别**：`UPDATE_CONTAINER` → `$HOSTNAME`（Docker 默认容器短 ID）→
+  `download-console`。改过 `container_name` 又忘了设环境变量时，多卷识别和在线更新后的
+  自动重启都不会再静默失效。
+- **在线更新重启确实会重启**：以前 `docker restart $UPDATE_CONTAINER` 用 Popen 不检查退出码，
+  容器名不对就静默失败 —— 出现「文件已换新、进程还是旧的」、页面版本号不变的怪状态。现在
+  先 `docker inspect` 确认容器存在，认不出来就明确提示手动重启。
+- **反向代理下写操作不再 403**：同源校验现在也接受 `CONSOLE_PUBLIC_HOST` 声明的对外地址。
+  nginx / 群晖反代 / Cloudflare Tunnel 改写或丢掉 Host 头时，此前所有 POST 都会被「已拒绝
+  跨站请求」拦死。
+
+### 稳定性
+
+- **JSON 落盘统一改造**：5 处 `json.load(open(f))` / `json.dump(o, open(f,"w"))` 换成统一的
+  `_read_json` / `_write_json` —— 显式 UTF-8（alpine 无 locale 时落盘编码不确定）、`with open`
+  不泄漏 fd（2 Hz 轮询长期运行会堆积）、flush + fsync + `os.replace` 原子替换（掉电不留空文件）、
+  一把锁避免两个请求同时写同一个 `.tmp`。
+- **子进程解码统一**：13 处 `subprocess.run(text=True)` 补 `encoding="utf-8", errors="replace"`。
+  此前 rclone 输出里出现非 UTF-8 字节（GBK 文件名）会让整个接口抛 `UnicodeDecodeError`。
+- **轮询接口加总预算**：`jobs` 里每个 running 任务最坏 8s+8s，三个任务串行就超过前端 8 秒
+  超时，界面报「请求超时」且长时间持锁把「停止/暂停」也堵住。现在整轮查询 6 秒预算，超预算的
+  任务本轮沿用上次状态。
+- **大目录不再卡列表**：子目录条目数只数到 999（原来全量 `os.scandir`，几万文件的目录会把
+  列目录拖到超时）。
+- **封面补齐加缓存**：同一文件夹 1 小时内复用（空结果 5 分钟），并发从 4 降到 3。以前每次
+  切目录/切视图都重打 12 个 PikPak 请求，来回点几次就可能触发风控，表现为封面全空。
+- **兜底错误也脱敏**：`do_POST` 最外层异常此前直接回显 `str(e)`，而 PikPak 的
+  `error_description` 会把 RefreshToken 原样拼进去。
+
+### 健壮性
+
+- **非法 UTF-8 文件名不再炸前端**：Windows 拷进 NAS 的 GBK 文件名在 Linux 上是非法字节，
+  `encodeURIComponent` 遇孤立代理字符直接抛 `URIError`，整行按钮点下去就异常。现在后端清洗
+  并标 `badname`，列表显示「编码异常」、播放/下载按钮置灰并提示先重命名；`lfUrl` 自身也做了
+  兜底清洗（保留 emoji 这类合法代理对）。
+- **前端错误提示可读**：`api()` 以前直接 `r.json()`，反向代理返回 502/HTML 时抛
+  `Unexpected token '<'`，用户完全看不懂。现在读出原文再解析，并把 HTTP 状态带进提示。
+
+### 回归
+
+- 新增 `test_v380.py`（41 项）；`test_v371`~`test_v380` 全部通过。
+- 真机核对：69 个 action 冒烟无 500；`/media` Range 仍 206；升级后 `job` 轮询与设置读写正常。
+
 ## v3.79 — 修复本地文件播放全部黑屏（2026-11-13）
 
 - **阻断性缺陷**：本地文件页点任意视频都只看到黑屏停在 `0:00`，没有任何提示。根因是 v3.57 把本地路径改成「控制台绝对路径」后，前端拼出的播放地址是 `/media/vol2/download/3/kz/x.mp4`，而 `/media/` 之后的部分天然没有前导斜杠，后端 `safe_local_path()` 按「相对主卷」解释，实际去找 `/vol2/download/vol2/download/3/kz/x.mp4` —— **每个本地文件都 404**。新增 `media_local_path()`：先按卷根把 `<rel>` 补回前导斜杠，再交给 `safe_local_path()` 做越界校验，绝对路径与老的相对主卷写法（`/media/1/喵兔/x.mp4`）同时兼容。

@@ -943,7 +943,21 @@ Vue.createApp({
           body: JSON.stringify(Object.assign({ action }, body || {})),
           signal: ctl ? ctl.signal : undefined,
         });
-        const d = await r.json();
+        /* v3.80：以前直接 r.json()，反向代理返回 502/HTML 错误页时会抛
+           "Unexpected token '<'"，用户完全看不懂。这里读出原文再解析，
+           并把 HTTP 状态带进提示，排障时一眼能定位是代理还是后端。 */
+        const txt = await r.text();
+        let d;
+        try {
+          d = JSON.parse(txt);
+        } catch (e) {
+          const snip = String(txt || "").trim().slice(0, 120).replace(/\s+/g, " ");
+          throw new Error(r.ok
+            ? "后端返回了非 JSON 响应（可能被反向代理拦截）：" + snip
+            : "HTTP " + r.status + " " + (r.statusText || "") + "：" + snip);
+        }
+        if (!r.ok && d && typeof d === "object" && !d.error)
+          d.error = "HTTP " + r.status + " " + (r.statusText || "");
         return d;
       } catch (e) {
         if (ctl && ctl.signal.aborted)
@@ -3133,8 +3147,13 @@ Vue.createApp({
 
     /* ---------- 本地文件页（v3.15，只读） ---------- */
     lfUrl(f, dl) {
+      /* v3.80：文件名可能带孤立代理字符（NAS 上的 GBK 文件），encodeURIComponent
+         对它直接抛 URIError，会让整行按钮点下去就异常。这里先剥掉再编码。
+         不用 lookbehind（Safari 16.4 之前不支持）：成对代理保留，孤立的换成 U+FFFD。 */
+      const clean = s => String(s).replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g,
+        m => (m.length === 2 ? m : "\uFFFD"));
       const segs = (this.lfPath ? this.lfPath.split("/").filter(Boolean) : []).concat(f.name);
-      return "/media/" + segs.map(s => encodeURIComponent(s)).join("/") + (dl ? "?dl=1" : "");
+      return "/media/" + segs.map(s => encodeURIComponent(clean(s))).join("/") + (dl ? "?dl=1" : "");
     },
     fmtTime(ts) {
       if (!ts) return "--";
@@ -3262,6 +3281,10 @@ Vue.createApp({
       this.toast("已导出 " + (rows.length - 1) + " 条到 CSV", "ok");
     },
     openPlayer(f) {
+      if (f.badname) {
+        this.toast("文件名含非法 UTF-8 字节，链接生成不了；请先点铅笔重命名再播放", "error");
+        return;
+      }
       if (!f.playable) {
         this.toast("浏览器不支持直接播放此格式，请点「下载」", "error");
         return;

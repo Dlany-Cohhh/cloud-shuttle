@@ -30,6 +30,10 @@ services:
       # 可选：自定义容器名 / 端口（多套部署或端口冲突时）。改这里要同步改
       # rclone-backend 的 container_name，并设置对应环境变量；默认值即本文件的约定。
       # RCLONE_CONTAINER: rclone-backend
+      # v3.80：容器内挂载点。改了下面 volumes 的右侧就必须同步改这两个，否则
+      # 控制台找不到下载目录（docker.sock 不可用时尤其如此 —— 那是唯一的线索）。
+      CONSOLE_DOWNLOAD_ROOT: ${CONSOLE_DOWNLOAD_PATH:-/vol2/download}
+      RCLONE_DATA_ROOT: ${RCLONE_DOWNLOAD_PATH:-/data}
       # PORT: 5566            # 控制台监听端口（Windows bridge 映射同步改 WEB_PORT）
       # RC_PORT: 5572         # rclone 主守护进程（直连）
       # PROXY_RC_PORT: 5573   # 代理下载守护进程
@@ -40,7 +44,7 @@ services:
       # 控制台通过 docker exec 指挥 rclone-backend
       - /var/run/docker.sock:/var/run/docker.sock
       # 磁盘空间保护 + 「本地文件」页浏览
-      - ${DOWNLOAD_ROOT:?请在 .env 中设置 DOWNLOAD_ROOT}:/vol2/download
+      - ${DOWNLOAD_ROOT:?请在 .env 中设置 DOWNLOAD_ROOT}:${CONSOLE_DOWNLOAD_PATH:-/vol2/download}
 
   rclone-backend:
     image: rclone/rclone:latest
@@ -52,7 +56,7 @@ services:
     volumes:
       # rclone.conf 含账号 refresh_token，只挂载、绝不进仓库
       - ${RCLONE_CONFIG_DIR:?请在 .env 中设置 RCLONE_CONFIG_DIR}:/config/rclone
-      - ${DOWNLOAD_ROOT:?请在 .env 中设置 DOWNLOAD_ROOT}:/data
+      - ${DOWNLOAD_ROOT:?请在 .env 中设置 DOWNLOAD_ROOT}:${RCLONE_DOWNLOAD_PATH:-/data}
     # 纯后端模式：rc 只绑本机回环，控制台经 docker exec 调用
     command: >
       rcd
