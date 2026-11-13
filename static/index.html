@@ -1033,10 +1033,6 @@
                           @click="testAllAccounts(false)">
                     <i class="ti" :class="testingAll ? 'ti-loader-2 animate-spin' : 'ti-bolt'"></i>{{testingAll ? '测试中 ' + testDone + '/' + testTotal : '一键测试全部'}}
                   </button>
-                  <button class="btn-sm primary" @click="openTokenImport()"
-                          title="下载一次性采集器（任意 Windows 双击），或直接粘贴 refresh_token 导入">
-                    <i class="ti ti-cloud-download"></i>导入 / 采集 Token
-                  </button>
                   <button class="btn-sm" @click="purgeResidual"
                           title="两个后端进程配置对账：清掉空壳段与一侧多出的残留段（账号删除后又冒出来就用它）">
                     <i class="ti ti-eraser"></i>清残留
@@ -1123,19 +1119,13 @@
                 <!-- v3.68 PikPak：登录采集入口（临时 profile 一键浏览器），无手动表单 -->
                 <div v-else class="flex flex-col gap-2">
                   <div class="flex flex-wrap items-center gap-2">
-                    <a class="btn-primary btn-press w-fit" href="/login-collector.bat">
-                      <i class="ti ti-download"></i>下载采集器（双击运行）
-                    </a>
-                    <a class="btn-sm" href="/login-collector-setup.bat" title="运行一次后，可直接点「打开干净浏览器」">
-                      <i class="ti ti-settings"></i>一键协议安装
-                    </a>
-                    <a class="btn-sm primary" href="pkcollect:" title="需先运行过「一键协议安装」；提示没有关联应用 = 还没安装">
-                      <i class="ti ti-player-play"></i>打开干净浏览器
-                    </a>
+                    <button class="btn-primary btn-press w-fit" @click="openTokenImport()">
+                      <i class="ti ti-cloud-download"></i>导入 / 采集 Token
+                    </button>
                   </div>
                   <div class="text-xs leading-relaxed text-base-content/50">
-                    双击采集器会自动弹出<b>全新的浏览器窗口</b>（不读取现有浏览器数据，用完即删）并打开 PikPak 登录页；
-                    登录后凭证<b>自动回传导入</b>，无需手动填 token / 密码。
+                    打开采集向导 → 一键干净浏览器：自动弹出<b>全新的浏览器窗口</b>（不读取现有浏览器数据，用完即删）
+                    并打开 PikPak 登录页；登录后凭证<b>自动回传导入</b>，无需手动填 token / 密码。
                   </div>
                 </div>
                 <div class="text-xs leading-relaxed text-base-content/50">
