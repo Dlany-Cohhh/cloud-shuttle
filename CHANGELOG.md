@@ -3,6 +3,12 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.67 — 添加账号表单重构：聚焦 OpenList（2026-11-13）
+
+- 「添加账号」表单只保留 **OpenList / WebDAV**（Alist / 坚果云等兼容端同样适用）：填 WebDAV 地址 + 用户名密码即可，厂商留空自动补 `other`，添加后立即连接验证；
+- 移除 PikPak 的手动表单（refresh_token / 账号密码 / device_id 行）——**PikPak 账号统一走「导入 / 采集 Token」**采集添加（支持批量、干净浏览器一键链路与自动对号），表单里给出指引；
+- 移除 SFTP / FTP / S3 / Mega / HTTP 直链 / 本地目录 / 别名等未使用的类型选项；后端 `providers` 同步裁剪，`acctadd` 仅接受 webdav（PikPak 的采集链路走 `acctimport` 不受影响）。
+
 ## v3.66 — 重新登录弹窗精简（2026-11-13）
 
 - 点「重新登录」只弹弹窗，不再自动打开 PikPak 登录页（弹窗内有「打开登录页」按钮）；

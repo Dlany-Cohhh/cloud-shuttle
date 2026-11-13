@@ -1117,13 +1117,10 @@
                   </button>
                 </div>
                 <div class="text-xs leading-relaxed text-base-content/50">
-                  添加后立即连接验证，失败自动回滚删除。本页永不回显 token / 密码。
-                  <span v-if="acctForm.type==='pikpak'">
-                    三种方式任选：① 只填账号 + 密码（会先申请验证码再登录，PikPak 若判定需人工验证码会直接报错）；
-                    ② 只填 refresh_token（现场换发 access_token 写入 token 字段，rclone 只认后者）；
-                    ③ 上面的「导入 / 采集 Token」——下载一次性采集器在任意电脑双击，或直接粘贴 token，批量写入且自动对号。
-                  </span>
-                  Google Drive / OneDrive 等 OAuth 类型需交互授权，暂不支持网页添加。
+                  添加后立即连接验证，失败自动回滚删除；本页永不回显 token / 密码。
+                  <b>OpenList</b>：地址填 <code class="rounded bg-base-300 px-1">http://NAS_IP:5244/dav</code>
+                  （OpenList 后台默认开启 WebDAV），用户名 / 密码为 OpenList 的登录凭据，厂商留空即 other。
+                  <b>PikPak 账号请用上方「导入 / 采集 Token」采集添加</b>（支持批量与自动对号，本表单不再提供）。
                 </div>
               </div>
 

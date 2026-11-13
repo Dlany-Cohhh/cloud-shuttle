@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.66"
+APP_VERSION = "v3.67"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -347,41 +347,11 @@ def merged_stats(_timeout=8):
 
 # 「添加账号」支持的 rclone 后端（非 OAuth 类型；OAuth 型需交互授权，暂不支持网页添加）
 PROVIDERS = [
-    {"type": "pikpak", "label": "PikPak 网盘", "params": [
-        {"name": "refresh_token", "label": "refresh_token", "ph": "可留空：填账号密码，或用上方「导入 / 采集 Token」"},
-        {"name": "username", "label": "账号（邮箱）", "ph": "登录邮箱 / 手机号"},
-        {"name": "password", "label": "密码", "secret": True},
-        {"name": "device_id", "label": "device_id（可选）"}]},
-    {"type": "webdav", "label": "WebDAV（OpenList/Alist/坚果云等）", "params": [
-        {"name": "url", "label": "WebDAV 地址", "required": True, "ph": "http://127.0.0.1:5244/dav"},
+    {"type": "webdav", "label": "OpenList / WebDAV（Alist/坚果云等）", "params": [
+        {"name": "url", "label": "WebDAV 地址", "required": True, "ph": "http://NAS_IP:5244/dav"},
         {"name": "user", "label": "用户名"},
         {"name": "pass", "label": "密码", "secret": True},
-        {"name": "vendor", "label": "厂商", "ph": "other"}]},
-    {"type": "sftp", "label": "SFTP / SSH 服务器", "params": [
-        {"name": "host", "label": "主机", "required": True},
-        {"name": "user", "label": "用户名", "required": True},
-        {"name": "port", "label": "端口", "ph": "22"},
-        {"name": "pass", "label": "密码", "secret": True},
-        {"name": "key_file", "label": "私钥路径（可选）"}]},
-    {"type": "ftp", "label": "FTP 服务器", "params": [
-        {"name": "host", "label": "主机", "required": True},
-        {"name": "user", "label": "用户名"},
-        {"name": "pass", "label": "密码", "secret": True},
-        {"name": "port", "label": "端口", "ph": "21"}]},
-    {"type": "s3", "label": "S3 / 对象存储（OSS/COS/B2 等）", "params": [
-        {"name": "provider", "label": "厂商", "required": True, "ph": "Other"},
-        {"name": "access_key_id", "label": "Access Key", "required": True},
-        {"name": "secret_access_key", "label": "Secret Key", "secret": True, "required": True},
-        {"name": "endpoint", "label": "Endpoint", "ph": "https://..."},
-        {"name": "region", "label": "Region（可选）"}]},
-    {"type": "mega", "label": "Mega 网盘", "params": [
-        {"name": "user", "label": "邮箱", "required": True},
-        {"name": "pass", "label": "密码", "secret": True, "required": True}]},
-    {"type": "http", "label": "HTTP 直链目录", "params": [
-        {"name": "url", "label": "索引页地址", "required": True}]},
-    {"type": "local", "label": "本地目录", "params": []},
-    {"type": "alias", "label": "别名（指向其他账号路径）", "params": [
-        {"name": "remote", "label": "目标 remote:path", "required": True, "ph": "pikpak-668:子目录"}]},
+        {"name": "vendor", "label": "厂商（默认 other）", "ph": "other"}]},
 ]
 
 # ---- PikPak 令牌 ----
@@ -5500,6 +5470,10 @@ def api(action, body):
             k, v = str(k).strip(), str(v).strip()
             if k and v:
                 clean[k] = v
+        if atype == "webdav":
+            # v3.67：OpenList/Alist 场景 vendor 几乎总是 other，不填自动补默认，
+            # 保证 rclone 非交互 config/create 不会因缺 vendor 失败
+            clean.setdefault("vendor", "other")
         if atype == "pikpak" and clean.get("refresh_token") and len(clean["refresh_token"]) < 20:
             return {"error": "refresh_token 看起来无效（长度不足）"}
         if atype == "pikpak":
