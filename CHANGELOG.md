@@ -3,6 +3,13 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.72 — 真机冒烟问题修复与账号页布局微调（2026-11-13）
+
+- **修复「文件夹大小显示不出来」的残留根因**：`dirsize` 的 rclone 兜底把 `_rclone_run()` 返回的 `CompletedProcess` 当成 `(code, out, err)` 三元组解包，PikPak 原生 API 一旦失败，兜底也跟着抛 `cannot unpack non-iterable CompletedProcess object`。现改为读取 `p.returncode` / `p.stdout` / `p.stderr`，并把原生异常文本带进错误信息；三条分支（兜底成功 / 兜底失败 / 输出非法 JSON）均有离线用例。
+- **修复 docker.sock 不可用时回退失效**：内置单卷 `LEGACY_VOLUME` 缺 `host` 字段，而 `refresh_storages()` 直接取 `p["host"]`，回退时会 KeyError，让存储空间列表与容量刷新全部失效。现补 `host: ""` 并改用 `p.get("host", "")`。
+- **账号页布局**：「导入 / 采集 Token」按钮从独立一行移到「类型下拉 + 账号名」同一行的最右侧，且仅在 PikPak 登录方式下显示；下方只保留流程说明。
+- 新增 `test_v371.py` 离线回归（32 项，位于工作区、不入库）；`docs/DEV-LOG-2026-11-13.md` 记录会话纪要、真机冒烟结果与本次修复。
+
 ## v3.71 — 账号页入口收敛（2026-11-13）
 
 - PikPak 登录方式的三个采集器按钮（下载采集器 / 一键协议安装 / 打开干净浏览器）收拢为一个「导入 / 采集 Token」入口——点开采集向导，完整的一键干净浏览器流程都在里面；

@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.71"
+APP_VERSION = "v3.72"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -3102,7 +3102,7 @@ def stop_job_entry(j):
 # Source 路径配对：同一个宿主目录在两个容器里的挂载点即构成一个「存储空间」，
 # 挂了几个就识别几个，容量全部实时读取，不再有任何写死的数字。
 # docker.sock 不可用等异常情况回退到内置的单卷约定，行为与旧版完全一致。
-LEGACY_VOLUME = {"rclone": "/data", "console": "/vol2/download"}
+LEGACY_VOLUME = {"rclone": "/data", "console": "/vol2/download", "host": ""}
 SELF_CONTAINER = os.environ.get("UPDATE_CONTAINER", "download-console")
 
 def _inspect_mounts(container):
@@ -3159,7 +3159,7 @@ def refresh_storages(s=None):
             total = min(total, quota)
             free = max(0.0, min(free, quota - used))
         stors.append({"name": "存储空间 %d" % i,
-                      "rclone": p["rclone"], "console": p["console"], "host": p["host"],
+                      "rclone": p["rclone"], "console": p["console"], "host": p.get("host", ""),
                       "totalGB": round(total, 1), "freeGB": round(free, 1),
                       "usedPct": round(min(100.0, (total - free) / total * 100.0), 1) if total > 0 else 0.0,
                       "low": free < disk_min})
@@ -4701,8 +4701,9 @@ def api(action, body):
                 fid = pk_walk(remote, sub)
             r = {"bytes": int(_pk_folder_size(remote, fid, time.time() + PK_SIZE_DEADLINE)), "count": -1}
         except Exception as e:
-            code, out, err = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=120)
-            if code != 0:
+            p = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=120)
+            out, err = _decode(p.stdout), _decode(p.stderr)
+            if p.returncode != 0:
                 return {"error": "目录大小统计失败：%s / %s" % (str(e)[:100], (err or out)[:100])}
             try:
                 d = json.loads(out)

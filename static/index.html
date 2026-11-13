@@ -1105,6 +1105,10 @@
                     <option v-for="p in providers" :key="p.type" :value="p.type">{{p.label}}</option>
                   </select>
                   <input class="fld w-44" v-model.trim="acctForm.name" placeholder="账号名（留空自动生成）">
+                  <!-- PikPak 采集入口移到本行最右，与账号名并排；WebDAV 方式下不显示 -->
+                  <button v-if="!(curProvider.params || []).length" class="btn-primary btn-press ml-auto w-fit" @click="openTokenImport()">
+                    <i class="ti ti-cloud-download"></i>导入 / 采集 Token
+                  </button>
                 </div>
                 <div v-if="(curProvider.params || []).length" class="flex flex-wrap items-center gap-3">
                   <template v-for="pd in curProvider.params" :key="pd.name">
@@ -1116,13 +1120,8 @@
                     <i class="ti ti-plus" :class="acctAdding ? 'animate-spin' : ''"></i>{{acctAdding ? '验证中…' : '添加并验证'}}
                   </button>
                 </div>
-                <!-- v3.68 PikPak：登录采集入口（临时 profile 一键浏览器），无手动表单 -->
+                <!-- PikPak 采集入口已移至上方账号名一行，此处只保留流程说明 -->
                 <div v-else class="flex flex-col gap-2">
-                  <div class="flex flex-wrap items-center gap-2">
-                    <button class="btn-primary btn-press w-fit" @click="openTokenImport()">
-                      <i class="ti ti-cloud-download"></i>导入 / 采集 Token
-                    </button>
-                  </div>
                   <div class="text-xs leading-relaxed text-base-content/50">
                     打开采集向导 → 一键干净浏览器：自动弹出<b>全新的浏览器窗口</b>（不读取现有浏览器数据，用完即删）
                     并打开 PikPak 登录页；登录后凭证<b>自动回传导入</b>，无需手动填 token / 密码。
