@@ -1337,38 +1337,35 @@
                     <i class="ti" :class="proxyChecking ? 'ti-loader-2 animate-spin' : 'ti-activity'"></i>{{proxyChecking ? '测试中…' : '测试连通性'}}
                   </button>
                 </div>
-                <!-- v3.75：状态只说一次，一句话结论 + 可展开明细 -->
+                <!-- v3.77：状态只说一次，全局模式不再拆成三条路径 -->
                 <div class="flex flex-wrap items-center gap-2 rounded-lg bg-base-content/5 px-4 py-2.5 text-xs">
                   <span class="h-2 w-2 shrink-0 rounded-full" :class="proxyStateDot"></span>
                   <span>{{proxyStateText}}</span>
-                  <button class="btn-sm ml-auto" @click="proxyDetailsOpen = !proxyDetailsOpen">{{proxyDetailsOpen ? '收起' : '查看三条路径'}}</button>
                 </div>
-                <div v-if="proxyDetailsOpen" class="rounded-xl border border-base-content/10 px-4 py-3 text-xs">
-                  <div class="grid gap-1 sm:grid-cols-3">
-                    <div>下载任务：<b class="font-mono">{{(proxyScope && proxyScope.download) || '读取中…'}}</b></div>
-                    <div>PikPak API：<b class="font-mono">{{(proxyScope && proxyScope.pk) || '读取中…'}}</b></div>
-                    <div>封面 CDN：<b class="font-mono">{{(proxyScope && proxyScope.thumb) || '读取中…'}}</b></div>
+                <!-- v3.77 全局二选一：直连 / 代理，切换立即对下载、云盘数据、封面同时生效 -->
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70">网络模式（全局）</label>
+                  <div class="inline-flex overflow-hidden rounded-lg border border-base-content/15">
+                    <button class="px-4 py-1.5 text-sm btn-press" :class="form.netMode === 'direct' ? 'bg-primary text-primary-content' : 'text-base-content/60'" @click="setNetMode('direct')">直连</button>
+                    <button class="px-4 py-1.5 text-sm btn-press" :class="form.netMode === 'proxy' ? 'bg-primary text-primary-content' : 'text-base-content/60'" @click="setNetMode('proxy')">代理</button>
                   </div>
-                  <div v-if="proxyScope && proxyScope.hint" class="mt-2 text-base-content/50">{{proxyScope.hint}}</div>
-                  <div class="mt-1 text-base-content/40">云盘数据使用独立模式，不受上方代理地址影响（当前：{{proxyScope && proxyScope.mode === 'proxy' ? '强制走代理' : (proxyScope && proxyScope.mode === 'direct' ? '强制直连' : '跟随下载代理')}}）。</div>
+                  <span class="text-xs text-base-content/50">切换后下载 / 云盘数据 / 封面统一生效</span>
                 </div>
-                <div class="flex flex-wrap items-center gap-3">
-                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sDownloadProxy">下载任务走代理</label>
-                  <input id="sDownloadProxy" type="checkbox" class="toggle toggle-primary" :disabled="proxyAddressOff" :checked="form.downloadProxy" @change="toggleDownloadProxy($event.target.checked)">
-                  <span v-if="proxyAddressOff" class="text-xs text-warning">代理地址已关闭，开关暂不生效</span>
+                <!-- v3.77：地址框常驻，避免「要先切代理才能填地址」的死锁 -->
+                <div class="rounded-xl border border-base-content/10 px-4 py-3 text-xs">
+                  <div class="flex flex-wrap items-center gap-3">
+                    <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxyUrl">代理地址<span class="text-warning">*</span></label>
+                    <input id="sProxyUrl" type="text" class="input input-sm input-bordered w-80 font-mono text-xs" v-model.trim="form.proxyUrl" placeholder="http://127.0.0.1:7890 或 socks5://…">
+                    <button class="btn-sm" :disabled="saving" @click="saveSettings()"><i class="ti ti-device-floppy"></i>保存地址</button>
+                  </div>
+                  <div v-if="form.netMode === 'direct'" class="mt-2 text-base-content/50">当前全局直连；填好地址后点上方「代理」即可切换。留空不影响直连。</div>
+                  <div v-else-if="!proxyAddrValid" class="mt-2 text-warning">代理模式需要有效地址：须以 http://、https:// 或 socks5:// 开头；未填写时会自动回落到直连。</div>
+                  <div v-else class="mt-2 text-base-content/50">当前地址：<b class="font-mono">{{form.proxyUrl}}</b> · 下载、云盘数据与封面都走它。</div>
                 </div>
-                <div class="flex flex-wrap items-center gap-3">
-                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sPkProxyMode">云盘数据与封面</label>
-                  <select id="sPkProxyMode" class="fld w-64" v-model="form.pkProxyMode" @change="saveSettings()">
-                    <option value="follow">跟随下载代理（旧行为）</option>
-                    <option value="direct">直连（推荐，更快）</option>
-                    <option value="proxy">强制走代理（仅直连被拦时用）</option>
-                  </select>
-                </div>
-                <!-- v3.75：诊断改为一行结论，明细折叠、可关闭、可一键应用 -->
+                <!-- v3.77：诊断圆点按「主路径是否失败」判定，与结论文字一致 -->
                 <div v-if="proxyCheck" class="rounded-xl border border-warning/30 bg-warning/8 px-4 py-3 text-xs">
                   <div class="flex flex-wrap items-center gap-2">
-                    <span class="h-2 w-2 shrink-0 rounded-full" :class="proxyCheck.recommend ? 'bg-warning' : 'bg-success'"></span>
+                    <span class="h-2 w-2 shrink-0 rounded-full" :class="proxyCheck.failed || proxyCheck.recommend ? 'bg-warning' : 'bg-success'"></span>
                     <span class="min-w-0 flex-1">{{proxyCheck.summary || proxyCheck.hint}}</span>
                     <button v-if="proxyCheck.recommend" class="btn-sm" :disabled="saving" @click="applyProxySuggestion()">改用{{proxyCheck.recommend === 'direct' ? '直连' : '代理'}}</button>
                     <button class="btn-sm" @click="proxyCheckDetails = !proxyCheckDetails">{{proxyCheckDetails ? '收起明细' : '明细'}}</button>
@@ -1384,28 +1381,14 @@
                     </div>
                   </div>
                 </div>
-                <!-- v3.75：低频项与原理全部收进进阶 -->
-                <details class="text-xs leading-relaxed text-base-content/50">
-                  <summary class="cursor-pointer text-base-content/70">› 进阶设置（代理地址 / 分享链接 / 说明）</summary>
-                  <div class="mt-3 space-y-3">
-                    <div class="flex flex-wrap items-center gap-3">
-                      <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxyUrl">自定义代理地址</label>
-                      <input id="sProxyUrl" type="text" class="input input-sm input-bordered w-80 font-mono text-xs" v-model.trim="form.proxyUrl" placeholder="http://… / socks5://…；留空用部署默认值">
-                      <button class="btn-sm" :disabled="saving" @click="saveSettings()"><i class="ti ti-device-floppy"></i>保存</button>
-                    </div>
-                    <div class="flex flex-wrap items-center gap-3">
-                      <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxy">分享链接优先走代理</label>
-                      <input id="sProxy" type="checkbox" class="toggle toggle-primary" :disabled="proxyAddressOff" :checked="form.proxy" @change="toggleProxy($event.target.checked)">
-                      <span v-if="proxyAddressOff" class="text-xs text-warning">代理地址已关闭，开关暂不生效</span>
-                      <span v-else class="text-xs text-base-content/50">只影响分享链接的尝试顺序，切换即自动保存</span>
-                    </div>
-                    <div class="space-y-1.5">
-                      <div><b>下载开关按任务生效</b>：切换只影响之后提交的任务；代理由独立守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}）承担，失败自动改走另一条，不用改 compose、不中断直连任务。</div>
-                      <div><b>云盘数据与封面</b>控制大小统计、token 换发与封面；默认跟随下载代理。直连更快，但直连被拦时没有自动回代理的兜底。</div>
-                      <div><b>不走代理</b>：地址填 <code class="rounded bg-base-300 px-1">off</code>（或 none / direct / disabled / no），或直接关闭下载开关。</div>
-                      <div>文件行的仪表盘图标会固定跑直连与代理各 5 秒对比速度，不受以上设置影响，会真实消耗下游流量。</div>
-                      <div>在他人的 NAS 上部署：见仓库内 <code class="rounded bg-base-300 px-1">docs/FOR-OTHERS.md</code>。</div>
-                    </div>
+                <details class="text-xs leading-relaxed text-base-content/50" :open="netModeAdvancedOpen">
+                  <summary class="cursor-pointer text-base-content/70" @click.prevent="netModeAdvancedOpen = !netModeAdvancedOpen">› 进阶设置（地址格式 / 说明）</summary>
+                  <div class="mt-3 space-y-1.5">
+                    <div><b>全局生效</b>：v3.77 起不再拆分下载与封面，也不再有两个独立开关。选「直连」= 所有请求直连；选「代理」= 下载、PikPak API、封面 CDN 统一走同一个地址。</div>
+                    <div><b>代理地址必填</b>：支持 <code class="rounded bg-base-300 px-1">http://</code>、<code class="rounded bg-base-300 px-1">https://</code>、<code class="rounded bg-base-300 px-1">socks5://</code>。留空或非法时无法启用代理模式，会自动回落到直连；<code class="rounded bg-base-300 px-1">socks5://</code> 只对 rclone 下载生效，Python 侧仍直连。</div>
+                    <div><b>代理守护进程</b>：代理模式按需拉起独立守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}），不用改 compose；切回直连会自动停止。</div>
+                    <div>文件行的仪表盘图标会固定跑直连与代理各 5 秒对比速度，不受以上设置影响，会真实消耗下游流量。</div>
+                    <div>在他人的 NAS 上部署：见仓库内 <code class="rounded bg-base-300 px-1">docs/FOR-OTHERS.md</code>。</div>
                   </div>
                 </details>
               </div>

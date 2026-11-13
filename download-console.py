@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.76"
+APP_VERSION = "v3.77"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -160,11 +160,14 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             "transfersClearedAt": 0,        # 「清空已完成传输记录」的时间水位
             "shareAutoCancel": False,       # v3.42 提取次数到上限自动取消分享（总开关）
             "nasHomeUrl": "http://127.0.0.1:8080/",  # v3.49 「返回 NAS 主页」跳转地址
-            # v3.55 自定义代理地址：空 = 用部署时 PROXY_URL / 默认 mihomo；off = 不走代理
+            # v3.77 全局网络模式：direct = 下载 / 云盘 API / 封面全部直连；
+            # proxy = 三者统一走同一个代理地址。选 proxy 必须填写合法地址，
+            # 留空会自动回落 direct，不再悄悄套用 127.0.0.1:7890。
+            "netMode": "direct",
             "proxyUrl": "",
-            # v3.74：PikPak 原生 API / 封面 CDN 的代理模式（与下载代理解耦）
-            # follow = 跟随 proxy_url()（旧行为）；direct = 强制直连；proxy = 强制走代理
-            "pkProxyMode": "follow"}
+            # 兼容字段：v3.74~v3.76 的 pkProxyMode，由 _norm_settings 与 netMode 同步；
+            # 请求层已不再读取，保留只为老配置 / 老前端平滑升级。
+            "pkProxyMode": "direct"}
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
 ORDER_BY_OPTIONS = ("", "size,descending", "size,ascending", "name,ascending",
@@ -215,19 +218,37 @@ PROXY_OFF_WORDS = ("off", "none", "direct", "disabled", "no")
 SPEEDTEST_SECONDS = 5                   # 单条路径测速窗口；容器内硬超时 = 该值 + 3s
 
 
+def net_mode():
+    """v3.77 全局网络模式：direct | proxy。
+    兼容迁移：老配置只有 pkProxyMode(follow/direct/proxy)，按语义推导；
+    follow 且填了合法地址视为 proxy，填关闭词 / 留空视为 direct。"""
+    st = load_settings()
+    m = str(st.get("netMode") or "").strip().lower()
+    if m in ("direct", "proxy"):
+        return m
+    old = str(st.get("pkProxyMode") or "follow").strip().lower()
+    if old in ("direct", "proxy"):
+        return old
+    raw = (str(st.get("proxyUrl") or "").strip()
+           or str(os.environ.get("PROXY_URL") or "").strip())
+    return "direct" if (not raw or raw.lower() in PROXY_OFF_WORDS) else "proxy"
+
+
 def proxy_url():
-    """当前生效的代理地址：设置页 > 环境变量 PROXY_URL > 默认 mihomo 地址。
-    返回空串表示「不走代理」，调用方据此决定是否注入 HTTP(S)_PROXY。
-    每次读取 settings.json（文件很小），这样在设置页改地址后无需重启控制台。"""
-    raw = str(load_settings().get("proxyUrl") or "").strip()
-    raw = raw or str(os.environ.get("PROXY_URL") or "").strip() or DEFAULT_PROXY_URL
-    if raw.lower() in PROXY_OFF_WORDS:
+    """v3.77 全局生效的代理地址：所有网络请求（下载 / PikPak API / 封面 CDN）共用。
+    direct 模式返回空串；proxy 模式必须有显式配置的合法地址，否则返回空串
+    （不会回落到默认地址，避免「选了代理却没填地址」时静默走一个坏代理）。"""
+    if net_mode() != "proxy":
         return ""
-    return raw if PROXY_URL_RE.match(raw) else DEFAULT_PROXY_URL
+    raw = (str(load_settings().get("proxyUrl") or "").strip()
+           or str(os.environ.get("PROXY_URL") or "").strip())
+    if not raw or raw.lower() in PROXY_OFF_WORDS:
+        return ""
+    return raw if PROXY_URL_RE.match(raw) else ""
 
 
 def proxy_env_args():
-    """docker exec 的代理环境变量参数；禁用代理时返回空列表。"""
+    """docker exec 的代理环境变量参数；直连模式返回空列表。"""
     p = proxy_url()
     return ["-e", "HTTPS_PROXY=" + p, "-e", "HTTP_PROXY=" + p] if p else []
 
@@ -239,19 +260,8 @@ def proxy_http_url():
 
 
 def pk_proxy_url():
-    """v3.74：PikPak 原生 API / 封面 CDN 专用代理（与下载代理解耦）。
-    follow = 跟随 proxy_url()（升级前的旧行为，保证兼容）；
-    direct = 强制直连（大小统计最快，但直连被拦时没有代理兜底）；
-    proxy  = 强制走部署代理（即使下载开关关闭、proxyUrl 填了 off）。
-    返回空串表示直连。"""
-    mode = str(load_settings().get("pkProxyMode") or "follow")
-    if mode == "direct":
-        return ""
-    if mode == "proxy":
-        raw = str(os.environ.get("PROXY_URL") or "").strip() or DEFAULT_PROXY_URL
-        if raw.lower() in PROXY_OFF_WORDS:
-            return ""
-        return raw if raw.lower().startswith(("http://", "https://")) else ""
+    """v3.77：不再拆分作用域，PikPak API / 封面 CDN 与下载共用 proxy_url()。
+    保留函数名是为了不改动 _pk_http / _thumb_fetch 的调用点。"""
     return proxy_http_url()
 
 
@@ -283,6 +293,10 @@ def _friendly_net_err(e):
         return "域名解析失败"
     if "certificate" in low:
         return "证书校验失败"
+    if "reset by peer" in low or "errno 104" in low or "connection reset" in low:
+        return "连接被对端重置（网络抖动或被限速）"
+    if "broken pipe" in low or "errno 32" in low:
+        return "连接被中断"
     return "%s：%s" % (type(e).__name__, s[:60])
 
 
@@ -331,17 +345,17 @@ PROXY_CHECK_CACHE = {"ts": 0.0, "bad": set(), "hint": "", "summary": "", "recomm
 
 
 def proxy_scope():
-    """v3.75：三条路径当前走什么 + 最近一次连通性结论（5 分钟内有效）。"""
-    d = proxy_url() or "直连"
-    p = pk_proxy_url() or "直连"
+    """v3.77：全局模式下三条路径同值；健康标记与最近一次诊断结论同步。"""
+    addr = proxy_url() or "直连"
+    mode = net_mode()
     ck = PROXY_CHECK_CACHE
     fresh = time.time() - ck["ts"] < 300
     bad = ck["bad"] if fresh else set()
-    return {"download": d, "pk": p, "thumb": p,
-            "mode": str(load_settings().get("pkProxyMode") or "follow"),
-            "downloadOk": "download" not in bad,
-            "pkOk": "pk" not in bad,
-            "thumbOk": "thumb" not in bad,
+    unhealthy = bool(bad)          # 全局：任一路径失败，三条一起标红
+    return {"download": addr, "pk": addr, "thumb": addr,
+            "mode": mode, "global": True,
+            "configured": mode == "direct" or bool(proxy_url()),
+            "downloadOk": not unhealthy, "pkOk": not unhealthy, "thumbOk": not unhealthy,
             "hint": ck["hint"] if fresh else "",
             "summary": ck["summary"] if fresh else "",
             "recommend": ck["recommend"] if fresh else None,
@@ -349,16 +363,15 @@ def proxy_scope():
 
 
 def api_proxy_check():
-    """v3.75 只读连通性测试：直连/代理、封面 CDN、代理端口与 CONNECT 隧道。
-    返回一行 summary 与可一键应用的 recommend，并把健康状态写入 PROXY_CHECK_CACHE。"""
+    """v3.77 只读连通性测试：按当前全局模式测主路径，代理模式另测对照与 CONNECT+TLS。
+    主路径失败时把三条健康标记一起置红，避免「状态行一切正常 / 诊断网络未通过」并存。"""
     from concurrent.futures import ThreadPoolExecutor
     url = PK_API + "/drive/v1/files"
-    pxy, pk = proxy_url(), pk_proxy_url()
-    mode = str(load_settings().get("pkProxyMode") or "follow")
-    jobs = [("PikPak API · 直连", url, "")]
+    cdn = "https://sg-thumbnail-drive.mypikpak.com/"
+    mode, pxy, pk = net_mode(), proxy_url(), proxy_http_url()
+    jobs = [("PikPak API · 直连", url, ""), ("封面 CDN · 直连", cdn, "")]
     if pk:
-        jobs.append(("PikPak API · 代理", url, pk))
-    jobs.append(("封面 CDN · 直连", "https://sg-thumbnail-drive.mypikpak.com/", ""))
+        jobs += [("PikPak API · 代理", url, pk), ("封面 CDN · 代理", cdn, pk)]
 
     def add(label, target, proxy):
         ok, ms, detail = _probe_url(target, proxy)
@@ -377,55 +390,60 @@ def api_proxy_check():
                     "ms": int((time.time() - t0) * 1000), "detail": _friendly_net_err(e)}
 
     def connect_probe():
-        r = _probe_connect(pk or pxy) if (pk or pxy) else None
+        r = _probe_connect(pk) if pk else None
         return ({"name": "代理 CONNECT + TLS", "ok": r["ok"], "ms": r["ms"],
                  "detail": r["detail"]} if r else None)
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         futs = [ex.submit(add, *j) for j in jobs]
         pf = ex.submit(port_probe) if pxy else None
-        cf = ex.submit(connect_probe) if (pk or pxy) else None
+        cf = ex.submit(connect_probe) if pk else None
         items = [f.result() for f in futs]
         if pf:
             items.append(pf.result())
         if cf and cf.result():
             items.append(cf.result())
 
-    direct = next((x for x in items if x["name"] == "PikPak API · 直连"), None)
-    via = next((x for x in items if x["name"] == "PikPak API · 代理"), None)
-    conn = next((x for x in items if x["name"] == "代理 CONNECT + TLS"), None)
+    def get(name):
+        return next((x for x in items if x["name"] == name), None)
+
+    direct = get("PikPak API · 直连")
+    via = get("PikPak API · 代理")
+    conn = get("代理 CONNECT + TLS")
     direct_ok = bool(direct and direct["ok"])
     via_ok = bool(via and via["ok"])
     conn_ok = bool(conn and conn["ok"]) if conn else via_ok
+    main_ok = (via_ok and conn_ok) if mode == "proxy" else direct_ok
+    alt_ok = direct_ok if mode == "proxy" else via_ok
 
     recommend, hint, summary = None, "", ""
-    if not direct_ok and via_ok:
-        recommend, hint = "proxy", "直连不通、代理可用 → 建议让云盘数据走代理"
-        summary = "直连不通，代理可用"
-    elif direct_ok and not via_ok and mode == "proxy":
-        recommend = "direct"
-        hint = "当前「走代理」不可用，但直连正常 → 建议改用直连"
-        summary = "代理路径不通（%s）；直连 %s ms 正常" % (
-            (via or conn or {}).get("detail", "连接失败"), direct["ms"])
-    elif direct_ok and via_ok and via["ms"] > direct["ms"] * 1.5:
-        recommend = "direct"
-        hint = "直连明显快于代理 → 可把云盘数据设为直连加速大小统计"
-        summary = "直连 %s ms，代理 %s ms，直连更快" % (direct["ms"], via["ms"])
-    elif direct_ok:
-        hint = "直连可用；云盘数据与封面会按上方模式选路"
-        summary = "直连可用（%s ms）" % direct["ms"]
-    else:
+    if not main_ok and alt_ok:
+        recommend = "direct" if mode == "proxy" else "proxy"
+        hint = ("当前代理不可用、直连正常 → 建议改用直连" if mode == "proxy"
+                else "直连不通；如网络需要代理，请切换为代理模式并填写地址")
+        summary = ("代理路径不通；直连 %s ms 正常" % direct["ms"] if mode == "proxy"
+                   else "直连不通，请检查网络或切换代理模式")
+    elif not main_ok:
         hint = "两条路径都不通，请检查网络与代理配置"
         summary = "网络检测未通过"
+        if mode == "direct":
+            recommend = "proxy"     # 前端会提示先填写有效代理地址
+            hint = "直连不通；如网络需要代理，请切换为代理模式并填写地址"
+    elif mode == "proxy" and direct_ok and via["ms"] > direct["ms"] * 1.5:
+        recommend = "direct"
+        hint = "直连明显快于代理 → 可改回直连加速大小统计"
+        summary = "代理可用（%s ms），但直连更快（%s ms）" % (via["ms"], direct["ms"])
+    elif mode == "proxy":
+        hint = "代理可用；下载 / 云盘数据 / 封面统一走该代理"
+        summary = "代理可用（%s ms）" % via["ms"]
+    else:
+        hint = "直连可用；下载 / 云盘数据 / 封面全部直连"
+        summary = "直连可用（%s ms）" % direct["ms"]
 
-    bad = set()
-    if mode == "proxy" and not (via_ok and conn_ok):
-        bad.update(("pk", "thumb"))
-    if pxy and bool(load_settings().get("downloadProxy", True)) and not conn_ok:
-        bad.add("download")
+    bad = set() if main_ok else {"download", "pk", "thumb"}
     PROXY_CHECK_CACHE.update(ts=time.time(), bad=bad, hint=hint,
                              summary=summary, recommend=recommend)
-    return {"ok": True, "items": items, "scope": proxy_scope(),
+    return {"ok": True, "items": items, "scope": proxy_scope(), "failed": not main_ok,
             "hint": hint, "summary": summary, "recommend": recommend}
 
 
@@ -500,7 +518,14 @@ def ensure_proxy_rc(force=False):
 
 
 def refresh_proxy_rc():
-    """设置页改了代理地址后调用：空闲时按新地址重启 5573，返回 (ok, 提示文字)。"""
+    """设置页改了模式/地址后调用：空闲时按新地址重启 5573，返回 (ok, 提示文字)。"""
+    if net_mode() != "proxy" and _proxy_rc_ping():
+        _stop_proxy_rc()
+        PROXY_RC_STATE.update(ok=False, ts=0.0, url="")
+        return True, "已切换为全局直连，代理守护进程已停止"
+    if net_mode() != "proxy":
+        PROXY_RC_STATE.update(ok=False, ts=0.0, url="")
+        return True, ""
     if not _proxy_rc_ping():
         PROXY_RC_STATE.update(ok=False, ts=0.0, url="")
         return True, "代理地址已保存，首次代理下载时按新地址自动拉起"
@@ -1249,9 +1274,18 @@ def _norm_settings(raw):
     d["downloadProxy"] = bool(d.get("downloadProxy", True))
     d["advancedMode"] = _truthy(d.get("advancedMode", False))
     d["shareAutoCancel"] = _truthy(d.get("shareAutoCancel", False))
-    d["pkProxyMode"] = str(d.get("pkProxyMode") or "follow")
-    if d["pkProxyMode"] not in ("follow", "direct", "proxy"):
-        d["pkProxyMode"] = "follow"
+    # v3.77 全局网络模式：老配置没有 netMode 时按 pkProxyMode / proxyUrl 迁移。
+    # 注意必须看 raw 而不是 d —— d 已被 DEFAULTS 补成 direct，会盖掉迁移判断。
+    m = str((raw or {}).get("netMode") or "").strip().lower()
+    if m not in ("direct", "proxy"):
+        old = str(d.get("pkProxyMode") or "follow").strip().lower()
+        if old in ("direct", "proxy"):
+            m = old
+        else:
+            raw = str(d.get("proxyUrl") or "").strip()
+            m = "direct" if (not raw or raw.lower() in PROXY_OFF_WORDS) else "proxy"
+    d["netMode"] = m
+    d["pkProxyMode"] = m          # 兼容镜像，请求层不再读取
     d["bwLimitOn"] = bool(d.get("bwLimitOn"))
     d["createEmptySrcDirs"] = bool(d.get("createEmptySrcDirs", True))
     d["autoStart"] = str(d.get("autoStart") or "")[:5]
@@ -5348,7 +5382,7 @@ def api(action, body):
                         "diskTotal": STATE.get("diskTotal"), "storages": storages(),
                         "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
-                "proxyScope": proxy_scope()}
+                "netMode": net_mode(), "proxyScope": proxy_scope()}
 
     if action == "savesettings":
         with LOCK:
@@ -5358,23 +5392,36 @@ def api(action, body):
                       "multiThreadStreams", "multiThreadCutoffMB", "retries",
                       "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
                       "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
-                      "transfersClearedAt", "nasHomeUrl", "proxyUrl", "pkProxyMode"):
+                      "transfersClearedAt", "nasHomeUrl", "proxyUrl", "netMode"):
                 if k in body:
                     s[k] = body[k]
-            s["proxy"] = bool(body.get("proxy", s["proxy"]))
-            s["downloadProxy"] = bool(body.get("downloadProxy", s["downloadProxy"]))
+            # v3.77：两个旧开关不再由前端单独控制，统一跟随全局模式
+            s["proxy"] = s["downloadProxy"] = (str(s.get("netMode") or "direct") == "proxy")
             s["advancedMode"] = _truthy(body.get("advancedMode", s.get("advancedMode", False)))
             s["shareAutoCancel"] = _truthy(body.get("shareAutoCancel", s.get("shareAutoCancel", False)))
             s = _norm_settings(s)      # 统一钳制 / 白名单，非法值退回默认
             save_settings(s)
             STATE["firedStart"] = None
             STATE["firedPause"] = None
-            changed = (old.get("proxyUrl") or "") != (s.get("proxyUrl") or "")
-        # 只在地址真的变了时重启 5573，且避开正在传输的任务
-        _, proxy_note = refresh_proxy_rc() if changed else (True, "")
+            changed = ((old.get("proxyUrl") or "") != (s.get("proxyUrl") or "")
+                       or old.get("netMode") != s.get("netMode"))
+            # v3.77：选代理却没有合法地址 → 自动回落直连，明确告知，不静默套默认地址
+            proxy_note = ""
+            if s.get("netMode") == "proxy" and not proxy_url():
+                s["netMode"] = "direct"
+                s["pkProxyMode"] = "direct"
+                s["proxy"] = s["downloadProxy"] = False
+                save_settings(s)
+                changed = True
+                proxy_note = "代理模式需要填写有效代理地址，已自动回落到直连"
+        # 只在模式/地址真的变了时重启 5573，且避开正在传输的任务
+        note2 = ""
+        if changed:
+            _, note2 = refresh_proxy_rc()
         return {"ok": True, "settings": s,
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
-                "proxyScope": proxy_scope(), "proxyNote": proxy_note}
+                "netMode": net_mode(), "proxyScope": proxy_scope(),
+                "proxyNote": proxy_note or note2}
 
     if action == "resetsettings":
         with LOCK:

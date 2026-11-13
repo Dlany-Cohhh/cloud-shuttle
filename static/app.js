@@ -40,7 +40,8 @@ Vue.createApp({
       proxyScope: null,          // v3.74 三条路径各自生效的代理
       proxyCheck: null,          // v3.74 只读连通性测试结果
       proxyChecking: false,
-      proxyDetailsOpen: false,    // v3.75 三条路径明细
+      proxyDetailsOpen: false,    // 兼容保留：v3.77 已不拆分路径
+      netModeAdvancedOpen: false,   // v3.77 代理地址编辑区
       proxyCheckDetails: false,   // v3.75 诊断明细折叠
       folderCovers: {},          // v3.74 无封面文件夹的异步补齐结果
       /* v3.57 storages 由后端自动识别（不再写死磁盘总量），每项含 name/totalGB/freeGB/low */
@@ -197,7 +198,7 @@ Vue.createApp({
       /* 设置页 */
       defaultNasHomeUrl: DEFAULT_NAS_HOME,
       form: { maxConcurrent: 2, autoStart: "", autoPause: "", diskMinGB: 20, diskQuotaGB: 0,
-              nasHomeUrl: DEFAULT_NAS_HOME, proxyUrl: "", pkProxyMode: "follow",
+              nasHomeUrl: DEFAULT_NAS_HOME, proxyUrl: "", netMode: "direct",
               transfers: 6, checkers: 8, proxy: false, downloadProxy: true,
               advancedMode: false,
               multiThreadStreams: 8, multiThreadCutoffMB: 64, orderBy: "size,descending",
@@ -422,7 +423,11 @@ Vue.createApp({
           ? "抽样：对前 N 个大小一致的文件，比对头 / 中 / 尾各 32 KB 字节，能发现截断、错版、串文件"
           : "快速：只比对文件名清单与大小，秒级完成，不读取文件内容";
     },
-    /* v3.76：代理地址填了 off / none 等关闭词时，两个开关实际不生效 */
+    /* v3.77：代理地址是否为可用于代理模式的合法 URL */
+    proxyAddrValid() {
+      return /^(?:https?|socks5h?):\/\/\S+$/i.test(String(this.form.proxyUrl || "").trim());
+    },
+    /* 兼容保留：老配置里的关闭词判定（v3.77 由 netMode 控制，此处仅供展示） */
     proxyAddressOff() {
       const v = String(this.form.proxyUrl || "").trim().toLowerCase();
       return ["off", "none", "direct", "disabled", "no"].includes(v);
@@ -431,12 +436,11 @@ Vue.createApp({
     proxyStateText() {
       const s = this.proxyScope;
       if (!s) return "正在读取网络状态…";
-      const bad = [];
-      if (s.downloadOk === false) bad.push("下载代理");
-      if (s.pkOk === false || s.thumbOk === false) bad.push("云盘数据");
-      if (bad.length) return "注意：" + bad.join("、") + "当前路径不可用，建议改用直连";
-      return "一切正常 · " + (s.download === "直连" ? "下载直连" : "下载走代理")
-           + " · " + (s.pk === "直连" ? "云盘数据直连" : "云盘数据走代理");
+      if (s.downloadOk === false || s.pkOk === false || s.thumbOk === false)
+        return "注意：当前网络路径检测未通过，请查看下方诊断";
+      return s.mode === "proxy"
+        ? "一切正常 · 全局代理 · " + (s.pk || "")
+        : "一切正常 · 全局直连";
     },
     proxyStateDot() {
       const s = this.proxyScope;
@@ -992,6 +996,9 @@ Vue.createApp({
         this.settings = d.settings || {};
         this.effectiveProxyUrl = d.effectiveProxyUrl || "";
         if (d.proxyScope !== undefined) this.proxyScope = d.proxyScope;
+        /* v3.77：外部改动 / 后端自动回落时同步全局模式 */
+        const nm = (d.settings || {}).netMode;
+        if (nm && nm !== this.form.netMode && !this.saving) this.form.netMode = nm;
         this.state = d.state || this.state;
         /* v3.58：后端升级检测。页面不刷新时 JS 永远是旧代码，新后端 + 旧前端
            混搭会出现"目录不存在"之类的怪状态——版本变了就提示用户刷新。 */
@@ -1434,10 +1441,27 @@ Vue.createApp({
     async applyProxySuggestion() {
       const r = this.proxyCheck && this.proxyCheck.recommend;
       if (!r) return;
-      this.form.pkProxyMode = r;
+      if (r === "proxy" && !this.proxyAddrValid()) {
+        this.netModeAdvancedOpen = true;
+        this.toast("请先填写有效代理地址，再切换到代理模式", "error");
+        return;
+      }
+      this.form.netMode = r;
       await this.saveSettings();
-      this.toast("已应用建议：云盘数据" + (r === "direct" ? "改为直连" : "改为走代理"), "ok");
+      this.toast("已应用建议：全局" + (r === "direct" ? "直连" : "代理"), "ok");
       await this.testProxy();
+    },
+    /* v3.77：全局模式二选一，点即保存；代理模式必须已有合法地址 */
+    async setNetMode(m) {
+      if (m === "proxy" && !this.proxyAddrValid()) {
+        this.netModeAdvancedOpen = true;
+        this.toast("请先填写代理地址（http:// 或 socks5://）再选择代理模式", "error");
+        return;
+      }
+      if (this.form.netMode === m) return;
+      this.form.netMode = m;
+      await this.saveSettings();
+      this.toast(m === "proxy" ? "已切换：全局代理" : "已切换：全局直连", "ok");
     },
     setMode(m) {
       if (m === this.mode) return;
@@ -2657,7 +2681,7 @@ Vue.createApp({
         diskQuotaGB: s.diskQuotaGB ?? 0,   // v3.57 存储空间配额（0 = 跟随实际容量）
         nasHomeUrl: s.nasHomeUrl || DEFAULT_NAS_HOME,
         proxyUrl: s.proxyUrl || "",
-        pkProxyMode: s.pkProxyMode || "follow",
+        netMode: s.netMode || "direct",
         transfers: s.transfers ?? 6,
         checkers: s.checkers ?? 8,
         proxy: !!s.proxy,
@@ -2725,7 +2749,7 @@ Vue.createApp({
       this.form.diskQuotaGB = q;
       const pu = String(this.form.proxyUrl || "").trim();
       if (pu && !/^(?:(?:https?|socks5h?):\/\/\S+|off|none|direct|disabled)$/i.test(pu)) {
-        this.toast("代理地址须以 http(s):// 或 socks5:// 开头，或填 off 关闭代理", "error");
+        this.toast("代理地址须以 http(s):// 或 socks5:// 开头；关闭代理请在上方选「直连」", "error");
         return;
       }
       this.saving = true;
@@ -2736,6 +2760,7 @@ Vue.createApp({
           this.settings = d.settings;
           this.effectiveProxyUrl = d.effectiveProxyUrl || "";
           if (d.proxyScope !== undefined) this.proxyScope = d.proxyScope;
+          if (d.netMode) this.form.netMode = d.netMode;   // v3.77 后端可能自动回落直连
         } else this.toast("保存失败", "error");
       } catch (e) { this.toast("保存失败：" + e.message, "error"); }
       this.saving = false;
