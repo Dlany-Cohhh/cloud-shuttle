@@ -40,6 +40,8 @@ Vue.createApp({
       proxyScope: null,          // v3.74 三条路径各自生效的代理
       proxyCheck: null,          // v3.74 只读连通性测试结果
       proxyChecking: false,
+      proxyDetailsOpen: false,    // v3.75 三条路径明细
+      proxyCheckDetails: false,   // v3.75 诊断明细折叠
       folderCovers: {},          // v3.74 无封面文件夹的异步补齐结果
       /* v3.57 storages 由后端自动识别（不再写死磁盘总量），每项含 name/totalGB/freeGB/low */
       state: { diskLow: false, diskFree: null, diskTotal: null, storages: [] },
@@ -419,6 +421,23 @@ Vue.createApp({
         : this.verifyForm.mode === "sample"
           ? "抽样：对前 N 个大小一致的文件，比对头 / 中 / 尾各 32 KB 字节，能发现截断、错版、串文件"
           : "快速：只比对文件名清单与大小，秒级完成，不读取文件内容";
+    },
+    /* v3.75：设置页状态行——一句话结论，替代原来三行重复状态 */
+    proxyStateText() {
+      const s = this.proxyScope;
+      if (!s) return "正在读取网络状态…";
+      const bad = [];
+      if (s.downloadOk === false) bad.push("下载代理");
+      if (s.pkOk === false || s.thumbOk === false) bad.push("云盘数据");
+      if (bad.length) return "注意：" + bad.join("、") + "当前路径不可用，建议改用直连";
+      return "一切正常 · " + (s.download === "直连" ? "下载直连" : "下载走代理")
+           + " · " + (s.pk === "直连" ? "云盘数据直连" : "云盘数据走代理");
+    },
+    proxyStateDot() {
+      const s = this.proxyScope;
+      if (!s) return "bg-base-content/30";
+      return (s.downloadOk === false || s.pkOk === false || s.thumbOk === false)
+        ? "bg-warning" : "bg-success";
     },
     curProvider() {
       return this.providers.find(p => p.type === this.acctForm.type) || { params: [] };
@@ -1397,12 +1416,23 @@ Vue.createApp({
     async testProxy() {
       this.proxyChecking = true;
       this.proxyCheck = null;
+      this.proxyCheckDetails = false;
       try {
         this.proxyCheck = await this.api("proxycheck", {}, 60000);
+        if (this.proxyCheck.scope) this.proxyScope = this.proxyCheck.scope;
       } catch (e) {
         this.proxyCheck = { ok: false, hint: "测试失败：" + (e.message || e), items: [] };
       }
       this.proxyChecking = false;
+    },
+    /* v3.75：把诊断建议一键写回设置，再复测一次 */
+    async applyProxySuggestion() {
+      const r = this.proxyCheck && this.proxyCheck.recommend;
+      if (!r) return;
+      this.form.pkProxyMode = r;
+      await this.saveSettings();
+      this.toast("已应用建议：云盘数据" + (r === "direct" ? "改为直连" : "改为走代理"), "ok");
+      await this.testProxy();
     },
     setMode(m) {
       if (m === this.mode) return;

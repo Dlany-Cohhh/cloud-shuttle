@@ -53,7 +53,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.74"
+APP_VERSION = "v3.75"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -267,22 +267,81 @@ def _probe_url(url, proxy, timeout=8):
     except urllib.error.HTTPError as e:
         return True, int((time.time() - t0) * 1000), "HTTP %s" % e.code
     except Exception as e:
-        return False, int((time.time() - t0) * 1000), "%s: %s" % (type(e).__name__, str(e)[:70])
+        return False, int((time.time() - t0) * 1000), _friendly_net_err(e)
+
+
+def _friendly_net_err(e):
+    """v3.75：把 Python 原始异常翻成用户能看懂的一句话。"""
+    s, low = str(e), str(e).lower()
+    if "unexpected_eof" in low or "eof occurred" in low:
+        return "TLS 连接被中断（代理可能未正常工作）"
+    if "timed out" in low or "timeout" in type(e).__name__.lower():
+        return "连接超时"
+    if "refused" in low or "10061" in s:
+        return "连接被拒绝（端口未监听）"
+    if "getaddrinfo" in low or "name or service not known" in low:
+        return "域名解析失败"
+    if "certificate" in low:
+        return "证书校验失败"
+    return "%s：%s" % (type(e).__name__, s[:60])
+
+
+def _probe_connect(proxy, host="api-drive.mypikpak.com", port=443, timeout=6):
+    """v3.75：HTTP CONNECT 探测代理是否真能转发 HTTPS。
+    TCP 端口通 ≠ 代理可用；socks5 / https 代理不支持此探测，返回 None 跳过。"""
+    u = urllib.parse.urlparse(proxy)
+    if u.scheme not in ("http", ""):
+        return None
+    ph, pp = u.hostname or "", u.port or 80
+    t0 = time.time()
+    try:
+        with socket.create_connection((ph, pp), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n"
+                          % (host, port, host, port)).encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf and len(buf) < 4096:
+                chunk = sock.recv(512)
+                if not chunk:
+                    break
+                buf += chunk
+            status = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            ok = " 200 " in (" " + status + " ")
+            return {"ok": ok, "ms": int((time.time() - t0) * 1000),
+                    "detail": ("CONNECT 已建立" if ok else status[:60] or "代理无响应")}
+    except Exception as e:
+        return {"ok": False, "ms": int((time.time() - t0) * 1000),
+                "detail": _friendly_net_err(e)}
+
+
+PROXY_CHECK_CACHE = {"ts": 0.0, "bad": set(), "hint": "", "summary": "", "recommend": None}
 
 
 def proxy_scope():
-    """设置页展示用：三条路径当前各自走什么。"""
+    """v3.75：三条路径当前走什么 + 最近一次连通性结论（5 分钟内有效）。"""
     d = proxy_url() or "直连"
     p = pk_proxy_url() or "直连"
+    ck = PROXY_CHECK_CACHE
+    fresh = time.time() - ck["ts"] < 300
+    bad = ck["bad"] if fresh else set()
     return {"download": d, "pk": p, "thumb": p,
-            "mode": str(load_settings().get("pkProxyMode") or "follow")}
+            "mode": str(load_settings().get("pkProxyMode") or "follow"),
+            "downloadOk": "download" not in bad,
+            "pkOk": "pk" not in bad,
+            "thumbOk": "thumb" not in bad,
+            "hint": ck["hint"] if fresh else "",
+            "summary": ck["summary"] if fresh else "",
+            "recommend": ck["recommend"] if fresh else None,
+            "checkedAt": ck["ts"] if fresh else 0}
 
 
 def api_proxy_check():
-    """v3.74 只读连通性测试：PikPak API 直连/代理、封面 CDN、代理端口。"""
+    """v3.75 只读连通性测试：直连/代理、封面 CDN、代理端口与 CONNECT 隧道。
+    返回一行 summary 与可一键应用的 recommend，并把健康状态写入 PROXY_CHECK_CACHE。"""
     from concurrent.futures import ThreadPoolExecutor
     url = PK_API + "/drive/v1/files"
     pxy, pk = proxy_url(), pk_proxy_url()
+    mode = str(load_settings().get("pkProxyMode") or "follow")
     jobs = [("PikPak API · 直连", url, "")]
     if pk:
         jobs.append(("PikPak API · 代理", url, pk))
@@ -302,20 +361,59 @@ def api_proxy_check():
                         "ms": int((time.time() - t0) * 1000), "detail": "TCP 可连"}
         except Exception as e:
             return {"name": "代理端口 %s:%s" % (host, port), "ok": False,
-                    "ms": int((time.time() - t0) * 1000), "detail": type(e).__name__}
+                    "ms": int((time.time() - t0) * 1000), "detail": _friendly_net_err(e)}
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    def connect_probe():
+        r = _probe_connect(pk or pxy) if (pk or pxy) else None
+        return ({"name": "代理 CONNECT 隧道", "ok": r["ok"], "ms": r["ms"],
+                 "detail": r["detail"]} if r else None)
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
         futs = [ex.submit(add, *j) for j in jobs]
         pf = ex.submit(port_probe) if pxy else None
-        items = [f.result() for f in futs] + ([pf.result()] if pf else [])
+        cf = ex.submit(connect_probe) if (pk or pxy) else None
+        items = [f.result() for f in futs]
+        if pf:
+            items.append(pf.result())
+        if cf and cf.result():
+            items.append(cf.result())
+
     direct = next((x for x in items if x["name"] == "PikPak API · 直连"), None)
     via = next((x for x in items if x["name"] == "PikPak API · 代理"), None)
-    hint = "直连可用；大小统计与封面会按上方模式选路"
-    if direct and not direct["ok"] and via and via["ok"]:
-        hint = "直连不通、代理可用 → 建议把 PikPak 请求设为「强制走代理」"
-    elif direct and direct["ok"] and via and via["ok"] and via["ms"] > direct["ms"] * 1.5:
-        hint = "直连明显快于代理 → 可把 PikPak 请求设为「强制直连」加速大小统计"
-    return {"ok": True, "items": items, "scope": proxy_scope(), "hint": hint}
+    conn = next((x for x in items if x["name"] == "代理 CONNECT 隧道"), None)
+    direct_ok = bool(direct and direct["ok"])
+    via_ok = bool(via and via["ok"])
+    conn_ok = bool(conn and conn["ok"]) if conn else via_ok
+
+    recommend, hint, summary = None, "", ""
+    if not direct_ok and via_ok:
+        recommend, hint = "proxy", "直连不通、代理可用 → 建议让云盘数据走代理"
+        summary = "直连不通，代理可用"
+    elif direct_ok and not via_ok and mode == "proxy":
+        recommend = "direct"
+        hint = "当前「走代理」不可用，但直连正常 → 建议改用直连"
+        summary = "代理路径不通（%s）；直连 %s ms 正常" % (
+            (via or conn or {}).get("detail", "连接失败"), direct["ms"])
+    elif direct_ok and via_ok and via["ms"] > direct["ms"] * 1.5:
+        recommend = "direct"
+        hint = "直连明显快于代理 → 可把云盘数据设为直连加速大小统计"
+        summary = "直连 %s ms，代理 %s ms，直连更快" % (direct["ms"], via["ms"])
+    elif direct_ok:
+        hint = "直连可用；云盘数据与封面会按上方模式选路"
+        summary = "直连可用（%s ms）" % direct["ms"]
+    else:
+        hint = "两条路径都不通，请检查网络与代理配置"
+        summary = "网络检测未通过"
+
+    bad = set()
+    if mode == "proxy" and not (via_ok and conn_ok):
+        bad.update(("pk", "thumb"))
+    if pxy and bool(load_settings().get("downloadProxy", True)) and not conn_ok:
+        bad.add("download")
+    PROXY_CHECK_CACHE.update(ts=time.time(), bad=bad, hint=hint,
+                             summary=summary, recommend=recommend)
+    return {"ok": True, "items": items, "scope": proxy_scope(),
+            "hint": hint, "summary": summary, "recommend": recommend}
 
 
 # ── 隔离的「代理下载」守护进程 ─────────────────────────────────────

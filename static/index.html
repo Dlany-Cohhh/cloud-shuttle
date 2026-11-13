@@ -524,7 +524,7 @@
                         </button>
                         <button class="btn-icon" title="把这个文件转存到另一个账号（原生转存，不消耗下载配额）" @click="openXfer(curPath ? curPath + '/' + f.name : f.name, true)"><i class="ti ti-switch-horizontal"></i></button>
                         <button class="btn-sm" title="下载这个文件到 NAS" @click="startFileJob(f.name)"><i class="ti ti-download"></i></button>
-                        <button class="btn-icon" title="对比测速：直连 / 经 mihomo 代理各下载 5 秒（共约 10 秒，会真实下载文件并消耗云盘流量）" @click="cloudSpeedTest(f.name)"><i class="ti" :class="speedTesting===f.name ? 'ti-loader-2 animate-spin' : 'ti-gauge'"></i></button>
+                        <button class="btn-icon" title="对比测速：直连 / 经 代理各下载 5 秒（共约 10 秒，会真实下载文件并消耗云盘流量）" @click="cloudSpeedTest(f.name)"><i class="ti" :class="speedTesting===f.name ? 'ti-loader-2 animate-spin' : 'ti-gauge'"></i></button>
                         <!-- ti-link-share 在 Tabler 中不存在（无字形 → 空方块），必须用真实存在的图标类 -->
                         <button class="btn-icon" title="获取分享链接（自动尝试代理）" @click="cloudShare(f.name)"><i class="ti ti-link"></i></button>
                         <button v-if="f.archive" class="btn-icon" title="预览压缩包内容 / 云端解压（云端解压需 PikPak 会员）" @click="openUnzip(f.name)"><i class="ti ti-file-zip"></i></button>
@@ -1332,65 +1332,77 @@
               <!-- 代理与测速 -->
               <div class="card-p flex flex-col gap-4 p-5 fade-slide-in" style="animation-delay:120ms">
                 <div class="flex flex-wrap items-center gap-2 text-sm font-medium text-base-content/80">
-                  <i class="ti ti-shield-lock text-info"></i>代理下载 · 可自定义代理地址
+                  <i class="ti ti-shield-lock text-info"></i>代理与网络
                   <button class="btn-sm ml-auto" :disabled="proxyChecking" @click="testProxy()">
                     <i class="ti" :class="proxyChecking ? 'ti-loader-2 animate-spin' : 'ti-activity'"></i>{{proxyChecking ? '测试中…' : '测试连通性'}}
                   </button>
                 </div>
-                <div class="flex flex-wrap items-center gap-3">
-                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sDownloadProxy">下载任务走 mihomo 代理</label>
-                  <input id="sDownloadProxy" type="checkbox" class="toggle toggle-primary" :checked="form.downloadProxy" @change="toggleDownloadProxy($event.target.checked)">
-                  <span class="text-xs tabular-nums text-base-content/50">当前：新任务{{form.downloadProxy ? '走代理' : '走直连'}}</span>
+                <!-- v3.75：状态只说一次，一句话结论 + 可展开明细 -->
+                <div class="flex flex-wrap items-center gap-2 rounded-lg bg-base-content/5 px-4 py-2.5 text-xs">
+                  <span class="h-2 w-2 shrink-0 rounded-full" :class="proxyStateDot"></span>
+                  <span>{{proxyStateText}}</span>
+                  <button class="btn-sm ml-auto" @click="proxyDetailsOpen = !proxyDetailsOpen">{{proxyDetailsOpen ? '收起' : '查看三条路径'}}</button>
                 </div>
-                <div class="flex flex-wrap items-center gap-3">
-                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxy">分享链接优先走代理</label>
-                  <input id="sProxy" type="checkbox" class="toggle toggle-primary" :checked="form.proxy" @change="toggleProxy($event.target.checked)">
-                  <span class="text-xs tabular-nums text-base-content/50">当前：{{form.proxy ? '分享：代理优先（直连兜底）' : '分享：直连优先（代理兜底）'}}</span>
-                </div>
-                <div class="flex flex-wrap items-center gap-3">
-                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxyUrl">自定义代理地址</label>
-                  <input id="sProxyUrl" type="text" class="input input-sm input-bordered w-80 font-mono text-xs" v-model.trim="form.proxyUrl" placeholder="留空用部署默认值；可填 http://、socks5:// 或 off">
-                  <button class="btn-sm" :disabled="saving" @click="saveSettings()"><i class="ti ti-device-floppy"></i>保存</button>
-                  <span class="text-xs text-base-content/50">off / none / direct / disabled / no 均表示强制直连</span>
-                </div>
-                <!-- v3.74：把 PikPak 原生 API / 封面 CDN 从下载代理里独立出来 -->
-                <div class="flex flex-wrap items-center gap-3">
-                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sPkProxyMode">PikPak 请求 / 封面</label>
-                  <select id="sPkProxyMode" class="fld w-64" v-model="form.pkProxyMode" @change="saveSettings()">
-                    <option value="follow">跟随下载代理（旧行为）</option>
-                    <option value="direct">强制直连（大小统计最快）</option>
-                    <option value="proxy">强制走代理（直连被拦时）</option>
-                  </select>
-                  <span class="text-xs text-base-content/50">与上面两个开关相互独立</span>
-                </div>
-                <div class="rounded-xl border border-base-content/10 bg-base-content/5 px-4 py-3 text-xs">
-                  <div class="mb-1.5 font-medium text-base-content/70">当前生效 · 三条独立路径</div>
+                <div v-if="proxyDetailsOpen" class="rounded-xl border border-base-content/10 px-4 py-3 text-xs">
                   <div class="grid gap-1 sm:grid-cols-3">
-                    <div>下载任务：<b class="font-mono">{{(proxyScope && proxyScope.download) || effectiveProxyUrl || '读取中…'}}</b></div>
+                    <div>下载任务：<b class="font-mono">{{(proxyScope && proxyScope.download) || '读取中…'}}</b></div>
                     <div>PikPak API：<b class="font-mono">{{(proxyScope && proxyScope.pk) || '读取中…'}}</b></div>
                     <div>封面 CDN：<b class="font-mono">{{(proxyScope && proxyScope.thumb) || '读取中…'}}</b></div>
                   </div>
-                  <div v-if="form.pkProxyMode === 'direct'" class="mt-2 text-warning">
-                    注意：强制直连下没有「直连失败自动回代理」兜底；若网络拦截 PikPak，大小统计与封面会失败，请先用「测试连通性」确认。
+                  <div v-if="proxyScope && proxyScope.hint" class="mt-2 text-base-content/50">{{proxyScope.hint}}</div>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sDownloadProxy">下载任务走代理</label>
+                  <input id="sDownloadProxy" type="checkbox" class="toggle toggle-primary" :checked="form.downloadProxy" @change="toggleDownloadProxy($event.target.checked)">
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sPkProxyMode">云盘数据与封面</label>
+                  <select id="sPkProxyMode" class="fld w-64" v-model="form.pkProxyMode" @change="saveSettings()">
+                    <option value="follow">跟随下载代理（旧行为）</option>
+                    <option value="direct">直连（推荐，更快）</option>
+                    <option value="proxy">走代理（直连不通时）</option>
+                  </select>
+                </div>
+                <!-- v3.75：诊断改为一行结论，明细折叠、可关闭、可一键应用 -->
+                <div v-if="proxyCheck" class="rounded-xl border border-warning/30 bg-warning/8 px-4 py-3 text-xs">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="h-2 w-2 shrink-0 rounded-full" :class="proxyCheck.recommend ? 'bg-warning' : 'bg-success'"></span>
+                    <span class="min-w-0 flex-1">{{proxyCheck.summary || proxyCheck.hint}}</span>
+                    <button v-if="proxyCheck.recommend" class="btn-sm" :disabled="saving" @click="applyProxySuggestion()">改用{{proxyCheck.recommend === 'direct' ? '直连' : '代理'}}</button>
+                    <button class="btn-sm" @click="proxyCheckDetails = !proxyCheckDetails">{{proxyCheckDetails ? '收起明细' : '明细'}}</button>
+                    <button class="btn-sm" @click="proxyCheck = null">关闭</button>
+                  </div>
+                  <div v-if="proxyCheckDetails" class="mt-2 border-t border-base-content/10 pt-2">
+                    <div class="mb-1 text-base-content/50">{{proxyCheck.hint}}</div>
+                    <div v-for="r in (proxyCheck.items || [])" :key="r.name" class="flex flex-wrap items-center gap-2 py-0.5">
+                      <span :class="r.ok ? 'text-success' : 'text-error'">●</span>
+                      <span class="min-w-40">{{r.name}}</span>
+                      <span class="font-mono tabular-nums text-base-content/60">{{r.ms}} ms</span>
+                      <span class="text-base-content/50">{{r.detail}}</span>
+                    </div>
                   </div>
                 </div>
-                <div v-if="proxyCheck" class="rounded-xl border border-base-content/10 px-4 py-3 text-xs">
-                  <div class="mb-1.5 font-medium text-base-content/70">连通性测试 <span class="font-normal text-base-content/50">{{proxyCheck.hint}}</span></div>
-                  <div v-for="r in (proxyCheck.items || [])" :key="r.name" class="flex flex-wrap items-center gap-2 py-0.5">
-                    <span :class="r.ok ? 'text-success' : 'text-error'">●</span>
-                    <span class="min-w-40">{{r.name}}</span>
-                    <span class="font-mono tabular-nums text-base-content/60">{{r.ms}} ms</span>
-                    <span class="text-base-content/50">{{r.detail}}</span>
-                  </div>
-                  <div v-if="!(proxyCheck.items || []).length" class="text-error">{{proxyCheck.hint}}</div>
-                </div>
+                <!-- v3.75：低频项与原理全部收进进阶 -->
                 <details class="text-xs leading-relaxed text-base-content/50">
-                  <summary class="cursor-pointer text-base-content/70">详细说明（影响范围 / 注意事项）</summary>
-                  <div class="mt-2 space-y-1.5">
-                    <div><b>下载开关按任务生效</b>：切换只影响之后提交的任务；代理由独立 rclone 守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}）承担，不用改 compose、不中断直连任务。</div>
-                    <div><b>分享开关只影响「分享链接」</b>的尝试顺序，切换即自动保存。</div>
-                    <div><b>PikPak 请求 / 封面</b>控制大小统计、token 换发与封面 CDN，默认「跟随下载代理」保持旧行为；选「强制直连」可绕开慢代理加速大小统计，选「强制走代理」可在直连被拦时恢复。</div>
-                    <div>「云盘预览」文件行的仪表盘图标 = 直连 / 代理各下载 5 秒对比速度，固定两条路都跑，不受以上设置影响，会真实消耗下游流量。</div>
+                  <summary class="cursor-pointer text-base-content/70">› 进阶设置（代理地址 / 分享链接 / 说明）</summary>
+                  <div class="mt-3 space-y-3">
+                    <div class="flex flex-wrap items-center gap-3">
+                      <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxyUrl">自定义代理地址</label>
+                      <input id="sProxyUrl" type="text" class="input input-sm input-bordered w-80 font-mono text-xs" v-model.trim="form.proxyUrl" placeholder="http://… / socks5://…；留空用部署默认值">
+                      <button class="btn-sm" :disabled="saving" @click="saveSettings()"><i class="ti ti-device-floppy"></i>保存</button>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-3">
+                      <label class="w-44 shrink-0 text-sm text-base-content/70" for="sProxy">分享链接优先走代理</label>
+                      <input id="sProxy" type="checkbox" class="toggle toggle-primary" :checked="form.proxy" @change="toggleProxy($event.target.checked)">
+                      <span class="text-xs text-base-content/50">只影响分享链接的尝试顺序，切换即自动保存</span>
+                    </div>
+                    <div class="space-y-1.5">
+                      <div><b>下载开关按任务生效</b>：切换只影响之后提交的任务；代理由独立守护进程（127.0.0.1:{{state.proxyRcPort || 5573}}）承担，失败自动改走另一条，不用改 compose、不中断直连任务。</div>
+                      <div><b>云盘数据与封面</b>控制大小统计、token 换发与封面；默认跟随下载代理。直连更快，但直连被拦时没有自动回代理的兜底。</div>
+                      <div><b>不走代理</b>：地址填 <code class="rounded bg-base-300 px-1">off</code>（或 none / direct / disabled / no），或直接关闭下载开关。</div>
+                      <div>文件行的仪表盘图标会固定跑直连与代理各 5 秒对比速度，不受以上设置影响，会真实消耗下游流量。</div>
+                      <div>在他人的 NAS 上部署：见仓库内 <code class="rounded bg-base-300 px-1">docs/FOR-OTHERS.md</code>。</div>
+                    </div>
                   </div>
                 </details>
               </div>
@@ -1795,7 +1807,7 @@
 
           <label class="flex items-center gap-2 text-xs text-base-content/60">
             <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" v-model="xferForm.proxy" />
-            接口走 mihomo 代理（直连被 PikPak 拦时仍可用）
+            接口走 代理（直连被 PikPak 拦时仍可用）
           </label>
 
           <div v-if="xferErr" class="flex items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-xs text-error">
@@ -1846,7 +1858,7 @@
               <span v-else-if="detail.job.kind==='xfer'">{{detail.job.mode==='move' ? ('移动 · 转存成功后删除源' + (detail.job.single_file?'文件':'文件夹')) : ('复制 · 源' + (detail.job.single_file?'文件':'文件夹') + '保留')}}</span>
               <span v-else>{{detail.job.mode==='move'?'move · 下完删云端':'copy · 保留云端'}}</span>
               <span class="text-base-content/40">下载路径</span><span v-if="detail.job.method==='externalshare'">PikPak 服务端原生转存（不消耗下载配额）</span>
-              <span v-else>{{detail.job.proxy ? '经 mihomo 代理（独立守护进程 5573）' : '直连（主守护进程 5572）'}}</span>
+              <span v-else>{{detail.job.proxy ? '经 代理（独立守护进程 5573）' : '直连（主守护进程 5572）'}}</span>
               <span class="text-base-content/40">开始</span><span class="tabular-nums">{{detail.job.started}}</span>
             </div>
             <div v-if="detail.job.state==='running'">
