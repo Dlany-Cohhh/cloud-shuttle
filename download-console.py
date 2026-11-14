@@ -4192,17 +4192,21 @@ def local_rename_batch(rel, items):
                 pass
         return {"error": "准备改名失败，已回滚：%s" % mask_secret(str(e))[:150]}
 
-    ok = 0
+    ok, renamed = 0, []
     for (a, b), t in zip(clean, tmps):
         try:
             os.rename(os.path.join(folder, t), os.path.join(folder, b))
             ok += 1
+            renamed.append((os.path.join(folder, a), os.path.join(folder, b)))
         except OSError as e:
             try:
                 os.rename(os.path.join(folder, t), os.path.join(folder, a))
             except OSError:
                 pass
             failed.append({"name": a, "error": mask_secret(str(e))[:120]})
+    # v3.81 修订：本地改名要同步文件夹基线里的路径映射，否则「下载完毕」会掉标
+    if renamed:
+        folder_remap_paths(renamed)
     return {"ok": ok, "failed": failed}
 
 
@@ -4403,7 +4407,7 @@ def verify_local(rel):
     return out, "dir", p, truncated, ""
 
 
-def local_download_index(limit=VERIFY_MAX_FILES):
+def local_download_index(limit=VERIFY_MAX_FILES, with_paths=False):
     """云盘预览「已下载」判定索引：递归扫全部存储空间，返回 {(归一化文件名, 字节数)}。
 
     落盘位置不固定 —— 单文件可能是 /data/<文件名> 或 /data/<保存目录>/<文件名>，
@@ -4414,7 +4418,9 @@ def local_download_index(limit=VERIFY_MAX_FILES):
     v3.57 起逐个扫描自动识别的存储空间；文件量小（几十~几百），每次列目录
     实时扫一遍即可：不做缓存，下载一完成标签就出现。
     """
-    idx = set()
+    # with_paths=True 时值改成「第一个命中的绝对路径」，供文件夹基线记住
+    # 「云端文件落在 NAS 的哪个位置」；同名同大小有多份时保留扫描到的第一份。
+    idx = {} if with_paths else set()
     try:
         for r in local_roots():
             root = os.path.realpath(r)
@@ -4423,13 +4429,18 @@ def local_download_index(limit=VERIFY_MAX_FILES):
                 for fn in fnames:
                     if _junk_name(fn):
                         continue
+                    fp = os.path.join(cur, fn)
                     try:
-                        st = os.stat(os.path.join(cur, fn))
+                        st = os.stat(fp)
                         if not statmod.S_ISREG(st.st_mode):
                             continue
                     except OSError:
                         continue
-                    idx.add((_norm_key(fn), int(st.st_size)))
+                    k = (_norm_key(fn), int(st.st_size))
+                    if with_paths:
+                        idx.setdefault(k, fp)
+                    else:
+                        idx.add(k)
                     if len(idx) >= limit:
                         return idx
     except Exception:
@@ -4528,30 +4539,107 @@ def folder_cloud_files(remote, path, refresh=False):
 
 
 def folder_local_index():
-    """带 15 秒 TTL 的本地索引，避免 folderstatus 与 dirs 各扫一遍全卷。"""
+    """带 15 秒 TTL 的本地索引，返回 {(归一化文件名, 字节数): 绝对路径}。
+
+    v3.81 修订：值从「集合」改成「路径」，基线才能记住每个云端文件落在 NAS 哪里，
+    本地改名之后不再因为名字对不上而掉标。上限 30000 条，15 秒缓存抵消全卷扫描成本。
+    """
     global _FOLDER_LOCAL_IDX
     now = time.time()
     if _FOLDER_LOCAL_IDX[1] and now - _FOLDER_LOCAL_IDX[0] < 15:
         return _FOLDER_LOCAL_IDX[1]
-    # 判定整个文件夹要覆盖大库，索引上限比单文件校验放宽；TTF 缓存抵消扫描成本
-    idx = local_download_index(limit=30000)
-    _FOLDER_LOCAL_IDX = (now, idx)
-    return idx
+    paths = local_download_index(limit=30000, with_paths=True)
+    _FOLDER_LOCAL_IDX = (now, paths)
+    return paths
 
 
-def _folder_hits(sigs, idx):
-    """云端签名集合里有多少个能在本地索引里找到同名同大小的文件。"""
-    hit = 0
+def folder_match(sigs, paths, mapping=None):
+    """返回 (命中数, {云端签名: 本地绝对路径})。
+
+    优先用基线里记住的路径 + 大小判定（本地改名 / 移动时由 folder_remap_paths 同步
+    更新这条路径）；路径不存在或大小变了才回退到「同名 + 同大小」全局索引。
+    """
+    mapping = mapping if isinstance(mapping, dict) else {}
+    hit, out = 0, {}
     for sig in sigs:
         rel, _, sz = sig.rpartition("|")
-        name = _norm_key(rel.rsplit("/", 1)[-1])
         try:
             size = int(sz)
         except ValueError:
             continue
-        if (name, size) in idx:
+        name = _norm_key(rel.rsplit("/", 1)[-1])
+        real = ""
+        p = mapping.get(sig)
+        if p:
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) == size:
+                    real = p
+            except OSError:
+                pass
+        if not real:
+            real = paths.get((name, size)) or ""
+        if real:
             hit += 1
-    return hit
+            out[sig] = real
+    return hit, out
+
+
+def folder_transfer_map(sigs, seen, mapping):
+    """云端改文件名时，把旧签名记住的本地路径转交给同大小的新签名。
+
+    不做这件事的话：云端一改名，新签名在 map 里查不到、按名字回退又对不上，
+    文件夹会凭空掉标。签名里的「大小」足够把一进一出的两项配对起来。
+    """
+    new_sigs, gone_sigs = sigs - seen, seen - sigs
+    if not new_sigs or not gone_sigs:
+        return mapping
+    pool = {}
+    for g in gone_sigs:
+        p = mapping.get(g)
+        if p:
+            pool.setdefault(g.rpartition("|")[2], []).append(p)
+    out = {k: v for k, v in mapping.items() if k not in gone_sigs}
+    for n in sorted(new_sigs):
+        cands = pool.get(n.rpartition("|")[2])
+        if cands:
+            out[n] = cands.pop(0)
+    return out
+
+
+def folder_remap_paths(pairs):
+    """本地文件改名 / 移动 / 删除后，同步 folder_state.json 里记住的路径。
+
+    pairs: [(旧绝对路径, 新绝对路径或 None)]。None = 删掉该条映射（文件确实不在了，
+    判定应正确掉标；之后从回收站恢复时靠全局索引自动重新命中并写回映射）。
+    用 realpath 做键，绕开 Windows / 软链接的路径写法差异。
+    """
+    lut = {}
+    for old, new in (pairs or []):
+        if not old:
+            continue
+        lut[os.path.realpath(old)] = os.path.realpath(new) if new else None
+    if not lut:
+        return
+    with FOLDER_STATE_LOCK:
+        folders = load_folder_state()
+        changed = False
+        for rec in folders.values():
+            if not isinstance(rec, dict) or not isinstance(rec.get("map"), dict):
+                continue
+            nm, touched = {}, False
+            for sig, p in rec["map"].items():
+                rp = os.path.realpath(p)
+                if rp in lut:
+                    touched = True
+                    if lut[rp]:
+                        nm[sig] = lut[rp]
+                else:
+                    nm[sig] = p
+            if touched:
+                rec["map"] = nm
+                changed = True
+        if changed:
+            save_folder_state(folders)
 
 
 def folder_one_status(remote, parent, d, refresh=False):
@@ -4563,18 +4651,39 @@ def folder_one_status(remote, parent, d, refresh=False):
     if err or not sigs:
         # 扫描失败或空文件夹：不显示任何标识，也不建立基线（避免误判）
         return {"state": "", "total": cnt, "added": 0, "hit": 0, "error": err}
-    hit = _folder_hits(sigs, folder_local_index())
-    complete = hit >= len(sigs)
+    paths = folder_local_index()
     with FOLDER_STATE_LOCK:
         folders = load_folder_state()
         rec = folders.get(key)
-        if not rec and complete:
-            rec = {"seen": sorted(sigs), "ts": int(time.time())}
-            folders[key] = rec
-            save_folder_state(folders)
+        mapping = rec.get("map") if isinstance(rec, dict) and isinstance(rec.get("map"), dict) else {}
         seen = set(rec.get("seen") or []) if isinstance(rec, dict) else set()
-        added = len(sigs - seen) if rec else 0
-    state = "updated" if (rec and added) else ("done" if (rec and complete) else "")
+        new_sigs, gone_sigs = sigs - seen, seen - sigs
+        # 「净增」才算有新文件加入：云端改文件名（一进一出）净增 0，不误报「有更新」。
+        # 顺带把旧签名的本地路径转交给新签名，否则云端改名会让文件夹凭空掉标。
+        added = max(0, len(new_sigs) - len(gone_sigs)) if rec else 0
+        if rec and added == 0 and new_sigs and gone_sigs:
+            mapping = folder_transfer_map(sigs, seen, mapping)
+        hit, curmap = folder_match(sigs, paths, mapping)
+        complete = hit >= len(sigs)
+        if not rec:
+            if complete:
+                rec = {"seen": sorted(sigs), "ts": int(time.time()), "map": curmap}
+                folders[key] = rec
+                save_folder_state(folders)
+        else:
+            nr = dict(rec)
+            touched = False
+            if added == 0 and (new_sigs or gone_sigs):
+                nr["seen"] = sorted(sigs)     # 吸收改名 / 删除，避免下次重复计算
+                touched = True
+            if complete and (curmap != mapping or nr.get("map") != curmap):
+                nr["map"] = curmap
+                touched = True
+            if touched:
+                folders[key] = nr
+                save_folder_state(folders)
+            rec = nr
+        state = "updated" if (rec and added) else ("done" if (rec and complete) else "")
     return {"state": state, "total": len(sigs), "added": added,
             "hit": hit, "complete": complete}
 
@@ -4626,9 +4735,12 @@ def folder_ack(remote, parent, names):
             if err or not sigs:
                 out[name] = {"state": "", "error": err or "文件夹是空的或不可读"}
                 continue
+            prev = folders.get(key) if isinstance(folders.get(key), dict) else {}
+            prev_map = prev.get("map") if isinstance(prev.get("map"), dict) else {}
+            # 沿用已有的路径映射：本地改过名也能正确判定「确认后仍是下载完毕」
+            hit, curmap = folder_match(sigs, folder_local_index(), prev_map)
             folders[key] = {"seen": sorted(sigs), "ts": int(time.time()),
-                            "ack": int(time.time())}
-            hit = _folder_hits(sigs, folder_local_index())
+                            "ack": int(time.time()), "map": curmap}
             out[name] = {"state": "done" if hit >= len(sigs) else "",
                          "total": len(sigs), "added": 0, "complete": hit >= len(sigs)}
         save_folder_state(folders)
@@ -4759,7 +4871,7 @@ def local_move_batch(path, items, dest):
         return {"error": str(e)}
     if os.path.realpath(src_parent) == os.path.realpath(dst_parent):
         return {"error": "目标目录和当前目录相同"}
-    results, ok = [], 0
+    results, ok, moved = [], 0, []
     batch = items[:MOVE_MAX_ITEMS]
     for n in batch:
         name = _crud_name(n)
@@ -4786,9 +4898,12 @@ def local_move_batch(path, items, dest):
         try:
             shutil.move(src, dst)
             ok += 1
+            moved.append((src, dst))
             _move_result(results, name)
         except Exception as e:
             _move_result(results, name, mask_secret(str(e))[:120])
+    if moved:
+        folder_remap_paths(moved)
     return {"ok": ok, "total": len(batch), "results": results}
 
 
@@ -4889,7 +5004,7 @@ def local_trash_batch(path, items):
         return {"error": str(e)}
     root = _local_volume_root(parent)
     trash_root = os.path.join(root, LOCAL_TRASH_DIRNAME)
-    results, ok = [], 0
+    results, ok, trashed = [], 0, []
     batch = items[:MOVE_MAX_ITEMS]
     with LOCAL_TRASH_LOCK:
         manifest = _read_json(LOCAL_TRASH_FILE, {})
@@ -4927,11 +5042,16 @@ def local_trash_batch(path, items):
                                  "isdir": os.path.isdir(dst)}
                 ok += 1
                 changed = True
+                trashed.append((src, None))
                 _move_result(results, name)
             except Exception as e:
                 _move_result(results, name, mask_secret(str(e))[:120])
         if changed:
             _write_json(LOCAL_TRASH_FILE, manifest, quiet=True)
+    # 文件确实不在原位了 → 删掉基线映射，让「下载完毕」正确掉标；
+    # 从回收站恢复后靠全局索引自动重新命中，映射会再次写回。
+    if trashed:
+        folder_remap_paths(trashed)
     return {"ok": ok, "total": len(batch), "results": results}
 
 

@@ -166,6 +166,8 @@ grep -n 'action ==' download-console.py
 | `localtrashrestore` / `localtrashpurge` | `ids` 或 `all` | `ok` / `total` / `results[]` |
 
 `state` 的三态：`""` = 不显示任何标识；`done` = 全部下载完毕；`updated` = 完毕后云端有新文件
-（需用户点徽标确认才消失）。判定口径为「云端文件夹内文件逐项在 NAS 上找同名同大小」，
-详见 [CHANGELOG.md](../CHANGELOG.md) v3.81 一节。
+（需用户点徽标确认才消失）。判定口径是「云端文件夹内文件逐项在 NAS 上找同名同大小」，
+但打标时会把 `{云端签名: 本地绝对路径}` 记进基线 `map`，之后优先按路径判定 ——
+所以本地改名 / 移动不会掉标，只有文件真的不在了才掉标；云端改名按「净增」计算，
+不会误报「有更新」。详见 [CHANGELOG.md](../CHANGELOG.md) v3.81 一节。
 
