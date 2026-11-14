@@ -1635,11 +1635,16 @@ def _pk_sign(dev, ts):
 
 
 def _pk_http(url, body=None, headers=None, method="GET", timeout=45, proxy=True):
-    """先走 mihomo，失败再直连（两个方向都可能被 PikPak 拦，互为兜底）。"""
+    """先走 mihomo，失败再直连（两个方向都可能被 PikPak 拦，互为兜底）。
+
+    v3.81：proxy 除 True/False 外还接受一个具体的代理地址字符串，只在本次请求生效，
+    用于「分享解析单独走代理、下载仍直连」的双路尝试。显式指定地址时失败**不**
+    静默回落直连 —— 否则调用方会误以为代理试过了，其实又走了直连。
+    """
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     handlers = []
-    p = pk_proxy_url() if proxy else ""
+    p = proxy if isinstance(proxy, str) else (pk_proxy_url() if proxy else "")
     if p:
         handlers.append(urllib.request.ProxyHandler({"http": p, "https": p}))
     else:
@@ -1650,7 +1655,7 @@ def _pk_http(url, body=None, headers=None, method="GET", timeout=45, proxy=True)
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "ignore")
     except Exception as e:
-        if proxy:
+        if proxy is True:
             return _pk_http(url, body, headers, method, timeout, proxy=False)
         return 0, str(e)
 
@@ -1733,12 +1738,12 @@ def _pk_session(name, action):
     return ent
 
 
-def pk_api(name, method, path, body=None, _retry=True, _timeout=45):
+def pk_api(name, method, path, body=None, _retry=True, _timeout=45, _proxy=True):
     action = "%s:%s" % (method, path.split("?")[0])
     s = _pk_session(name, action)
     h = {"Content-Type": "application/json", "Authorization": "Bearer " + s["at"],
          "x-device-id": s["dev"], "x-captcha-token": s["cap"], "User-Agent": PK_UA}
-    code, raw = _pk_http(PK_API + path, body, h, method, timeout=_timeout)
+    code, raw = _pk_http(PK_API + path, body, h, method, timeout=_timeout, proxy=_proxy)
     try:
         d = json.loads(raw)
     except Exception:
@@ -1746,7 +1751,7 @@ def pk_api(name, method, path, body=None, _retry=True, _timeout=45):
     if _retry and isinstance(d, dict) and d.get("error") in ("captcha_invalid", "captcha_expired"):
         with PK_LOCK:
             PK_CACHE.pop((name, action), None)
-        return pk_api(name, method, path, body, _retry=False)
+        return pk_api(name, method, path, body, _retry=False, _timeout=_timeout, _proxy=_proxy)
     return code, d
 
 
@@ -1927,29 +1932,60 @@ def _share_payload(d):
     return d or {}
 
 
-def pk_share_info(name, sid, pcode):
-    """GET /drive/v1/share：拿 pass_code_token 与分享元信息（只读）。"""
+_SHARE_STATUS_HINT = {
+    "EXPIRED": "分享已过期，请让分享者重新生成链接",
+    "DELETED": "分享里的文件已被删除",
+    "NOT_FOUND": "PikPak 找不到这个分享（链接 ID 可能有误，或分享已被彻底移除）",
+    "PROHIBITED": "PikPak 拒绝当前网络出口访问：多为出口 IP 所在地区受限。"
+                  "请在「设置 → 代理」里填一个可用代理地址（无需切换全局模式，"
+                  "下载仍走直连），解析会自动改走代理重试；也可用手机流量打开链接对照",
+}
+
+
+def _share_fail(st, text="", via=""):
+    """按 share_status 分类给可操作的提示，并带上服务端返回的官方说明。"""
+    st = str(st or "").strip() or "UNKNOWN"
+    hint = _SHARE_STATUS_HINT.get(st.upper(), "PikPak 返回了未识别的分享状态")
+    bits = ["分享不可用（%s）：%s" % (st[:60], hint)]
+    if text:
+        bits.append("服务端说明：" + str(text)[:120])
+    if via:
+        bits.append("本次请求走：" + via)
+    return "；".join(bits)
+
+
+def pk_share_info(name, sid, pcode, proxy=True, via=""):
+    """GET /drive/v1/share：拿 pass_code_token 与分享元信息（只读）。
+
+    v3.81：proxy 可传具体地址字符串，供 shareparse 做「直连 → 代理」双路尝试；
+    via 只用于把实际走的路径写进错误提示，避免用户以为代理生效了其实没有。
+    """
     code, d = pk_api(name, "GET", "/drive/v1/share?share_id=%s&pass_code=%s"
-                     % (urllib.parse.quote(sid), urllib.parse.quote(pcode or "")))
+                     % (urllib.parse.quote(sid), urllib.parse.quote(pcode or "")),
+                     _proxy=proxy)
     if code >= 400:
         raise RuntimeError(_pk_err(code, d))
     x = _share_payload(d)
     st = str(x.get("share_status") or "")
+    s_text = str(x.get("share_status_text") or "")
     if st and st != "OK":
-        raise RuntimeError("分享不可用（%s）：链接可能已过期、被删除或提取次数用尽" % st[:60])
+        raise RuntimeError(_share_fail(st, s_text, via))
     tok = str(x.get("pass_code_token") or "")
     if not tok:
-        raise RuntimeError("需要提取码，或提取码不正确（请在上方填写后重新解析）")
+        raise RuntimeError("需要提取码，或提取码不正确（请在上方填写后重新解析）"
+                           + ("；服务端说明：" + s_text[:120] if s_text else "")
+                           + ("；本次请求走：" + via if via else ""))
     return {"shareId": sid, "passCode": pcode, "passCodeToken": tok,
             "title": str(x.get("title") or x.get("share_title") or x.get("name") or "")[:120],
-            "shareStatus": st,
+            "shareStatus": st, "shareStatusText": s_text, "via": via,
             "shareUser": str((x.get("share_user") or {}).get("nickname")
                              if isinstance(x.get("share_user"), dict)
                              else (x.get("share_user_name") or x.get("nickname") or ""))[:60]}
 
 
-def pk_share_detail(name, sid, token, parent_id="", page_token="", limit=200):
-    """GET /drive/v1/share/detail：列分享内某一层（只读，可翻页/进子目录）。"""
+def pk_share_detail(name, sid, token, parent_id="", page_token="", limit=200, proxy=True):
+    """GET /drive/v1/share/detail：列分享内某一层（只读，可翻页/进子目录）。
+    必须与 pk_share_info 用同一条网络路径，否则换出口后 token 可能不通用。"""
     q = ("/drive/v1/share/detail?share_id=%s&pass_code_token=%s&limit=%d"
          "&thumbnail_size=SIZE_MEDIUM&order=3&folders_first=true"
          % (urllib.parse.quote(sid), urllib.parse.quote(token), limit))
@@ -1957,7 +1993,7 @@ def pk_share_detail(name, sid, token, parent_id="", page_token="", limit=200):
         q += "&parent_id=" + urllib.parse.quote(parent_id)
     if page_token:
         q += "&page_token=" + urllib.parse.quote(page_token)
-    code, d = pk_api(name, "GET", q)
+    code, d = pk_api(name, "GET", q, _proxy=proxy)
     if code >= 400:
         raise RuntimeError(_pk_err(code, d))
     x = _share_payload(d)
@@ -5983,17 +6019,41 @@ def api(action, body):
         if not name:
             return {"error": "请选择用于查看分享的账号"}
         tok = str(body.get("passCodeToken") or "").strip()
-        try:
-            info = pk_share_info(name, sid, pcode) if not tok else {
-                "shareId": sid, "passCode": pcode, "passCodeToken": tok,
-                "title": str(body.get("title") or "")[:120], "shareStatus": "OK", "shareUser": ""}
-            items, nxt = pk_share_detail(name, sid, info["passCodeToken"],
-                                         str(body.get("parentId") or ""),
-                                         str(body.get("pageToken") or ""))
-        except Exception as e:
-            return {"error": str(e)[:200]}
-        return {"ok": True, "info": info, "items": items,
-                "nextPageToken": nxt, "parentId": str(body.get("parentId") or "")}
+        # v3.81：双路尝试。第一路跟随全局网络模式（通常直连）；若 PikPak 因出口地区
+        # 返回 PROHIBITED / NOT_FOUND，且设置里「预置」了代理地址，就只让分享解析
+        # 改走这个地址重试 —— 下载、云盘数据、封面都保持直连，不被慢代理拖累。
+        # proxyUrl 本来就是「可预置、可不启用」的字段，这里复用它，无需新增设置项。
+        current = proxy_url()
+        preset = (str(load_settings().get("proxyUrl") or "").strip()
+                  or str(os.environ.get("PROXY_URL") or "").strip())
+        if preset.lower() in PROXY_OFF_WORDS or not PROXY_URL_RE.match(preset):
+            preset = ""
+        routes = [(True, "跟随全局（%s）" % ("代理" if current else "直连"))]
+        if preset and preset != current:
+            routes.append((preset, "分享专用代理 " + preset))
+        last, tried = "", []
+        for px, via in routes:
+            tried.append(via)
+            try:
+                info = pk_share_info(name, sid, pcode, proxy=px, via=via) if not tok else {
+                    "shareId": sid, "passCode": pcode, "passCodeToken": tok,
+                    "title": str(body.get("title") or "")[:120], "shareStatus": "OK",
+                    "shareStatusText": "", "shareUser": "", "via": via}
+                items, nxt = pk_share_detail(name, sid, info["passCodeToken"],
+                                             str(body.get("parentId") or ""),
+                                             str(body.get("pageToken") or ""),
+                                             proxy=px)
+                return {"ok": True, "info": info, "items": items,
+                        "nextPageToken": nxt, "parentId": str(body.get("parentId") or ""),
+                        "tried": tried}
+            except Exception as e:
+                last = str(e)[:300]
+                # 只有「换出口可能有救」的状态才重试；提取码 / 凭证错误重试无意义
+                if not any(k in last for k in ("PROHIBITED", "NOT_FOUND")):
+                    break
+        if len(tried) > 1:
+            last += "；已尝试 %d 条路径：%s" % (len(tried), " → ".join(tried))
+        return {"error": last, "tried": tried}
 
     if action == "sharesave":
         name = str(body.get("remote") or "").strip()
