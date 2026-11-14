@@ -102,6 +102,12 @@ mihomo（7890）却完全没被启用，分享请求一直裸直连出去。
 - `_pk_http()` 的 `proxy` 现在可接受具体地址字符串；显式指定地址时失败**不再静默回落
   直连**（以前会让人误以为代理试过了，其实又走了直连），并把 `via` 写进结果与错误提示。
 - `pk_share_info` / `pk_share_detail` 用同一条网络路径，避免换出口后 token 不通用。
+- **再修订**：对齐 alist / pikpakcli 的 `getSharePassToken()`，给 `GET /drive/v1/share`
+  补上 `thumbnail_size=SIZE_MEDIUM&limit=100`。此前只传 `share_id` / `pass_code`，
+  服务端会回一份不带 `pass_code_token` 的精简响应，界面上就表现成「需要提取码」；
+  同时在这个分支带出服务端状态与响应字段名，便于分辨「真的要提取码」还是「接口没给 token」。
+  另据公开资料，PikPak 对 IDC / 机房 IP 段有封禁，`PROHIBITED` 常需要**住宅出口**代理，
+  机房节点即使挂在 HK/JP/SG 也可能仍被拒。
 
 ### 口径与已知边界
 

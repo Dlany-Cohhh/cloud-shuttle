@@ -1960,9 +1960,11 @@ def pk_share_info(name, sid, pcode, proxy=True, via=""):
     v3.81：proxy 可传具体地址字符串，供 shareparse 做「直连 → 代理」双路尝试；
     via 只用于把实际走的路径写进错误提示，避免用户以为代理生效了其实没有。
     """
-    code, d = pk_api(name, "GET", "/drive/v1/share?share_id=%s&pass_code=%s"
-                     % (urllib.parse.quote(sid), urllib.parse.quote(pcode or "")),
-                     _proxy=proxy)
+    # 对齐 alist / pikpakcli 的 getSharePassToken：这两个参数不是可选的装饰，
+    # 缺了它们 PikPak 会回一份不带 pass_code_token 的精简响应（表现为「需要提取码」）。
+    q = ("/drive/v1/share?share_id=%s&pass_code=%s&thumbnail_size=SIZE_MEDIUM&limit=100"
+         % (urllib.parse.quote(sid), urllib.parse.quote(pcode or "")))
+    code, d = pk_api(name, "GET", q, _proxy=proxy)
     if code >= 400:
         raise RuntimeError(_pk_err(code, d))
     x = _share_payload(d)
@@ -1972,8 +1974,12 @@ def pk_share_info(name, sid, pcode, proxy=True, via=""):
         raise RuntimeError(_share_fail(st, s_text, via))
     tok = str(x.get("pass_code_token") or "")
     if not tok:
+        # 带上服务端状态与响应字段名，便于区分「真的要提取码」与「接口没给 token」
+        keys = ",".join(sorted(x.keys())[:14]) if isinstance(x, dict) else ""
         raise RuntimeError("需要提取码，或提取码不正确（请在上方填写后重新解析）"
+                           + ("；服务端状态：" + (st or "空"))
                            + ("；服务端说明：" + s_text[:120] if s_text else "")
+                           + ("；响应字段：" + keys[:160] if keys else "")
                            + ("；本次请求走：" + via if via else ""))
     return {"shareId": sid, "passCode": pcode, "passCodeToken": tok,
             "title": str(x.get("title") or x.get("share_title") or x.get("name") or "")[:120],
