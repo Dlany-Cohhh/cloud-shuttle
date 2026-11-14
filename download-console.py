@@ -1968,6 +1968,22 @@ def _share_payload(d):
     return d or {}
 
 
+def _share_raw_error(d, stage, via=""):
+    """非 JSON 响应统一在这里拦住：取 token 与列文件两个阶段都不能把它当空结果。
+
+    v3.81 真机发现：列文件阶段若拿到 TLS 中断的 _raw，旧代码会静默返回空列表，
+    界面显示「解析成功」却没有任何可勾选的文件 —— 比直接报错更迷惑人。
+    """
+    if not (isinstance(d, dict) and d.get("_raw")):
+        return ""
+    raw_txt = mask_secret(str(d["_raw"])).replace("\n", " ").replace("\r", " ")
+    hint = ("；这条路径已自动重试仍失败，稍等几秒再点一次「解析链接」，"
+            "若持续出现请切换代理节点" if "自动重试" in raw_txt else "")
+    return ("PikPak 返回了非 JSON 响应（代理链路可能被拦截、出口被重置或节点异常）："
+            + raw_txt[:160] + ("；本次请求走：" + via if via else "")
+            + "；发生在" + stage + hint)
+
+
 _SHARE_STATUS_HINT = {
     "EXPIRED": "分享已过期，请让分享者重新生成链接",
     "DELETED": "分享里的文件已被删除",
@@ -2003,15 +2019,12 @@ def pk_share_info(name, sid, pcode, proxy=True, via=""):
     code, d = pk_api(name, "GET", q, _proxy=proxy)
     if code >= 400:
         raise RuntimeError(_pk_err(code, d))
-    x = _share_payload(d)
     # 响应不是 JSON 时 pk_api 会把原文塞进 _raw。以前会一路走到「需要提取码」，
     # 把代理链路的问题伪装成提取码问题 —— 必须在这里就拦住并说清楚。
-    if isinstance(x, dict) and x.get("_raw"):
-        raw_txt = mask_secret(str(x["_raw"])).replace("\n", " ").replace("\r", " ")
-        hint = ("；这条路径已自动重试仍失败，稍等几秒再点一次「解析链接」，"
-                "若持续出现请切换代理节点" if "自动重试" in raw_txt else "")
-        raise RuntimeError("PikPak 返回了非 JSON 响应（代理链路可能被拦截、出口被重置或节点异常）："
-                           + raw_txt[:160] + ("；本次请求走：" + via if via else "") + hint)
+    raw_err = _share_raw_error(d, "读取分享信息", via)
+    if raw_err:
+        raise RuntimeError(raw_err)
+    x = _share_payload(d)
     st = str(x.get("share_status") or "")
     s_text = str(x.get("share_status_text") or "")
     if st and st != "OK":
@@ -2046,6 +2059,9 @@ def pk_share_detail(name, sid, token, parent_id="", page_token="", limit=200, pr
     code, d = pk_api(name, "GET", q, _proxy=proxy)
     if code >= 400:
         raise RuntimeError(_pk_err(code, d))
+    raw_err = _share_raw_error(d, "列出分享文件")
+    if raw_err:
+        raise RuntimeError(raw_err)
     x = _share_payload(d)
     out = []
     for f in (x.get("files") or []):
