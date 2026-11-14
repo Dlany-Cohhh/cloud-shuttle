@@ -43,6 +43,20 @@ Vue.createApp({
       proxyDetailsOpen: false,    // 兼容保留：v3.77 已不拆分路径
       proxyCheckDetails: false,   // v3.75 诊断明细折叠
       folderCovers: {},          // v3.74 无封面文件夹的异步补齐结果
+      /* v3.81：云端文件夹三态（"" 无标识 / done 下载完毕 / updated 有更新） */
+      folderStatus: {},
+      folderStatusBusy: false,
+      folderStatusPartial: false,
+      /* v3.81：云盘页 / 本地文件页共用的多选拖拽状态 */
+      dragScope: "",
+      dragNames: [],
+      dragOverKey: "",
+      crudBusy: false,
+      /* v3.81：本地回收站（与云端 trash* 分开，避免重名覆盖） */
+      lfTrashOpen: false,
+      lfTrashBusy: false,
+      lfTrashItems: [],
+      lfTrashPicked: [],
       /* v3.57 storages 由后端自动识别（不再写死磁盘总量），每项含 name/totalGB/freeGB/low */
       state: { diskLow: false, diskFree: null, diskTotal: null, storages: [] },
       bootVer: "",                // v3.58 页面加载时的后端版本，用于升级检测
@@ -597,6 +611,16 @@ Vue.createApp({
       return names.length > 0 && names.every(n => this.lfPicked.includes(n));
     },
     /* ---------- v3.50 本地批量改名：勾选范围从「仅压缩包」扩展到文件夹 + 所有文件 ---------- */
+    /* v3.81：当前目录下可移入的文件夹（另加「上一级」虚项，供下拉与拖拽共用） */
+    cloudMoveTargets() {
+      const up = this.curPath ? [{ key: "__up__", label: "↑ 上一级目录" }] : [];
+      return up.concat(this.dirFolders.map(d => ({ key: d.name, label: d.name })));
+    },
+    localMoveTargets() {
+      const up = this.lfParentPath() ? [{ key: "__up__", label: "↑ 上一级目录" }] : [];
+      return up.concat(this.lfViewDirs.filter(d => !d.volumeRoot)
+        .map(d => ({ key: d.name, label: d.name })));
+    },
     lfRenameNames() { return this.lfViewDirs.map(d => d.name).concat(this.lfViewFiles.map(f => f.name)); },
     lfPickedNames() {
       const set = new Set(this.lfRenameNames);
@@ -932,6 +956,13 @@ Vue.createApp({
                      trashlist: 90000, trashop: 120000,
                      unzipinfo: 90000, unzip: 120000, localunzip: 60000,
                      playinfo: 60000,
+                     /* v3.81：状态判定后端有 12 秒预算；批量移动/删除按最坏情况放宽 */
+                     folderstatus: 30000, folderack: 30000,
+                     cloudmkdir: 60000, localmkdir: 30000,
+                     cloudmove: 180000, localmove: 120000,
+                     cloudrmbatch: 180000, localtrash: 120000,
+                     localtrashlist: 30000, localtrashrestore: 120000,
+                     localtrashpurge: 120000,
                      updatecheck: 30000, updateapply: 240000,
                      updatestate: 15000, updaterollback: 60000 };
       const ms = timeoutMs || LONG[action] || 30000;
@@ -1389,6 +1420,8 @@ Vue.createApp({
       this.picked = [];
       this.cleanupPicked = [];
       this.folderCovers = {};                          // v3.74 换目录清空异步封面
+      this.folderStatus = {};                          // v3.81 换目录清空文件夹状态，避免串目录
+      this.folderStatusPartial = false;
       this.dirsLoading = true;
       this.dirsError = "";
       /* 连点两下目录（或切账号后旧请求才回来）时，晚到的响应会把新目录的内容
@@ -1407,6 +1440,7 @@ Vue.createApp({
              超出的仍会在勾选时按需统计）。结果缓存 5 分钟，重复进入不重复请求。 */
           this.statDirSizes((this.dirs || []).filter(x => x.isdir).map(x => x.name), { limit: 40 });
           this.fetchCovers();                              // v3.74 无封面文件夹异步补齐
+          this.fetchFolderStatus();                        // v3.81 文件夹下载状态异步补齐
         }
       } catch (e) {
         if (seq !== this._dirsSeq) return;
@@ -3214,6 +3248,197 @@ Vue.createApp({
         this.lfError = "读取失败：" + e.message;
       } finally {
         if (seq === this._lfSeq) this.lfLoading = false;
+      }
+    },
+    /* ══════════ v3.81：文件夹三态 + 多选拖拽 CRUD ══════════ */
+    /* 下载状态是异步增强：不阻塞 dirs，切目录时丢弃过期响应 */
+    async fetchFolderStatus(refresh) {
+      if (!this.curRemote) return;
+      const folders = (this.dirFolders || []).map(d => ({ name: d.name, id: d.id || "" }));
+      if (!folders.length) { this.folderStatus = {}; return; }
+      const seq = this._dirsSeq;
+      this.folderStatusBusy = true;
+      try {
+        const d = await this.api("folderstatus", {
+          remote: this.curRemote, path: this.curPath, folders, refresh: !!refresh
+        }, 30000);
+        if (seq !== this._dirsSeq) return;
+        if (d.error) { this.folderStatus = {}; return; }
+        this.folderStatus = d.status || {};
+        this.folderStatusPartial = !!d.partial;
+      } catch (e) { /* 增强功能失败不打扰主流程 */ }
+      finally { if (seq === this._dirsSeq) this.folderStatusBusy = false; }
+    },
+    /* 点「有更新」徽标 = 手动确认：基线推进到当前云端集合；已补齐则回到「下载完毕」，
+       没补齐就退回无标识，绝不会凭一次点击把没下的文件标成已下载 */
+    async ackFolder(name) {
+      try {
+        const d = await this.api("folderack", {
+          remote: this.curRemote, path: this.curPath, names: [name]
+        }, 30000);
+        if (d.error) { this.toast(d.error, "error"); return; }
+        const st = (d.status || {})[name];
+        if (st && st.error) { this.toast(st.error, "error"); return; }
+        this.folderStatus = Object.assign({}, this.folderStatus, { [name]: st || { state: "" } });
+        this.toast(st && st.state === "done"
+          ? "已确认，这个文件夹仍是下载完毕"
+          : "已确认更新；新增文件下载完后会重新显示「下载完毕」", "ok");
+      } catch (e) { this.toast("确认失败：" + e.message, "error"); }
+    },
+    folderBadge(name) { return this.folderStatus[name] || { state: "" }; },
+
+    /* 拖拽：拖已勾选整组里的任意一条 → 带上整组；否则只拖这一条 */
+    dragKey(scope, name) { return scope + ":" + name; },
+    onDragStart(scope, ev, name) {
+      const sel = scope === "cloud" ? this.picked : this.lfPicked;
+      const names = (sel.length > 1 && sel.indexOf(name) >= 0) ? sel.slice() : [name];
+      this.dragScope = scope;
+      this.dragNames = names;
+      this.dragOverKey = "";
+      try {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", JSON.stringify({ scope, names }));
+      } catch (e) { /* 旧浏览器不支持 dataTransfer，内存状态仍可用 */ }
+    },
+    onDragEnd() { this.dragScope = ""; this.dragNames = []; this.dragOverKey = ""; },
+    onDragOver(scope, ev, name) {
+      if (this.dragScope !== scope) return;
+      if (this.dragNames.length === 1 && this.dragNames[0] === name) return;
+      ev.preventDefault();
+      try { ev.dataTransfer.dropEffect = "move"; } catch (e) { /* 忽略 */ }
+      this.dragOverKey = this.dragKey(scope, name);
+    },
+    onDragLeave(scope, name) {
+      if (this.dragOverKey === this.dragKey(scope, name)) this.dragOverKey = "";
+    },
+    async onDrop(scope, ev, name) {
+      ev.preventDefault();
+      const names = this.dragNames.filter(n => n !== name);
+      this.onDragEnd();
+      if (!names.length) return;
+      await this.moveMany(scope, names, name);
+    },
+    lfParentPath() {
+      if (this.volumeNameOf(this.lfPath)) return "";
+      const p = this.lfPath.split("/").filter(Boolean);
+      p.pop();
+      return p.length ? "/" + p.join("/") : "";
+    },
+    lfJoin(name) {
+      return (this.lfPath ? this.lfPath.replace(/\/$/, "") + "/" : "") + name;
+    },
+    async moveMany(scope, names, dest) {
+      if (this.crudBusy || !names.length) return;
+      const isCloud = scope === "cloud";
+      const label = dest === "__up__" ? "上一级目录" : "「" + dest + "」";
+      if (!window.confirm("把选中的 " + names.length + " 项移动到" + label + "？")) return;
+      let destPath;
+      if (isCloud) {
+        destPath = dest === "__up__"
+          ? (this.pathSegs.length > 1 ? this.pathSegs.slice(0, -1).join("/") : "")
+          : (this.curPath ? this.curPath + "/" + dest : dest);
+      } else {
+        destPath = dest === "__up__" ? this.lfParentPath() : this.lfJoin(dest);
+      }
+      if (!isCloud && !destPath) {
+        this.toast("顶层是存储空间列表，请先在下方选一个目标文件夹", "warn");
+        return;
+      }
+      this.crudBusy = true;
+      try {
+        const d = isCloud
+          ? await this.api("cloudmove", { remote: this.curRemote, path: this.curPath,
+                                          items: names, dest: destPath }, 180000)
+          : await this.api("localmove", { path: this.lfPath, items: names,
+                                          dest: destPath }, 120000);
+        if (d.error) { this.toast(d.error, "error"); return; }
+        const bad = (d.results || []).filter(x => !x.ok);
+        if (d.ok) this.toast("已移动 " + d.ok + " 项到" + label, "ok");
+        if (bad.length) this.toast(bad.length + " 项未移动：" + (bad[0].error || "未知原因"), "warn");
+        this.picked = []; this.lfPicked = [];
+      } catch (e) { this.toast("移动失败：" + e.message, "error"); }
+      finally {
+        this.crudBusy = false;
+        if (isCloud) this.loadDirs(this.curPath); else this.loadLocalFiles(this.lfPath);
+      }
+    },
+    moveSelected(scope, dest) {
+      const names = (scope === "cloud" ? this.picked : this.lfPicked).slice();
+      if (!names.length) { this.toast("先勾选要移动的条目", "warn"); return; }
+      if (!dest) return;
+      this.moveMany(scope, names, dest);
+    },
+    async mkDir(scope) {
+      const n = window.prompt(scope === "cloud" ? "新建云端文件夹" : "新建本地文件夹（NAS 上真实创建）");
+      if (n == null) return;
+      const name = String(n).trim();
+      if (!name) return;
+      if (/[\\/]/.test(name)) { this.toast("名称不能包含路径分隔符", "error"); return; }
+      try {
+        const d = scope === "cloud"
+          ? await this.api("cloudmkdir", { remote: this.curRemote, path: this.curPath, name })
+          : await this.api("localmkdir", { path: this.lfPath, name });
+        if (d.error) { this.toast(d.error, "error"); return; }
+        this.toast("已新建文件夹：" + name, "ok");
+      } catch (e) { this.toast("新建失败：" + e.message, "error"); }
+      if (scope === "cloud") this.loadDirs(this.curPath); else this.loadLocalFiles(this.lfPath);
+    },
+    async deleteSelected(scope) {
+      const names = (scope === "cloud" ? this.picked : this.lfPicked).slice();
+      if (!names.length) { this.toast("先勾选要删除的条目", "warn"); return; }
+      const hint = scope === "cloud"
+        ? (this.trashSupported() ? "删除后进 PikPak 回收站，可在「回收站」里恢复或彻底删除。"
+                                 : "此操作不可恢复！")
+        : "删除后会移到 NAS 本地回收站，可在「本地回收站」里恢复；清空回收站才真正释放空间。";
+      if (!window.confirm("确认删除选中的 " + names.length + " 项？\n" + hint)) return;
+      this.crudBusy = true;
+      try {
+        const d = scope === "cloud"
+          ? await this.api("cloudrmbatch", { remote: this.curRemote, path: this.curPath,
+                                             items: names }, 180000)
+          : await this.api("localtrash", { path: this.lfPath, items: names }, 120000);
+        if (d.error) { this.toast(d.error, "error"); return; }
+        const bad = (d.results || []).filter(x => !x.ok);
+        if (d.ok) this.toast("已删除 " + d.ok + " 项" + (scope === "local" ? "（已进本地回收站）" : ""), "ok");
+        if (bad.length) this.toast(bad.length + " 项未删除：" + (bad[0].error || "未知原因"), "warn");
+        this.picked = []; this.lfPicked = [];
+      } catch (e) { this.toast("删除失败：" + e.message, "error"); }
+      finally {
+        this.crudBusy = false;
+        if (scope === "cloud") this.loadDirs(this.curPath); else this.loadLocalFiles(this.lfPath);
+      }
+    },
+    async openLfTrash() {
+      this.lfTrashOpen = true;
+      this.lfTrashBusy = true;
+      try {
+        const d = await this.api("localtrashlist", {});
+        if (d.error) { this.toast(d.error, "error"); return; }
+        this.lfTrashItems = d.items || [];
+        this.lfTrashPicked = [];
+      } catch (e) { this.toast("读取本地回收站失败：" + e.message, "error"); }
+      finally { this.lfTrashBusy = false; }
+    },
+    async lfTrashOp(op) {
+      const all = op === "purgeAll" || op === "restoreAll";
+      const ids = this.lfTrashPicked.slice();
+      if (!all && !ids.length) { this.toast("先勾选回收站条目", "warn"); return; }
+      if (op === "purge" || op === "purgeAll") {
+        if (!window.confirm("彻底删除这些回收站条目？此操作不可恢复，会真正释放磁盘空间。")) return;
+      }
+      this.lfTrashBusy = true;
+      const action = (op === "purge" || op === "purgeAll") ? "localtrashpurge" : "localtrashrestore";
+      try {
+        const d = await this.api(action, { ids, all }, 120000);
+        if (d.error) { this.toast(d.error, "error"); return; }
+        const bad = (d.results || []).filter(x => !x.ok);
+        if (d.ok) this.toast((op.indexOf("purge") === 0 ? "已彻底删除 " : "已恢复 ") + d.ok + " 项", "ok");
+        if (bad.length) this.toast(bad.length + " 项未处理：" + (bad[0].error || "未知原因"), "warn");
+      } catch (e) { this.toast("操作失败：" + e.message, "error"); }
+      finally {
+        this.lfTrashBusy = false;
+        await this.openLfTrash();
+        this.loadLocalFiles(this.lfPath);
       }
     },
     reloadNow() { location.reload(); },   // v3.58 升级提示横幅用

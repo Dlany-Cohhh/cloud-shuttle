@@ -25,7 +25,7 @@ curl -s -X POST http://<控制台地址>/api \
 | `renamebatch` | 云盘目录内批量重命名 |
 | `version` | 版本与运行状态 |
 
-## 全部 action（由源码自动提取，共 65 个）
+## 全部 action（由源码自动提取，共 80 个）
 
 - `about`
 - `accounts`
@@ -45,11 +45,17 @@ curl -s -X POST http://<控制台地址>/api \
 - `clearfinished`
 - `cleartransfers`
 - `cloudlink`
+- `cloudmkdir`
+- `cloudmove`
 - `cloudmv`
 - `cloudrm`
+- `cloudrmbatch`
 - `credcheck`
 - `dirs`
 - `dirsize`
+- `folderack`
+- `foldercovers`
+- `folderstatus`
 - `health`
 - `history`
 - `jobdetail`
@@ -57,11 +63,19 @@ curl -s -X POST http://<控制台地址>/api \
 - `jobs`
 - `localdirs`
 - `localfiles`
+- `localmkdir`
+- `localmove`
 - `localrenamebatch`
+- `localsize`
+- `localtrash`
+- `localtrashlist`
+- `localtrashpurge`
+- `localtrashrestore`
 - `localunzip`
 - `myshares`
 - `playinfo`
 - `providers`
+- `proxycheck`
 - `quota`
 - `remotes`
 - `remove`
@@ -137,3 +151,21 @@ grep -n 'action ==' download-console.py
 | `updaterollback` | 无 | `ok` / `message` |
 
 更新包的格式、校验规则与发版流程见 [UPDATE.md](UPDATE.md)。
+
+### 文件夹下载状态与 CRUD（v3.81+）
+
+| action | 参数 | 返回要点 |
+| --- | --- | --- |
+| `folderstatus` | `remote`, `path`, `folders`（`[{name,id}]`）, `refresh`（可选） | `status[name] = {state: ""|done|updated, added, total, hit, complete}`；`partial` 表示有文件夹没算完 |
+| `folderack` | `remote`, `path`, `names` | `status[name]` 为确认后的状态；只推进基线，不伪造下载状态 |
+| `cloudmkdir` / `localmkdir` | `path`（父目录）, `name`；云端另需 `remote` | `ok` / `error`；重名或名称非法直接拒绝 |
+| `cloudmove` / `localmove` | `path`（源父目录）, `items`（名称数组）, `dest`（目标目录完整路径）；云端另需 `remote` | `ok` / `total` / `results[]`（逐项 `name`/`ok`/`error`） |
+| `cloudrmbatch` | `remote`, `path`, `items`, `hard`（可选） | 批量删除，默认进 PikPak 回收站 |
+| `localtrash` | `path`, `items` | 移到 `.cloud-shuttle-trash`，可恢复 |
+| `localtrashlist` | 无 | `items[] = {id,name,from,ts,isdir,exists}` |
+| `localtrashrestore` / `localtrashpurge` | `ids` 或 `all` | `ok` / `total` / `results[]` |
+
+`state` 的三态：`""` = 不显示任何标识；`done` = 全部下载完毕；`updated` = 完毕后云端有新文件
+（需用户点徽标确认才消失）。判定口径为「云端文件夹内文件逐项在 NAS 上找同名同大小」，
+详见 [CHANGELOG.md](../CHANGELOG.md) v3.81 一节。
+

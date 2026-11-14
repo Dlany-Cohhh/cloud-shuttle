@@ -85,7 +85,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.80"
+APP_VERSION = "v3.81"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -4437,6 +4437,590 @@ def local_download_index(limit=VERIFY_MAX_FILES):
     return idx
 
 
+# ── v3.81：云端文件夹「下载完毕 / 有更新」三态 ───────────────────────────────
+# 需求：只有「整个文件夹都下完」才打标；打标之后云端再加入新文件，改显示「有更新」；
+#       其余情况一律不显示任何标识；「有更新」必须用户手动确认才消失。
+#
+# 判定口径（用户在 v3.81 明确选定）：本地文件逐项比对。递归列出该云端文件夹下的
+# 所有文件，逐个查 NAS 上是否有「同名 + 同大小」的文件，全部命中才算下载完毕。
+# 沿用 local_download_index() 的既有口径，手动拷进 NAS 的文件也算数。
+#
+# 关键设计：
+#   · 基线 seen = 最后一次「判定完毕」或「用户点确认」时的云端文件签名集合。
+#     added = 当前云端集合 - seen，added>0 即「有更新」，与本地是否已补齐无关。
+#     这样「已完毕 → 云端加新文件（本地还没下）」时标识不会闪一下就消失。
+#   · 点确认只推进 seen，不伪造「已下载」：补齐了显示「下载完毕」，没补齐就无标识。
+#   · 云端递归列目录较重，独立成 folderstatus 接口由前端异步请求，不拖慢 dirs；
+#     带 5 分钟内存缓存 + 单次最多 24 个文件夹 + 12 秒总预算 + 失败隔离。
+#   · 签名用「文件夹内相对路径|字节数」：删文件不误报，改名/新增会报（合理）。
+# ────────────────────────────────────────────────────────────────────────────
+FOLDER_STATE_FILE = os.path.join(DATA_DIR, "folder_state.json")
+FOLDER_STATE_LOCK = threading.Lock()
+FOLDER_SCAN_TIMEOUT = 20          # 单个文件夹递归列目录的硬超时（秒）
+FOLDER_SCAN_MAX = 1500            # 单文件夹文件数上限，超出不判定
+FOLDER_SCAN_DEPTH = 6
+FOLDER_STATUS_TTL = 300           # 云端扫描结果缓存（秒）
+FOLDER_STATUS_MAX_DIRS = 24       # 单次请求最多判定多少个文件夹
+FOLDER_STATUS_BUDGET = 12.0       # 单次请求总时间预算（秒）
+_FOLDER_SCANS = {}                # (remote, path) -> (ts, sigs, count, bytes, err)
+_FOLDER_LOCAL_IDX = (0.0, set())  # (ts, 本地索引)，15 秒内复用，避免重复扫全卷
+
+
+def _folder_key(remote, path):
+    """remote + 路径做 key 时用 JSON 数组编码，避免名字里含分隔符造成碰撞。"""
+    return json.dumps([str(remote or ""), _norm_key(path)],
+                      ensure_ascii=False, separators=(",", ":"))
+
+
+def load_folder_state():
+    d = _read_json(FOLDER_STATE_FILE, {})
+    return d.get("folders") if isinstance(d, dict) and isinstance(d.get("folders"), dict) else {}
+
+
+def save_folder_state(folders):
+    # 长期在几百个目录间浏览会不断累积基线，给状态文件一个上限，避免无限膨胀
+    if len(folders) > 400:
+        keep = sorted(folders.items(),
+                      key=lambda kv: -(kv[1].get("ts") or 0) if isinstance(kv[1], dict) else 0)
+        folders = dict(keep[:300])
+    _write_json(FOLDER_STATE_FILE, {"v": 1, "folders": folders}, quiet=True)
+
+
+def folder_cloud_files(remote, path, refresh=False):
+    """递归列云端文件夹，返回 (签名集合, 数量, 总字节, 错误)。"""
+    ck = (str(remote or ""), _norm_key(path))
+    hit = _FOLDER_SCANS.get(ck)
+    if not refresh and hit and time.time() - hit[0] < FOLDER_STATUS_TTL:
+        return hit[1], hit[2], hit[3], hit[4]
+    sigs, total, err = set(), 0, ""
+    try:
+        target = "%s:%s" % (remote, str(path or "").strip("/"))
+        p = _rclone_run(["lsjson", "--recursive", "--max-depth", str(FOLDER_SCAN_DEPTH),
+                         "--log-level", "ERROR", target], timeout=FOLDER_SCAN_TIMEOUT)
+        if p.returncode != 0:
+            err = (_decode(p.stderr).strip()[:120] or "列目录失败")
+        else:
+            rows = json.loads(_decode(p.stdout) or "[]")
+            if isinstance(rows, dict):
+                rows = [rows]
+            for e in rows:
+                if not isinstance(e, dict) or e.get("IsDir"):
+                    continue
+                rel = _norm_key(e.get("Path") or e.get("Name"))
+                if not rel:
+                    continue
+                size = int(e.get("Size") or 0)
+                sigs.add(rel + "|" + str(size))
+                total += size
+                if len(sigs) >= FOLDER_SCAN_MAX:
+                    err = "文件过多（≥%d），无法判定" % FOLDER_SCAN_MAX
+                    break
+    except subprocess.TimeoutExpired:
+        err = "列目录超时"
+    except Exception as e:
+        err = mask_secret(str(e))[:120]
+    _FOLDER_SCANS[ck] = (time.time(), sigs, len(sigs), total, err)
+    # 长期浏览大量目录会让缓存无上限增长，超过 500 条时丢掉最老的一半
+    if len(_FOLDER_SCANS) > 500:
+        for k in sorted(_FOLDER_SCANS, key=lambda k: _FOLDER_SCANS[k][0])[:250]:
+            _FOLDER_SCANS.pop(k, None)
+    return sigs, len(sigs), total, err
+
+
+def folder_local_index():
+    """带 15 秒 TTL 的本地索引，避免 folderstatus 与 dirs 各扫一遍全卷。"""
+    global _FOLDER_LOCAL_IDX
+    now = time.time()
+    if _FOLDER_LOCAL_IDX[1] and now - _FOLDER_LOCAL_IDX[0] < 15:
+        return _FOLDER_LOCAL_IDX[1]
+    # 判定整个文件夹要覆盖大库，索引上限比单文件校验放宽；TTF 缓存抵消扫描成本
+    idx = local_download_index(limit=30000)
+    _FOLDER_LOCAL_IDX = (now, idx)
+    return idx
+
+
+def _folder_hits(sigs, idx):
+    """云端签名集合里有多少个能在本地索引里找到同名同大小的文件。"""
+    hit = 0
+    for sig in sigs:
+        rel, _, sz = sig.rpartition("|")
+        name = _norm_key(rel.rsplit("/", 1)[-1])
+        try:
+            size = int(sz)
+        except ValueError:
+            continue
+        if (name, size) in idx:
+            hit += 1
+    return hit
+
+
+def folder_one_status(remote, parent, d, refresh=False):
+    """单个文件夹的三态判定。返回给前端的 dict 里 state 只有 ""/done/updated。"""
+    name = str(d.get("name") or "")
+    path = _cloud_join(parent, name)
+    key = _folder_key(remote, path)
+    sigs, cnt, byts, err = folder_cloud_files(remote, path, refresh=refresh)
+    if err or not sigs:
+        # 扫描失败或空文件夹：不显示任何标识，也不建立基线（避免误判）
+        return {"state": "", "total": cnt, "added": 0, "hit": 0, "error": err}
+    hit = _folder_hits(sigs, folder_local_index())
+    complete = hit >= len(sigs)
+    with FOLDER_STATE_LOCK:
+        folders = load_folder_state()
+        rec = folders.get(key)
+        if not rec and complete:
+            rec = {"seen": sorted(sigs), "ts": int(time.time())}
+            folders[key] = rec
+            save_folder_state(folders)
+        seen = set(rec.get("seen") or []) if isinstance(rec, dict) else set()
+        added = len(sigs - seen) if rec else 0
+    state = "updated" if (rec and added) else ("done" if (rec and complete) else "")
+    return {"state": state, "total": len(sigs), "added": added,
+            "hit": hit, "complete": complete}
+
+
+def folder_status_batch(remote, parent, items, refresh=False):
+    """并发判定当前目录下若干文件夹；总预算到点即返回已算完的部分。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if not isinstance(items, list):
+        return {"status": {}, "partial": False}
+    items = [x for x in items if isinstance(x, dict) and x.get("name")][:FOLDER_STATUS_MAX_DIRS]
+    if not items:
+        return {"status": {}, "partial": False}
+    status, done, t0 = {}, 0, time.time()
+    folder_local_index()      # 先预热一次，避免 3 个线程同时各扫一遍全卷
+    ex = ThreadPoolExecutor(max_workers=3)
+    futs = {ex.submit(folder_one_status, remote, parent, d, refresh): str(d["name"])
+            for d in items}
+    try:
+        for fut in as_completed(futs, timeout=FOLDER_STATUS_BUDGET):
+            nm = futs[fut]
+            try:
+                status[nm] = fut.result()
+            except Exception as e:
+                status[nm] = {"state": "", "total": 0, "added": 0,
+                              "hit": 0, "error": mask_secret(str(e))[:120]}
+            done += 1
+    except Exception:
+        # as_completed 超时：没算完的文件夹保持无标识，不影响其余结果
+        pass
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    partial = done < len(items)
+    return {"status": status, "partial": partial,
+            "elapsed": round(time.time() - t0, 2)}
+
+
+def folder_ack(remote, parent, names):
+    """手动确认「有更新」：把基线推进到当前云端集合，不伪造下载状态。"""
+    if not isinstance(names, list) or not names:
+        return {"error": "没有要确认的文件夹"}
+    names = [str(n) for n in names if str(n or "").strip()][:FOLDER_STATUS_MAX_DIRS]
+    with FOLDER_STATE_LOCK:
+        folders = load_folder_state()
+        out = {}
+        for name in names:
+            path = _cloud_join(parent, name)
+            key = _folder_key(remote, path)
+            sigs, cnt, byts, err = folder_cloud_files(remote, path, refresh=True)
+            if err or not sigs:
+                out[name] = {"state": "", "error": err or "文件夹是空的或不可读"}
+                continue
+            folders[key] = {"seen": sorted(sigs), "ts": int(time.time()),
+                            "ack": int(time.time())}
+            hit = _folder_hits(sigs, folder_local_index())
+            out[name] = {"state": "done" if hit >= len(sigs) else "",
+                         "total": len(sigs), "added": 0, "complete": hit >= len(sigs)}
+        save_folder_state(folders)
+    return {"ok": True, "status": out}
+
+
+# ── v3.81：云端 / 本地文件完整 CRUD ──────────────────────────────────────────
+# 已有的能力：cloudrm（单条删）、cloudmv / renamebatch（重命名）、localrenamebatch。
+# 本轮补齐：新建文件夹、批量移动（同账号 / 同卷）、批量删除、本地可恢复回收站。
+# 安全边界：
+#   · 所有本地路径都过 safe_local_path()（挡 ../ 与越界软链接）；名称过 _bad_entry_name
+#   · 移动前逐项预检源存在 / 目标无同名 / 不能把文件夹移进自己
+#   · 回收站固定在每个存储卷根的隐藏目录下；localfiles_listing 与 local_download_index
+#     都会跳过以 "." 开头的条目，所以回收站里的文件不会被误判成「已下载」
+#   · 彻底清空前校验条目路径确实落在回收站目录内，避免被篡改的 manifest 指向任意路径
+# ────────────────────────────────────────────────────────────────────────────
+LOCAL_TRASH_DIRNAME = ".cloud-shuttle-trash"
+LOCAL_TRASH_FILE = os.path.join(DATA_DIR, "local_trash.json")
+LOCAL_TRASH_LOCK = threading.Lock()
+MOVE_MAX_ITEMS = 200
+
+
+def _crud_name(n):
+    """单层名称校验；返回干净名字或空串。"""
+    s = str(n or "").strip()
+    if _bad_entry_name(s) or s == LOCAL_TRASH_DIRNAME:
+        return ""
+    return s
+
+
+def _within_roots(p):
+    """realpath 后的路径是否落在任一存储卷内。"""
+    rp = os.path.realpath(p)
+    for r in local_roots():
+        rr = os.path.realpath(r)
+        if rp == rr or rp.startswith(rr + os.sep):
+            return True
+    return False
+
+
+def _local_parent(path):
+    """目录路径 → 绝对路径。顶层（""）是虚拟的存储空间列表，不允许作为操作目标。"""
+    if not str(path or "").strip("/"):
+        raise ValueError("请先进入一个目录再操作")
+    p = safe_local_path(path)
+    if not os.path.isdir(p):
+        raise ValueError("目录不存在或已被移动")
+    return p
+
+
+def _local_volume_root(p):
+    """找出 p 所属的存储卷根（realpath）。"""
+    rp = os.path.realpath(p)
+    for r in local_roots():
+        rr = os.path.realpath(r)
+        if rp == rr or rp.startswith(rr + os.sep):
+            return rr
+    return os.path.realpath(primary_root())
+
+
+def _resolve_local_name(parent, name):
+    """前端传来的名字可能是替换后的 U+FFFD（非法 UTF-8 文件名），反查磁盘真实条目名。
+    这样编码异常的文件也能被移动 / 删除 / 进回收站，不必先改名。"""
+    if os.path.lexists(os.path.join(parent, name)):
+        return name
+    try:
+        for raw in os.listdir(parent):
+            conv, _bad = _fs_name(raw)
+            if conv == name:
+                return raw
+    except OSError:
+        pass
+    return None
+
+
+def local_mkdir(path, name):
+    name = _crud_name(name)
+    if not name:
+        return {"error": "名称不合法（不能为空、含路径分隔符、超过 180 字或使用保留名）"}
+    try:
+        parent = _local_parent(path)
+    except ValueError as e:
+        return {"error": str(e)}
+    if os.path.lexists(os.path.join(parent, name)) or _resolve_local_name(parent, name):
+        return {"error": "已存在同名文件或文件夹"}
+    try:
+        os.mkdir(os.path.join(parent, name))
+    except OSError as e:
+        return {"error": "创建失败：" + mask_secret(str(e))[:120]}
+    return {"ok": True, "name": name}
+
+
+def cloud_mkdir(remote, parent, name):
+    name = _crud_name(name)
+    if not name:
+        return {"error": "名称不合法（不能为空、含路径分隔符、超过 180 字或使用保留名）"}
+    if not remote:
+        return {"error": "缺少参数：remote"}
+    lst, err = cloud_list(remote, parent)
+    if err:
+        return {"error": "读取云端目录失败：" + mask_secret(err)[:150]}
+    if any(str(e.get("Name") or "") == name for e in lst):
+        return {"error": "云端已存在同名文件或文件夹"}
+    path = _cloud_join(parent, name)
+    # 用 CLI `rclone mkdir`（与 cloudmove 的 moveto 同一条通道），不依赖 rc
+    # operations/mkdir 的参数细节；rclone mkdir 对已存在目录是幂等的，上面已先查重名。
+    try:
+        code, out, e2 = rclone_cli(["mkdir", remote + ":" + path, "--log-level", "ERROR"],
+                                   timeout=60)
+        if code != 0:
+            raise RuntimeError((e2 or out or "创建失败")[:150])
+    except Exception as e:
+        return {"error": mask_secret(str(e))[:150]}
+    return {"ok": True, "name": name, "path": path}
+
+
+def _move_result(results, name, err=None):
+    results.append({"name": name, "ok": not bool(err), **({"error": err} if err else {})})
+
+
+def local_move_batch(path, items, dest):
+    if not isinstance(items, list) or not items:
+        return {"error": "没有要移动的条目"}
+    try:
+        src_parent = _local_parent(path)
+        dst_parent = _local_parent(dest)
+    except ValueError as e:
+        return {"error": str(e)}
+    if os.path.realpath(src_parent) == os.path.realpath(dst_parent):
+        return {"error": "目标目录和当前目录相同"}
+    results, ok = [], 0
+    batch = items[:MOVE_MAX_ITEMS]
+    for n in batch:
+        name = _crud_name(n)
+        if not name:
+            _move_result(results, str(n), "名称不合法")
+            continue
+        real = _resolve_local_name(src_parent, name)
+        if real is None:
+            _move_result(results, name, "源不存在")
+            continue
+        src = os.path.join(src_parent, real)
+        dst = os.path.join(dst_parent, name)
+        if os.path.lexists(dst):
+            _move_result(results, name, "目标目录已有同名条目")
+            continue
+        if os.path.islink(src) and not _within_roots(src):
+            _move_result(results, name, "软链接指向卷外，禁止移动")
+            continue
+        if os.path.isdir(src):
+            rsrc, rdst = os.path.realpath(src), os.path.realpath(dst_parent)
+            if rsrc == rdst or rdst.startswith(rsrc + os.sep):
+                _move_result(results, name, "不能把文件夹移进自己")
+                continue
+        try:
+            shutil.move(src, dst)
+            ok += 1
+            _move_result(results, name)
+        except Exception as e:
+            _move_result(results, name, mask_secret(str(e))[:120])
+    return {"ok": ok, "total": len(batch), "results": results}
+
+
+def cloud_move_batch(remote, parent, items, dest):
+    if not remote:
+        return {"error": "缺少参数：remote"}
+    if not isinstance(items, list) or not items:
+        return {"error": "没有要移动的条目"}
+    d = _norm_key(dest)
+    if d == _norm_key(parent):
+        return {"error": "目标目录和当前目录相同"}
+    lst, err = cloud_list(remote, d)
+    if err:
+        return {"error": "目标目录不可读：" + mask_secret(err)[:150]}
+    exists = {str(e.get("Name") or "") for e in lst}
+    results, ok = [], 0
+    batch = items[:MOVE_MAX_ITEMS]
+    for n in batch:
+        name = _crud_name(n)
+        if not name:
+            _move_result(results, str(n), "名称不合法")
+            continue
+        src = _cloud_join(parent, name)
+        nsrc = _norm_key(src)
+        if d and (d == nsrc or d.startswith(nsrc + "/")):
+            _move_result(results, name, "不能把文件夹移进自己")
+            continue
+        if name in exists:
+            _move_result(results, name, "目标目录已有同名条目")
+            continue
+        dstp = _cloud_join(d, name)
+        try:
+            code, out, e2 = rclone_cli(
+                ["moveto", remote + ":" + src, remote + ":" + dstp, "--log-level", "ERROR"],
+                timeout=90)
+            if code != 0:
+                raise RuntimeError(mask_secret((e2 or out or "移动失败")[:150]))
+            exists.add(name)
+            ok += 1
+            _move_result(results, name)
+        except Exception as e:
+            _move_result(results, name, mask_secret(str(e))[:150])
+    return {"ok": ok, "total": len(batch), "results": results}
+
+
+def cloud_rm_batch(remote, parent, items, hard=False):
+    if not remote:
+        return {"error": "缺少参数：remote"}
+    if not isinstance(items, list) or not items:
+        return {"error": "没有要删除的条目"}
+    lst, err = cloud_list(remote, parent)
+    if err:
+        return {"error": "读取云端目录失败：" + mask_secret(err)[:150]}
+    kind = {str(e.get("Name") or ""): bool(e.get("IsDir")) for e in lst}
+    results, ok = [], 0
+    batch = items[:MOVE_MAX_ITEMS]
+    for n in batch:
+        name = _crud_name(n)
+        if not name or name not in kind:
+            _move_result(results, str(n), "名称不合法或云端已无此条目")
+            continue
+        path = _cloud_join(parent, name)
+        try:
+            if hard:
+                r = cloud_hard_delete(remote, path, not kind[name])
+                if isinstance(r, dict) and r.get("error"):
+                    raise RuntimeError(str(r["error"]))
+            elif kind[name]:
+                rc("operations/purge", _strict=True, fs=remote + ":", remote=path)
+            else:
+                rc("operations/deletefile", _strict=True, fs=remote + ":", remote=path)
+            ok += 1
+            _move_result(results, name)
+        except Exception as e:
+            _move_result(results, name, mask_secret(str(e))[:150])
+    return {"ok": ok, "total": len(batch), "results": results}
+
+
+def _trash_slot_ok(rec):
+    """校验 manifest 条目确实落在某个卷根的回收站目录里（防止被篡改后误删任意路径）。"""
+    try:
+        root = os.path.realpath(str(rec.get("root") or ""))
+        if not root or not _within_roots(root):
+            return False
+        tr = os.path.realpath(os.path.join(root, LOCAL_TRASH_DIRNAME))
+        slot = os.path.dirname(os.path.realpath(str(rec.get("stored") or "")))
+        return slot.startswith(tr + os.sep)
+    except Exception:
+        return False
+
+
+def local_trash_batch(path, items):
+    if not isinstance(items, list) or not items:
+        return {"error": "没有要删除的条目"}
+    try:
+        parent = _local_parent(path)
+    except ValueError as e:
+        return {"error": str(e)}
+    root = _local_volume_root(parent)
+    trash_root = os.path.join(root, LOCAL_TRASH_DIRNAME)
+    results, ok = [], 0
+    batch = items[:MOVE_MAX_ITEMS]
+    with LOCAL_TRASH_LOCK:
+        manifest = _read_json(LOCAL_TRASH_FILE, {})
+        if not isinstance(manifest, dict):
+            manifest = {}
+        changed = False
+        for n in batch:
+            name = _crud_name(n)
+            if not name:
+                _move_result(results, str(n), "名称不合法")
+                continue
+            real = _resolve_local_name(parent, name)
+            if real is None:
+                _move_result(results, name, "源不存在")
+                continue
+            # 回收站索引是 JSON：真实名若含孤立代理字符（Windows 拷入的 GBK 名）
+            # 会让 _write_json 抛 UnicodeEncodeError —— 文件已移走、索引却写不进去，
+            # 等于条目「消失」。这类文件先用铅笔重命名再删除。
+            if _fs_name(real)[1]:
+                _move_result(results, name, "文件名编码异常，请先用铅笔重命名后再删除")
+                continue
+            src = os.path.join(parent, real)
+            if os.path.realpath(src) == root:
+                _move_result(results, name, "不能删除存储空间根目录")
+                continue
+            try:
+                os.makedirs(trash_root, exist_ok=True)
+                bid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+                slot = os.path.join(trash_root, bid)
+                os.makedirs(slot, exist_ok=True)
+                dst = os.path.join(slot, real)
+                shutil.move(src, dst)
+                manifest[bid] = {"id": bid, "name": name, "from": parent, "root": root,
+                                 "stored": dst, "ts": int(time.time()),
+                                 "isdir": os.path.isdir(dst)}
+                ok += 1
+                changed = True
+                _move_result(results, name)
+            except Exception as e:
+                _move_result(results, name, mask_secret(str(e))[:120])
+        if changed:
+            _write_json(LOCAL_TRASH_FILE, manifest, quiet=True)
+    return {"ok": ok, "total": len(batch), "results": results}
+
+
+def local_trash_list():
+    m = _read_json(LOCAL_TRASH_FILE, {})
+    items = []
+    for bid, rec in (m.items() if isinstance(m, dict) else []):
+        if not isinstance(rec, dict) or not _trash_slot_ok(rec):
+            continue
+        items.append({"id": str(bid), "name": str(rec.get("name") or ""),
+                      "from": str(rec.get("from") or ""),
+                      "ts": int(rec.get("ts") or 0),
+                      "isdir": bool(rec.get("isdir")),
+                      "exists": os.path.lexists(str(rec.get("stored") or ""))})
+    items.sort(key=lambda x: -x["ts"])
+    return {"items": items, "total": len(items)}
+
+
+def _trash_targets(ids, all_items):
+    m = _read_json(LOCAL_TRASH_FILE, {})
+    if not isinstance(m, dict):
+        return {}, []
+    if all_items:
+        keys = [k for k, v in m.items() if isinstance(v, dict) and _trash_slot_ok(v)]
+    else:
+        keys = [str(i) for i in (ids or []) if str(i) in m
+                and isinstance(m[str(i)], dict) and _trash_slot_ok(m[str(i)])]
+    return m, keys
+
+
+def local_trash_restore(ids, all_items=False):
+    with LOCAL_TRASH_LOCK:
+        m, keys = _trash_targets(ids, all_items)
+        results, ok = [], 0
+        for bid in keys:
+            rec = m[bid]
+            stored = str(rec.get("stored") or "")
+            origin = str(rec.get("from") or "")
+            if not os.path.lexists(stored):
+                _move_result(results, rec.get("name"), "回收站里已无此条目")
+                continue
+            if not _within_roots(origin):
+                _move_result(results, rec.get("name"), "原位置不在存储空间内，已跳过")
+                continue
+            dst = os.path.join(origin, os.path.basename(stored))
+            if os.path.lexists(dst):
+                _move_result(results, rec.get("name"), "原位置已有同名条目，请先移走")
+                continue
+            try:
+                os.makedirs(origin, exist_ok=True)
+                shutil.move(stored, dst)
+                try:
+                    os.rmdir(os.path.dirname(stored))
+                except OSError:
+                    pass
+                del m[bid]
+                ok += 1
+                _move_result(results, rec.get("name"))
+            except Exception as e:
+                _move_result(results, rec.get("name"), mask_secret(str(e))[:120])
+        _write_json(LOCAL_TRASH_FILE, m, quiet=True)
+    return {"ok": ok, "total": len(keys), "results": results}
+
+
+def local_trash_purge(ids, all_items=False):
+    with LOCAL_TRASH_LOCK:
+        m, keys = _trash_targets(ids, all_items)
+        results, ok = [], 0
+        for bid in keys:
+            rec = m[bid]
+            stored = str(rec.get("stored") or "")
+            try:
+                if os.path.isdir(stored) and not os.path.islink(stored):
+                    shutil.rmtree(stored)
+                elif os.path.lexists(stored):
+                    os.remove(stored)
+                try:
+                    os.rmdir(os.path.dirname(stored))
+                except OSError:
+                    pass
+                del m[bid]
+                ok += 1
+                _move_result(results, rec.get("name"))
+            except Exception as e:
+                _move_result(results, rec.get("name"), mask_secret(str(e))[:120])
+        _write_json(LOCAL_TRASH_FILE, m, quiet=True)
+    return {"ok": ok, "total": len(keys), "results": results}
+
+
 def _cloud_file_target(cloud_target, cloud_scope, rel):
     if cloud_scope == "file":
         return cloud_target
@@ -6540,6 +7124,57 @@ def api(action, body):
         # 一致性校验：云盘 ↔ 落盘目录/单文件。只读，不改任何数据。
         return verify_compare(body.get("remote"), body.get("cloudPath"),
                               body.get("localPath"), body.get("mode"), body.get("limit"))
+
+    # ── v3.81：云端文件夹「下载完毕 / 有更新」 ─────────────────────────────
+    if action == "folderstatus":
+        remote = str(body.get("remote") or "").strip()
+        if not remote:
+            return {"error": "缺少参数：remote"}
+        return folder_status_batch(remote, str(body.get("path") or "").strip("/"),
+                                   body.get("folders"), bool(body.get("refresh")))
+
+    if action == "folderack":
+        remote = str(body.get("remote") or "").strip()
+        if not remote:
+            return {"error": "缺少参数：remote"}
+        return folder_ack(remote, str(body.get("path") or "").strip("/"),
+                          body.get("names"))
+
+    # ── v3.81：云端 / 本地文件完整 CRUD ───────────────────────────────────
+    if action == "cloudmkdir":
+        return cloud_mkdir(str(body.get("remote") or "").strip(),
+                           str(body.get("path") or "").strip("/"),
+                           body.get("name"))
+
+    if action == "cloudmove":
+        return cloud_move_batch(str(body.get("remote") or "").strip(),
+                                str(body.get("path") or "").strip("/"),
+                                body.get("items"),
+                                str(body.get("dest") or "").strip("/"))
+
+    if action == "cloudrmbatch":
+        return cloud_rm_batch(str(body.get("remote") or "").strip(),
+                              str(body.get("path") or "").strip("/"),
+                              body.get("items"), bool(body.get("hard")))
+
+    if action == "localmkdir":
+        return local_mkdir(str(body.get("path") or ""), body.get("name"))
+
+    if action == "localmove":
+        return local_move_batch(str(body.get("path") or ""), body.get("items"),
+                                str(body.get("dest") or ""))
+
+    if action == "localtrash":
+        return local_trash_batch(str(body.get("path") or ""), body.get("items"))
+
+    if action == "localtrashlist":
+        return local_trash_list()
+
+    if action == "localtrashrestore":
+        return local_trash_restore(body.get("ids"), bool(body.get("all")))
+
+    if action == "localtrashpurge":
+        return local_trash_purge(body.get("ids"), bool(body.get("all")))
 
     if action == "localfiles":
         # 本地文件页：只读列目录（文件本体走 /media/ 的 Range 流）

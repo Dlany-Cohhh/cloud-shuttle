@@ -438,6 +438,26 @@
                   </button>
                 </div>
 
+                <!-- v3.81：多选 CRUD 工具条（新建 / 移动 / 删除），两种视图共用 -->
+                <div v-if="!cleanupMode" class="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-base-content/10 bg-base-content/5 px-2.5 py-2 text-xs">
+                  <span class="shrink-0 font-semibold text-base-content/60">已选 {{picked.length}} 项</span>
+                  <button class="btn-sm" :disabled="crudBusy" title="在当前云端目录下新建一个文件夹" @click="mkDir('cloud')"><i class="ti ti-folder-plus"></i>新建文件夹</button>
+                  <select class="fld w-36" :disabled="!picked.length || crudBusy"
+                          title="把勾选的条目移动到当前目录下的文件夹，或上一级目录"
+                          @change="moveSelected('cloud', $event.target.value); $event.target.value=''">
+                    <option value="">移动到…</option>
+                    <option v-for="t in cloudMoveTargets" :key="t.key" :value="t.key">{{t.label}}</option>
+                  </select>
+                  <button class="btn-sm" :disabled="!picked.length || crudBusy" @click="deleteSelected('cloud')"><i class="ti ti-trash"></i>删除选中</button>
+                  <button v-if="picked.length" class="btn-sm" @click="picked=[]">取消选择</button>
+                  <span class="ml-auto flex items-center gap-1 text-base-content/45">
+                    <i v-if="folderStatusBusy" class="ti ti-loader-2 animate-spin"></i>
+                    <span v-if="folderStatusPartial">部分文件夹未判定完</span>
+                    <span v-else>勾选多项后拖到文件夹，或用「移动到…」</span>
+                    <button class="btn-icon always" title="重新判定本目录文件夹的下载状态" @click="fetchFolderStatus(true)"><i class="ti ti-refresh"></i></button>
+                  </span>
+                </div>
+
                 <!-- 测速进度 / 结果：常驻显示，不再只靠 3.2 秒就消失的 toast -->
                 <div v-if="speedTesting || speedResult"
                      class="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-base-content/10 bg-base-content/5 px-3 py-2 text-xs">
@@ -474,16 +494,36 @@
                 <!-- 目录行：列表视图（v3.40 之前唯一形态，保持零改动） -->
                 <div v-else-if="viewMode==='list'" class="flex flex-col gap-0.5">
                   <button v-if="curPath" class="flex items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-base-content/70 transition-colors hover:bg-base-content/8 hover:text-base-content"
+                          :class="dragOverKey===dragKey('cloud','__up__') ? 'bg-primary/15 ring-1 ring-primary/50' : ''"
+                          @dragover="onDragOver('cloud', $event, '__up__')" @dragleave="onDragLeave('cloud','__up__')"
+                          @drop.prevent="onDrop('cloud', $event, '__up__')"
                           @click="loadDirs(pathSegs.length > 1 ? pathSegs.slice(0,-1).join('/') : '')">
                     <i class="ti ti-arrow-back-up text-base"></i>返回上一级<span v-if="pathSegs.length <= 1" class="text-xs text-base-content/40">（根目录）</span>
+                    <span v-if="dragOverKey===dragKey('cloud','__up__')" class="text-xs text-primary">松手移入上一级</span>
                   </button>
                   <!-- 文件夹 -->
-                  <div v-for="d in dirFolders" :key="'d-'+d.name" class="group flex items-center gap-3 rounded-lg px-3 py-2 transition-colors hover:bg-base-content/8">
+                  <div v-for="d in dirFolders" :key="'d-'+d.name"
+                       draggable="true"
+                       @dragstart="onDragStart('cloud', $event, d.name)" @dragend="onDragEnd"
+                       @dragover="onDragOver('cloud', $event, d.name)" @dragleave="onDragLeave('cloud', d.name)"
+                       @drop.prevent="onDrop('cloud', $event, d.name)"
+                       class="group flex items-center gap-3 rounded-lg px-3 py-2 transition-colors hover:bg-base-content/8"
+                       :class="dragOverKey===dragKey('cloud',d.name) ? 'bg-primary/15 ring-1 ring-primary/50' : ''">
                     <input v-if="!cleanupMode" type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="d.name" v-model="picked">
                     <input v-else type="checkbox" class="checkbox checkbox-sm checkbox-error" :value="d.name" v-model="cleanupPicked">
                     <button class="flex min-w-0 flex-1 items-center gap-2.5 text-left" @click="loadDirs(curPath ? curPath + '/' + d.name : d.name)">
                       <i class="ti ti-folder text-base leading-none text-base-content/40 transition-transform duration-200 ease-[var(--ease-spring)] group-hover:scale-110"></i>
                       <span class="truncate text-sm" :title="hideNames ? '' : d.name">{{hideNames ? '••••••••' : d.name}}</span>
+                      <!-- v3.81 三态：只有整个文件夹都下完才打标；未下完不显示任何标识 -->
+                      <span v-if="folderBadge(d.name).state==='done'" class="badge-pill b-done shrink-0"
+                            title="这个文件夹里的云端文件都已下载到 NAS（同名且大小一致）"><i class="ti ti-check"></i>下载完毕</span>
+                      <span v-else-if="folderBadge(d.name).state==='updated'" role="button" tabindex="0"
+                            class="badge-pill shrink-0 cursor-pointer bg-warning/20 text-warning hover:bg-warning/30"
+                            :title="'下载完毕之后云端又新增了 ' + (folderBadge(d.name).added||0) + ' 个文件；点一下确认，确认后标识消失'"
+                            @click.stop="ackFolder(d.name)" @keydown.enter.stop="ackFolder(d.name)">
+                        <i class="ti ti-sparkles"></i>有更新 {{folderBadge(d.name).added}}
+                      </span>
+                      <span v-if="dragOverKey===dragKey('cloud',d.name)" class="shrink-0 text-[11px] text-primary">松手移入</span>
                     </button>
                     <!-- v3.73 文件夹大小：进目录自动统计，占位显示「统计中…」，失败自动重试一次 -->
                     <span class="shrink-0 text-xs tabular-nums text-base-content/50"
@@ -503,7 +543,9 @@
                       <span>文件 · 测速 / 重命名 / 删除</span>
                       <span class="ml-auto font-normal normal-case tracking-normal tabular-nums">{{dirFiles.length}} 个<span v-if="downloadedCount"> · 已下载 {{downloadedCount}}</span></span>
                     </div>
-                    <div v-for="f in dirFiles" :key="'f-'+f.name" class="group flex items-center gap-3 rounded-lg px-3 py-2 transition-colors hover:bg-base-content/8">
+                    <div v-for="f in dirFiles" :key="'f-'+f.name" draggable="true"
+                         @dragstart="onDragStart('cloud', $event, f.name)" @dragend="onDragEnd"
+                         class="group flex items-center gap-3 rounded-lg px-3 py-2 transition-colors hover:bg-base-content/8">
                       <!-- 浏览模式也要能勾文件：早期版本这里只渲染文件图标，导致「下载选中」永远勾不到文件 -->
                       <input v-if="!cleanupMode" type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="f.name" v-model="picked">
                       <input v-else type="checkbox" class="checkbox checkbox-sm checkbox-error" :value="f.name" v-model="cleanupPicked">
@@ -546,7 +588,11 @@
                 <!-- 缩略图 / 网格视图（v3.40）：真实封面优先，失败回退文件类型大图标 -->
                 <div v-else class="flex flex-col gap-3">
                   <div class="flex flex-wrap items-center gap-2 px-1">
-                    <button v-if="curPath" class="btn-sm" @click="loadDirs(pathSegs.length > 1 ? pathSegs.slice(0,-1).join('/') : '')"><i class="ti ti-arrow-back-up"></i>返回上一级</button>
+                    <button v-if="curPath" class="btn-sm"
+                            :class="dragOverKey===dragKey('cloud','__up__') ? 'ring-2 ring-primary' : ''"
+                            @dragover="onDragOver('cloud', $event, '__up__')" @dragleave="onDragLeave('cloud','__up__')"
+                            @drop.prevent="onDrop('cloud', $event, '__up__')"
+                            @click="loadDirs(pathSegs.length > 1 ? pathSegs.slice(0,-1).join('/') : '')"><i class="ti ti-arrow-back-up"></i>返回上一级</button>
                     <label class="flex items-center gap-1.5 text-xs text-base-content/50">
                       <input type="checkbox" class="checkbox checkbox-xs" :class="cleanupMode ? 'checkbox-error' : 'checkbox-primary'"
                              :checked="allPicked" @change="toggleAll($event.target.checked)" title="全选 / 取消本页文件">
@@ -556,7 +602,13 @@
                   </div>
                   <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
                     <div v-for="it in gridItems" :key="(it.isdir?'gd-':'gf-')+it.name"
-                         class="group overflow-hidden rounded-xl border border-base-content/10 bg-base-100 transition-colors hover:border-primary/40">
+                         draggable="true"
+                         @dragstart="onDragStart('cloud', $event, it.name)" @dragend="onDragEnd"
+                         @dragover="it.isdir && onDragOver('cloud', $event, it.name)"
+                         @dragleave="it.isdir && onDragLeave('cloud', it.name)"
+                         @drop.prevent="it.isdir && onDrop('cloud', $event, it.name)"
+                         class="group overflow-hidden rounded-xl border border-base-content/10 bg-base-100 transition-colors hover:border-primary/40"
+                         :class="dragOverKey===dragKey('cloud',it.name) ? 'border-primary ring-2 ring-primary/60' : ''">
                       <div class="relative overflow-hidden bg-base-content/5" style="aspect-ratio:4/3"
                            :class="it.isdir ? 'cursor-pointer' : ''"
                            @click="it.isdir && loadDirs(fullPath(it.name))">
@@ -569,6 +621,15 @@
                         <input v-if="!cleanupMode" type="checkbox" class="checkbox checkbox-sm checkbox-primary absolute left-2 top-2 z-10" :value="it.name" v-model="picked" @click.stop>
                         <input v-else type="checkbox" class="checkbox checkbox-sm checkbox-error absolute left-2 top-2 z-10" :value="it.name" v-model="cleanupPicked" @click.stop>
                         <span v-if="it.downloaded" class="badge-pill b-done absolute right-2 top-2 z-10"><i class="ti ti-check"></i>已下载</span>
+                        <!-- v3.81 文件夹三态（网格视图同款），点「有更新」确认 -->
+                        <span v-if="it.isdir && folderBadge(it.name).state==='done'" class="badge-pill b-done absolute right-2 top-9 z-10"
+                              title="文件夹里的云端文件都已下载到 NAS"><i class="ti ti-check"></i>下载完毕</span>
+                        <span v-else-if="it.isdir && folderBadge(it.name).state==='updated'" role="button" tabindex="0"
+                              class="badge-pill absolute right-2 top-9 z-10 cursor-pointer bg-warning/25 text-warning"
+                              :title="'云端新增了 ' + (folderBadge(it.name).added||0) + ' 个文件；点一下确认'"
+                              @click.stop="ackFolder(it.name)" @keydown.enter.stop="ackFolder(it.name)">
+                          <i class="ti ti-sparkles"></i>有更新 {{folderBadge(it.name).added}}
+                        </span>
                         <span v-if="it.isdir" class="badge-pill absolute bottom-2 left-2 z-10 bg-base-content/10 text-base-content/65"><i class="ti ti-folder"></i>文件夹</span>
                       </div>
                       <div class="p-2.5">
@@ -834,13 +895,19 @@
                           :title="lfPickedArchives.length ? '把勾选的压缩包解到同目录下的同名文件夹' : '先在下方勾选压缩包'">
                     <i class="ti ti-file-zip"></i>解压选中（{{lfPickedArchives.length}}）
                   </button>
+                  <!-- v3.81 本地文件 CRUD 入口 -->
+                  <button class="btn-sm" @click="mkDir('local')" title="在 NAS 当前目录下真实创建一个文件夹"><i class="ti ti-folder-plus"></i>新建文件夹</button>
+                  <button class="btn-sm" @click="openLfTrash" title="查看 / 恢复 / 清空从本地文件页删除的条目"><i class="ti ti-recycle"></i>本地回收站</button>
                   <button class="btn-sm" @click="go('tasks')"><i class="ti ti-download"></i>下载任务</button>
                 </div>
               </div>
 
               <div class="card-p fade-slide-in flex flex-col gap-3 p-4" style="animation-delay:60ms">
                 <div class="flex flex-wrap items-center gap-2">
-                  <button class="btn-sm" :disabled="!lfPath" @click="lfUp" title="返回上一级"><i class="ti ti-arrow-left"></i>上一级</button>
+                  <button class="btn-sm" :disabled="!lfPath" @click="lfUp" title="返回上一级（也可把文件拖到这里移出当前目录）"
+                          :class="dragOverKey===dragKey('local','__up__') ? 'ring-2 ring-primary' : ''"
+                          @dragover="onDragOver('local', $event, '__up__')" @dragleave="onDragLeave('local','__up__')"
+                          @drop.prevent="onDrop('local', $event, '__up__')"><i class="ti ti-arrow-left"></i>上一级</button>
                   <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1 text-sm">
                     <template v-for="(c,i) in lfCrumbs" :key="'crumb-'+c.path">
                       <i v-if="i" class="ti ti-chevron-right text-xs text-base-content/40"></i>
@@ -867,6 +934,20 @@
                   </label>
                   <span class="text-xs tabular-nums text-base-content/50">{{lfDirs.length}} 个文件夹 · {{lfFiles.length}} 个文件 · {{fmt(lfTotalSize)}}</span>
                 </div>
+                <!-- v3.81：本地多选 CRUD（拖动 / 移动到 / 删除进回收站） -->
+                <div class="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-base-content/10 bg-base-content/5 px-2.5 py-2 text-xs">
+                  <span class="shrink-0 font-semibold text-base-content/60">已选 {{lfPicked.length}} 项</span>
+                  <select class="fld w-36" :disabled="!lfPicked.length || crudBusy"
+                          title="把勾选的条目移动到当前目录下的文件夹，或上一级目录"
+                          @change="moveSelected('local', $event.target.value); $event.target.value=''">
+                    <option value="">移动到…</option>
+                    <option v-for="t in localMoveTargets" :key="t.key" :value="t.key">{{t.label}}</option>
+                  </select>
+                  <button class="btn-sm" :disabled="!lfPicked.length || crudBusy"
+                          title="删除后进入 NAS 本地回收站，可恢复" @click="deleteSelected('local')"><i class="ti ti-trash"></i>删除选中</button>
+                  <button v-if="lfPicked.length" class="btn-sm" @click="lfPicked=[]">取消选择</button>
+                  <span class="ml-auto text-base-content/45">拖动条目到文件夹行即可移入；勾选多项后拖动会带上整组</span>
+                </div>
               </div>
 
               <div v-if="lfError" class="card-p flex items-center gap-2 border border-error/30 bg-error/10 p-3.5 text-sm text-error">
@@ -880,7 +961,13 @@
                 <div class="flex items-center gap-2 border-b border-base-content/10 px-4 py-2.5 text-xs font-medium text-base-content/60">
                   <i class="ti ti-folders"></i>文件夹（{{lfViewDirs.length}}）
                 </div>
-                <div v-for="d in lfViewDirs" :key="'d-'+d.name" class="lf-row">
+                <div v-for="d in lfViewDirs" :key="'d-'+d.name" class="lf-row"
+                     :draggable="!d.volumeRoot"
+                     @dragstart="!d.volumeRoot && onDragStart('local', $event, d.name)" @dragend="onDragEnd"
+                     @dragover="!d.volumeRoot && onDragOver('local', $event, d.name)"
+                     @dragleave="!d.volumeRoot && onDragLeave('local', d.name)"
+                     @drop.prevent="!d.volumeRoot && onDrop('local', $event, d.name)"
+                     :class="dragOverKey===dragKey('local',d.name) ? 'bg-primary/15 ring-1 ring-primary/50' : ''">
                   <input v-if="!d.volumeRoot" type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="d.name" v-model="lfPicked"
                          :title="'勾选以便批量改名：' + d.name">
                   <span v-else class="w-[1.25rem]"></span>
@@ -913,7 +1000,8 @@
                   </label>
                   <span v-if="lfTruncated" class="ml-auto text-warning">文件过多，仅显示前 2000 项</span>
                 </div>
-                <div v-for="f in lfViewFiles" :key="'f-'+f.name" class="lf-row">
+                <div v-for="f in lfViewFiles" :key="'f-'+f.name" class="lf-row" draggable="true"
+                     @dragstart="onDragStart('local', $event, f.name)" @dragend="onDragEnd">
                   <input type="checkbox" class="checkbox checkbox-sm checkbox-primary"
                          :value="f.name" v-model="lfPicked"
                          :title="(f.archive ? '勾选以便批量解压 / 改名：' : '勾选以便批量改名：') + f.name">
@@ -2686,6 +2774,57 @@ os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
           </div>
           <div v-if="player.meta && player.meta.hint" class="mb-1 text-warning">{{player.meta.hint}}</div>
           播放不了？多为视频编码不受浏览器支持（如 H.265 / MKV 封装），点右上角「下载到本机」用本地播放器打开。
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ v3.81 本地回收站（NAS 侧，删除先进这里，可恢复 / 可彻底清空）══ -->
+    <div v-if="lfTrashOpen" class="fixed inset-0 z-[82] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="lfTrashOpen=false"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-recycle text-lg leading-none text-warning"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">本地回收站</span>
+          <span class="shrink-0 text-xs tabular-nums text-base-content/50">{{lfTrashItems.length}} 项</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="lfTrashOpen=false" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-5">
+          <div class="rounded-xl border border-base-content/10 bg-base-content/5 p-3 text-xs leading-relaxed text-base-content/70">
+            从「本地文件」页删除的文件与文件夹会移到各存储空间根目录下的隐藏目录 <code class="rounded bg-base-300 px-1">.cloud-shuttle-trash</code>，<b>不会立刻释放空间</b>。
+            <b>恢复</b>放回删除前的目录（原位置已有同名条目时会拒绝，先移走再恢复）；<b>彻底删除 / 清空</b>不可撤销。
+            回收站里的文件以「.」开头，不会被算作「已下载」。
+          </div>
+          <div v-if="lfTrashBusy" class="flex items-center gap-2 py-6 text-sm text-base-content/50">
+            <i class="ti ti-loader-2 animate-spin"></i>正在读取回收站…
+          </div>
+          <div v-else-if="!lfTrashItems.length" class="empty-state py-10">
+            <i class="ti ti-trash-off"></i>本地回收站是空的
+          </div>
+          <div v-else class="overflow-hidden rounded-xl border border-base-content/10">
+            <div class="flex items-center gap-2 border-b border-base-content/10 bg-base-content/5 px-3 py-2 text-[11px] font-medium text-base-content/50">
+              <span class="w-5"></span><span class="flex-1">条目</span><span class="w-28 text-right">原位置</span><span class="w-24 text-right">删除时间</span>
+            </div>
+            <div class="max-h-[42vh] overflow-y-auto">
+              <div v-for="t in lfTrashItems" :key="'ltr-'+t.id" class="flex items-center gap-2 px-3 py-2 text-xs hover:bg-base-content/5">
+                <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" :value="t.id" v-model="lfTrashPicked" :disabled="!t.exists">
+                <i class="ti shrink-0 text-base leading-none" :class="t.isdir ? 'ti-folder text-warning' : 'ti-file text-base-content/45'"></i>
+                <span class="min-w-0 flex-1 truncate" :title="t.name">{{t.name}}<span v-if="!t.exists" class="ml-1 text-error">（条目已不在回收站）</span></span>
+                <span class="w-28 shrink-0 truncate text-right tabular-nums text-base-content/45" :title="t.from">{{t.from}}</span>
+                <span class="hidden w-24 shrink-0 text-right tabular-nums text-base-content/40 sm:inline">{{fmtTime(t.ts)}}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="flex shrink-0 flex-wrap items-center gap-2 border-t border-base-content/10 bg-base-200 px-5 py-3">
+          <button class="btn-sm" :disabled="lfTrashBusy" @click="openLfTrash"><i class="ti ti-refresh" :class="lfTrashBusy ? 'animate-spin' : ''"></i>刷新</button>
+          <span class="text-[11px] text-base-content/45">已选 {{lfTrashPicked.length}} 项</span>
+          <div class="ml-auto flex items-center gap-2">
+            <button class="btn-sm" :disabled="lfTrashBusy || !lfTrashPicked.length" @click="lfTrashOp('restore')"><i class="ti ti-restore"></i>恢复选中</button>
+            <button class="btn-sm danger" :disabled="lfTrashBusy || !lfTrashPicked.length" @click="lfTrashOp('purge')"><i class="ti ti-trash"></i>彻底删除选中</button>
+            <button class="btn-sm danger" :disabled="lfTrashBusy || !lfTrashItems.length" @click="lfTrashOp('purgeAll')"><i class="ti ti-trash-x"></i>清空回收站</button>
+          </div>
         </div>
       </div>
     </div>
