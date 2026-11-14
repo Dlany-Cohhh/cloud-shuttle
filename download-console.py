@@ -4468,7 +4468,8 @@ def local_download_index(limit=VERIFY_MAX_FILES, with_paths=False):
 FOLDER_STATE_FILE = os.path.join(DATA_DIR, "folder_state.json")
 FOLDER_STATE_LOCK = threading.Lock()
 FOLDER_SCAN_TIMEOUT = 20          # 单个文件夹递归列目录的硬超时（秒）
-FOLDER_SCAN_MAX = 1500            # 单文件夹文件数上限，超出不判定
+FOLDER_SCAN_MAX = 6000            # 单文件夹文件数上限（与 SCAN_MAX_FILES 对齐）；
+                                  # 真机实测 2141 文件的目录 6.6s 可列完，1500 太保守
 FOLDER_SCAN_DEPTH = 6
 FOLDER_STATUS_TTL = 300           # 云端扫描结果缓存（秒）
 FOLDER_STATUS_MAX_DIRS = 24       # 单次请求最多判定多少个文件夹

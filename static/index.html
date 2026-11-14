@@ -452,7 +452,10 @@
                   <button v-if="picked.length" class="btn-sm" @click="picked=[]">取消选择</button>
                   <span class="ml-auto flex items-center gap-1 text-base-content/45">
                     <i v-if="folderStatusBusy" class="ti ti-loader-2 animate-spin"></i>
-                    <span v-if="folderStatusPartial">部分文件夹未判定完</span>
+                    <span v-if="folderStatusSkipped" class="text-warning" :title="folderStatusSkippedText">
+                      {{folderStatusSkipped}} 个文件夹无法判定
+                    </span>
+                    <span v-else-if="folderStatusPartial">部分文件夹未判定完</span>
                     <span v-else>勾选多项后拖到文件夹，或用「移动到…」</span>
                     <button class="btn-icon always" title="重新判定本目录文件夹的下载状态" @click="fetchFolderStatus(true)"><i class="ti ti-refresh"></i></button>
                   </span>

@@ -611,6 +611,15 @@ Vue.createApp({
       return names.length > 0 && names.every(n => this.lfPicked.includes(n));
     },
     /* ---------- v3.50 本地批量改名：勾选范围从「仅压缩包」扩展到文件夹 + 所有文件 ---------- */
+    /* v3.81：扫描失败 / 文件过多的文件夹不静默无标识，在工具条上给个可悬停的说明 */
+    folderStatusSkipped() {
+      return Object.values(this.folderStatus || {}).filter(s => s && s.error).length;
+    },
+    folderStatusSkippedText() {
+      return Object.entries(this.folderStatus || {})
+        .filter(([, s]) => s && s.error)
+        .map(([n, s]) => n + '：' + s.error).join('；');
+    },
     /* v3.81：当前目录下可移入的文件夹（另加「上一级」虚项，供下拉与拖拽共用） */
     cloudMoveTargets() {
       const up = this.curPath ? [{ key: "__up__", label: "↑ 上一级目录" }] : [];
