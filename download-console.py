@@ -1968,6 +1968,12 @@ def pk_share_info(name, sid, pcode, proxy=True, via=""):
     if code >= 400:
         raise RuntimeError(_pk_err(code, d))
     x = _share_payload(d)
+    # 响应不是 JSON 时 pk_api 会把原文塞进 _raw。以前会一路走到「需要提取码」，
+    # 把代理链路的问题伪装成提取码问题 —— 必须在这里就拦住并说清楚。
+    if isinstance(x, dict) and x.get("_raw"):
+        snippet = mask_secret(str(x["_raw"])[:160]).replace("\n", " ").replace("\r", " ")
+        raise RuntimeError("PikPak 返回了非 JSON 响应（代理链路可能被拦截、出口被重置或节点异常）："
+                           + snippet + ("；本次请求走：" + via if via else ""))
     st = str(x.get("share_status") or "")
     s_text = str(x.get("share_status_text") or "")
     if st and st != "OK":
@@ -6055,7 +6061,7 @@ def api(action, body):
             except Exception as e:
                 last = str(e)[:300]
                 # 只有「换出口可能有救」的状态才重试；提取码 / 凭证错误重试无意义
-                if not any(k in last for k in ("PROHIBITED", "NOT_FOUND")):
+                if not any(k in last for k in ("PROHIBITED", "NOT_FOUND", "非 JSON")):
                     break
         if len(tried) > 1:
             last += "；已尝试 %d 条路径：%s" % (len(tried), " → ".join(tried))
