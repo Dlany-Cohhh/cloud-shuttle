@@ -1634,30 +1634,66 @@ def _pk_sign(dev, ts):
     return "1." + s
 
 
-def _pk_http(url, body=None, headers=None, method="GET", timeout=45, proxy=True):
+# v3.81：代理节点偶发 TLS 中断（UNEXPECTED_EOF_WHILE_READING / Connection reset），
+# 这类瞬时抖动重试一次通常就过。以前直接把异常文本当响应返回，用户只能手动反复点
+# 「解析链接」，还会被误报成「需要提取码」。同一路径内做有限次重试，不换出口。
+PK_HTTP_RETRIES = 2
+PK_HTTP_RETRY_DELAY = 0.35
+_TRANSIENT_NET_MARKS = (
+    "unexpected_eof_while_reading", "eof occurred", "eof in violation",
+    "connection reset", "remotedisconnected", "connection aborted",
+    "read timed out", "timed out", "urlopen error [ssl", "urlopen error [errno",
+    "broken pipe", "temporarily unavailable", "connection refused",
+)
+_CERT_NET_MARKS = ("certificate_verify_failed", "certificate verify failed",
+                   "unknown ca", "self signed", "ssl: wrong_version_number")
+
+
+def _is_transient_net(msg):
+    """只有网络层瞬时故障才重试；证书配置错误重试一百次也不会好。"""
+    s = str(msg or "").lower()
+    if any(k in s for k in _CERT_NET_MARKS):
+        return False
+    return any(k in s for k in _TRANSIENT_NET_MARKS)
+
+
+def _pk_http(url, body=None, headers=None, method="GET", timeout=45, proxy=True,
+             _tries=None):
     """先走 mihomo，失败再直连（两个方向都可能被 PikPak 拦，互为兜底）。
 
     v3.81：proxy 除 True/False 外还接受一个具体的代理地址字符串，只在本次请求生效，
     用于「分享解析单独走代理、下载仍直连」的双路尝试。显式指定地址时失败**不**
     静默回落直连 —— 否则调用方会误以为代理试过了，其实又走了直连。
+    同一路径遇到瞬时网络抖动会自动重试 PK_HTTP_RETRIES 次（短退避），重试耗尽
+    才把带「已自动重试」标记的错误交给上层，避免用户误以为系统没试过。
     """
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
-    handlers = []
     p = proxy if isinstance(proxy, str) else (pk_proxy_url() if proxy else "")
-    if p:
-        handlers.append(urllib.request.ProxyHandler({"http": p, "https": p}))
-    else:
-        handlers.append(urllib.request.ProxyHandler({}))
-    try:
-        with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as r:
-            return r.status, r.read().decode("utf-8", "ignore")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "ignore")
-    except Exception as e:
-        if proxy is True:
-            return _pk_http(url, body, headers, method, timeout, proxy=False)
-        return 0, str(e)
+    handlers = [urllib.request.ProxyHandler({"http": p, "https": p} if p else {})]
+    tries = PK_HTTP_RETRIES if _tries is None else _tries
+    last, did_retry = "", False
+    for i in range(tries + 1):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+        try:
+            with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as r:
+                return r.status, r.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            # 400/401/404 等是服务端明确答复，重试没有意义
+            return e.code, e.read().decode("utf-8", "ignore")
+        except Exception as e:
+            last = str(e)
+            if i < tries and _is_transient_net(last):
+                did_retry = True
+                time.sleep(PK_HTTP_RETRY_DELAY * (2 ** i))
+                continue
+            break
+    if proxy is True and p:
+        # 只有真的走了代理才有必要回落直连；本来就是直连时别把同一条路再跑一遍
+        return _pk_http(url, body, headers, method, timeout, proxy=False,
+                        _tries=tries)
+    if did_retry:
+        last += "（同一路径已自动重试 %d 次仍失败）" % tries
+    return 0, last
 
 
 def _pk_cfg(name):
@@ -1971,9 +2007,11 @@ def pk_share_info(name, sid, pcode, proxy=True, via=""):
     # 响应不是 JSON 时 pk_api 会把原文塞进 _raw。以前会一路走到「需要提取码」，
     # 把代理链路的问题伪装成提取码问题 —— 必须在这里就拦住并说清楚。
     if isinstance(x, dict) and x.get("_raw"):
-        snippet = mask_secret(str(x["_raw"])[:160]).replace("\n", " ").replace("\r", " ")
+        raw_txt = mask_secret(str(x["_raw"])).replace("\n", " ").replace("\r", " ")
+        hint = ("；这条路径已自动重试仍失败，稍等几秒再点一次「解析链接」，"
+                "若持续出现请切换代理节点" if "自动重试" in raw_txt else "")
         raise RuntimeError("PikPak 返回了非 JSON 响应（代理链路可能被拦截、出口被重置或节点异常）："
-                           + snippet + ("；本次请求走：" + via if via else ""))
+                           + raw_txt[:160] + ("；本次请求走：" + via if via else "") + hint)
     st = str(x.get("share_status") or "")
     s_text = str(x.get("share_status_text") or "")
     if st and st != "OK":
