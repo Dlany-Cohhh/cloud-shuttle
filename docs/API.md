@@ -179,7 +179,10 @@ grep -n 'action ==' download-console.py
 | `sharecreate` | `remote`, `items`（`[{name,id}]`，`id` 取 `dirs` 里的 `id`）, `days`（`-1/1/7/30`，默认 7）, `passCode`（4~10 位，留空自动生成）, `limit`（提取次数上限，默认 100） | `ok` / `shareId` / `url` / `passCode` / `text`（链接 + 提取码，可直接转发）/ `count` / `names` |
 
 多个 `items` 合并成**一条**分享，文件夹连同内容一起分享。仅 PikPak 账号可用。
-这是写操作，**不做自动换路径重试**（避免网络抖动重复建分享）；失败时返回可读中文错误。
+这是写操作，**默认不做自动换路径重试**（避免网络抖动重复建分享）；唯一例外是服务端
+明确返回地区限制（`Share Unavailable in Your Region` / `PROHIBITED`）——这类请求没有
+产生任何分享，会自动改用预置代理地址重试一次，并在结果里带出 `via` / `retried`。
+失败时返回可读中文错误。
 生成的是官方加密链接，需要提取码；可在「我的分享」里查看提取次数、设上限或取消。
 
 注意与 `cloudlink` 区分：`cloudlink` 走 `rclone link`，返回的是**临时下载直链**，

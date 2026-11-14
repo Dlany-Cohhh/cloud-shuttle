@@ -2115,7 +2115,28 @@ SHARE_CREATE_MAX_ITEMS = 50
 SHARE_CREATE_DAYS = (-1, 1, 7, 30)      # -1 = 永久有效
 
 
-def share_create(remote, items, days=7, pcode="", limit=100):
+def _share_region_block(msg):
+    """服务端明确说「你所在地区不能用分享」——这类拒绝不会创建任何分享。"""
+    s = str(msg or "").lower()
+    return any(k in s for k in ("region", "prohibited", "地区",
+                                "not available in your country"))
+
+
+def _share_preset_proxy():
+    """取「可预置、可不启用」的代理地址；与当前全局出口相同则没必要再试。"""
+    p = (str(load_settings().get("proxyUrl") or "").strip()
+         or str(os.environ.get("PROXY_URL") or "").strip())
+    if p.lower() in PROXY_OFF_WORDS or not PROXY_URL_RE.match(p):
+        return ""
+    try:
+        if p == proxy_url():
+            return ""
+    except Exception:
+        pass
+    return p
+
+
+def share_create(remote, items, days=7, pcode="", limit=100, _proxy=True):
     """给账号里的文件 / 文件夹创建一条**正式的 PikPak 分享链接**（v3.82）。
 
     与 `cloudlink`（rclone link 临时下载直链）不同，这里生成的是
@@ -2124,7 +2145,10 @@ def share_create(remote, items, days=7, pcode="", limit=100):
     但分享会保留下来而不是用完即删；多个 file_ids 会合成**一条**分享，
     正好对应前端「勾选多项 → 一次分享」。
 
-    这是写操作：失败时**不自动换路径重试**，否则网络抖动可能重复创建多条分享。
+    写操作默认**不重试**，否则网络抖动可能重复创建多条分享。唯一例外是服务端
+    明确返回地区限制（`Share Unavailable in Your Region` / `PROHIBITED`）：这类
+    请求被业务层拒绝、没有产生任何分享，换一条出口重试一次是安全的。真机实测
+    直连必被拒、走代理可成功，所以默认直连部署也能用，无需切全局代理模式。
     """
     remote = str(remote or "").strip()
     if not remote:
@@ -2163,7 +2187,7 @@ def share_create(remote, items, days=7, pcode="", limit=100):
                "expiration_days": days, "pass_code_option": "REQUIRED",
                "custom_pass_code": pcode, "limit_count": limit}
     try:
-        code, d = pk_api(remote, "POST", "/drive/v1/share", payload)
+        code, d = pk_api(remote, "POST", "/drive/v1/share", payload, _proxy=_proxy)
     except Exception as e:
         return {"error": "创建分享失败：" + mask_secret(str(e))[:160]}
     x = d if isinstance(d, dict) else {}
@@ -2173,7 +2197,18 @@ def share_create(remote, items, days=7, pcode="", limit=100):
     data = x.get("data") if isinstance(x.get("data"), dict) else {}
     sid = str(x.get("share_id") or data.get("share_id") or "")
     if code >= 400 or not sid:
-        return {"error": "创建分享失败：" + _pk_err(code, d)}
+        err = _pk_err(code, d)
+        if _proxy is True and _share_region_block(err):
+            alt = _share_preset_proxy()
+            if alt:
+                r = share_create(remote, items, days, pcode, limit, _proxy=alt)
+                if r.get("ok"):
+                    r["via"] = "分享专用代理 " + alt
+                    r["retried"] = True
+                return r
+            return {"error": "创建分享失败：" + err +
+                    "。请在「设置 → 代理」填一个可用代理地址（无需切换全局模式）后重试"}
+        return {"error": "创建分享失败：" + err}
     url = str(x.get("share_url") or data.get("share_url") or "").strip()
     if not url.startswith("https://"):
         url = "https://mypikpak.com/s/" + sid
