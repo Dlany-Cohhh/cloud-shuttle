@@ -85,7 +85,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.81"
+APP_VERSION = "v3.82"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -2109,6 +2109,79 @@ SHARE_LIMITS_LOCK = threading.Lock()
 MYSHARES_TTL = 60
 MYSHARES_CACHE = {}       # remote -> (ts, rows)
 FOLDERCOVERS_CACHE = {}   # (remote, fileId) -> (ts, coverUrl)；v3.80 封面补齐缓存
+
+
+SHARE_CREATE_MAX_ITEMS = 50
+SHARE_CREATE_DAYS = (-1, 1, 7, 30)      # -1 = 永久有效
+
+
+def share_create(remote, items, days=7, pcode="", limit=100):
+    """给账号里的文件 / 文件夹创建一条**正式的 PikPak 分享链接**（v3.82）。
+
+    与 `cloudlink`（rclone link 临时下载直链）不同，这里生成的是
+    `https://mypikpak.com/s/<id>` 形式的分享，可被别人转存、能在「我的分享」
+    里查看提取次数 / 取消。请求体沿用 `_share_worker` 里已验证可用的参数组合，
+    但分享会保留下来而不是用完即删；多个 file_ids 会合成**一条**分享，
+    正好对应前端「勾选多项 → 一次分享」。
+
+    这是写操作：失败时**不自动换路径重试**，否则网络抖动可能重复创建多条分享。
+    """
+    remote = str(remote or "").strip()
+    if not remote:
+        return {"error": "请选择账号"}
+    raw = items if isinstance(items, list) else []
+    ids, names = [], []
+    for it in raw[:SHARE_CREATE_MAX_ITEMS]:
+        if isinstance(it, dict):
+            fid = str(it.get("id") or "").strip()
+            nm = str(it.get("name") or "").strip()
+        else:
+            fid, nm = str(it or "").strip(), ""
+        # PikPak 的 file_id 是 base64url 风格字符串；挡住路径 / 空值 / 明显脏数据
+        if fid and re.fullmatch(r"[A-Za-z0-9_-]{4,128}", fid) and fid not in ids:
+            ids.append(fid)
+            names.append(nm or fid)
+    if not ids:
+        return {"error": "没有可用的文件 ID：请刷新当前目录后重试（文件与文件夹都要用列表里的 ID）"}
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 7
+    if days not in SHARE_CREATE_DAYS:
+        days = 7
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 9999))
+    pcode = str(pcode or "").strip()
+    if pcode and not re.fullmatch(r"[A-Za-z0-9]{4,10}", pcode):
+        return {"error": "提取码只能是 4~10 位字母或数字"}
+    if not pcode:
+        pcode = _pk_pass()
+    payload = {"file_ids": ids, "share_to": "encryptedlink",
+               "expiration_days": days, "pass_code_option": "REQUIRED",
+               "custom_pass_code": pcode, "limit_count": limit}
+    try:
+        code, d = pk_api(remote, "POST", "/drive/v1/share", payload)
+    except Exception as e:
+        return {"error": "创建分享失败：" + mask_secret(str(e))[:160]}
+    x = d if isinstance(d, dict) else {}
+    if x.get("_raw"):
+        snip = mask_secret(str(x["_raw"])[:100]).replace("\n", " ")
+        return {"error": "创建分享失败：服务端返回了非 JSON 响应（可能是网络或代理异常）：" + snip}
+    data = x.get("data") if isinstance(x.get("data"), dict) else {}
+    sid = str(x.get("share_id") or data.get("share_id") or "")
+    if code >= 400 or not sid:
+        return {"error": "创建分享失败：" + _pk_err(code, d)}
+    url = str(x.get("share_url") or data.get("share_url") or "").strip()
+    if not url.startswith("https://"):
+        url = "https://mypikpak.com/s/" + sid
+    code_out = str(x.get("pass_code") or data.get("pass_code") or pcode)
+    return {"ok": True, "shareId": sid, "url": url, "passCode": code_out,
+            "title": str(x.get("title") or data.get("title") or "")[:120],
+            "days": days, "limit": limit, "count": len(ids), "names": names[:20],
+            "text": url + "  提取码：" + code_out}
 
 
 def load_share_limits():
@@ -7273,8 +7346,14 @@ def api(action, body):
             return {"error": str(e)[:200]}
         return {"ok": True, "newPath": dst}
 
+    if action == "sharecreate":
+        # v3.82：账号内文件 / 文件夹 → 正式 PikPak 分享链接（可保留、可管理）
+        return share_create(body.get("remote"), body.get("items"),
+                            body.get("days", 7), body.get("passCode", ""),
+                            body.get("limit", 100))
+
     if action == "cloudlink":
-        # 分享链接：按开关决定 优先代理/优先直连，另一条路兜底（PikPak 分享受地区限制）
+        # 临时下载直链（rclone link）：与上面的正式分享链接不是一回事
         remote = str(body.get("remote") or "").strip()
         path = str(body.get("path") or "").strip("/")
         if not remote or not path:

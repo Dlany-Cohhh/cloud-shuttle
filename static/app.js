@@ -255,6 +255,13 @@ Vue.createApp({
       myShareFilterRemote: "",
       myShareFilterStatus: "OK",
       myShareBusy: "",
+      /* v3.82 创建分享：账号内文件 / 文件夹 → 正式 PikPak 分享链接 */
+      createShareOpen: false,
+      createShareBusy: false,
+      createShareErr: "",
+      createShareItems: [],
+      createShareForm: { days: 7, passCode: "", limit: 100 },
+      createShareResult: null,
       /* 跨账号转移（v3.34 / v3.35 单文件 / v3.39 根目录可挑源 / v3.46 多源批量） */
       xferOpen: false,
       xferBusy: false,
@@ -1937,6 +1944,62 @@ Vue.createApp({
       this.scanData = null;                 // 删了东西，导出/查重的缓存必须作废
       this.toast("云端清理完成：成功 " + ok + " 个" + (fail ? "，失败 " + fail + " 个" : ""), fail && !ok ? "error" : "ok");
       this.loadDirs(this.curPath);
+    },
+    /* v3.82：把账号里的文件 / 文件夹做成正式 PikPak 分享链接。
+       与 cloudShare（rclone link 临时直链）区分开：这条能发给别人转存、可在「我的分享」管理。 */
+    pickedToShareItems() {
+      const all = (this.dirFolders || []).concat(this.dirFiles || []);
+      return (this.picked || []).map(n => all.find(x => x.name === n)).filter(Boolean)
+        .map(x => ({ name: x.name, id: x.id || "", isdir: !!x.isdir }));
+    },
+    openCreateShare(items) {
+      if (!this.trashSupported()) {
+        this.toast("创建正式分享链接目前只支持 PikPak 账号", "error");
+        return;
+      }
+      const list = Array.isArray(items) && items.length ? items : this.pickedToShareItems();
+      if (!list.length) { this.toast("请先勾选要分享的文件或文件夹", "error"); return; }
+      const noId = list.filter(x => !x.id).length;
+      if (noId) { this.toast("有 " + noId + " 项缺少文件 ID，请刷新列表后重试", "error"); return; }
+      this.createShareItems = list.slice(0, 50);
+      this.createShareErr = "";
+      this.createShareResult = null;
+      this.createShareForm = { days: 7, passCode: "", limit: 100 };
+      this.createShareOpen = true;
+    },
+    closeCreateShare() { if (!this.createShareBusy) this.createShareOpen = false; },
+    createShareTitle() {
+      const n = this.createShareItems.length;
+      if (!n) return "";
+      return n === 1 ? this.createShareItems[0].name
+        : this.createShareItems[0].name + " 等 " + n + " 项";
+    },
+    async submitCreateShare() {
+      if (this.createShareBusy) return;
+      this.createShareBusy = true;
+      this.createShareErr = "";
+      try {
+        const d = await this.api("sharecreate", {
+          remote: this.curRemote,
+          items: this.createShareItems.map(x => ({ name: x.name, id: x.id })),
+          days: Number(this.createShareForm.days),
+          passCode: String(this.createShareForm.passCode || "").trim(),
+          limit: Number(this.createShareForm.limit) || 100,
+        }, 90000);
+        if (d.error) { this.createShareErr = d.error; return; }
+        this.createShareResult = d;
+        this.toast("分享链接已创建（" + (d.count || 1) + " 项）", "ok");
+        if (this.myShareOpen) this.loadMyShares(true);
+      } catch (e) { this.createShareErr = "创建失败：" + ((e && e.message) || e); }
+      finally { this.createShareBusy = false; }
+    },
+    copyCreateShare(kind) {
+      const r = this.createShareResult;
+      if (!r) return;
+      const t = kind === "code" ? r.passCode
+        : kind === "all" ? (r.text || (r.url + "  提取码：" + r.passCode)) : r.url;
+      this.copyText(t);
+      this.toast(kind === "code" ? "提取码已复制" : "已复制到剪贴板", "ok");
     },
     async cloudShare(name) {
       try {

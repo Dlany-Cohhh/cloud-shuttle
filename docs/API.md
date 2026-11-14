@@ -25,7 +25,7 @@ curl -s -X POST http://<控制台地址>/api \
 | `renamebatch` | 云盘目录内批量重命名 |
 | `version` | 版本与运行状态 |
 
-## 全部 action（由源码自动提取，共 80 个）
+## 全部 action（由源码自动提取，共 81 个）
 
 - `about`
 - `accounts`
@@ -86,6 +86,7 @@ curl -s -X POST http://<控制台地址>/api \
 - `scanpath`
 - `setbwlimit`
 - `settings`
+- `sharecreate`
 - `sharedel`
 - `sharelimit`
 - `shareparse`
@@ -170,4 +171,17 @@ grep -n 'action ==' download-console.py
 但打标时会把 `{云端签名: 本地绝对路径}` 记进基线 `map`，之后优先按路径判定 ——
 所以本地改名 / 移动不会掉标，只有文件真的不在了才掉标；云端改名按「净增」计算，
 不会误报「有更新」。详见 [CHANGELOG.md](../CHANGELOG.md) v3.81 一节。
+
+### 创建分享（v3.82+）
+
+| action | 参数 | 返回要点 |
+| --- | --- | --- |
+| `sharecreate` | `remote`, `items`（`[{name,id}]`，`id` 取 `dirs` 里的 `id`）, `days`（`-1/1/7/30`，默认 7）, `passCode`（4~10 位，留空自动生成）, `limit`（提取次数上限，默认 100） | `ok` / `shareId` / `url` / `passCode` / `text`（链接 + 提取码，可直接转发）/ `count` / `names` |
+
+多个 `items` 合并成**一条**分享，文件夹连同内容一起分享。仅 PikPak 账号可用。
+这是写操作，**不做自动换路径重试**（避免网络抖动重复建分享）；失败时返回可读中文错误。
+生成的是官方加密链接，需要提取码；可在「我的分享」里查看提取次数、设上限或取消。
+
+注意与 `cloudlink` 区分：`cloudlink` 走 `rclone link`，返回的是**临时下载直链**，
+不是可转存的分享链接。
 
