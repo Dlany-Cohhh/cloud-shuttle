@@ -5,6 +5,11 @@ settings.json
 accounts_meta.json
 share_limits.json
 rclone.conf
+# v3.83：目录任务的文件级执行计划 + 原名 ↔ 落盘名映射清单（含真实文件名）
+jobfiles/
+.cloudshuttle-name-map.json
+.cloudshuttle-name-map.json.old
+.cloudshuttle-name-map.json.tmp
 *.log
 tls/
 *.pem

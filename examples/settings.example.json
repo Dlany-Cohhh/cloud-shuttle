@@ -22,5 +22,13 @@
   "logFile": "",
   "shareAutoCancel": false,
   "nasHomeUrl": "http://127.0.0.1:8080/",
-  "proxyUrl": ""
+  "netMode": "direct",
+  "proxyUrl": "",
+  "pkProxyMode": "direct",
+  "safeNaming": true,
+  "safeNameMaxBytes": 180,
+  "safeNameHashLen": 12,
+  "safePathMaxBytes": 240,
+  "stuckWatchdogMin": 10,
+  "fileRetryMax": 3
 }

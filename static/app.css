@@ -195,6 +195,16 @@ body { margin: 0; height: 100%; font-family: var(--font-ui); font-variant-numeri
 .btn-sm.primary:hover { background: var(--color-primary); filter: brightness(1.08); }
 .btn-sm:disabled { opacity: .45; cursor: not-allowed; }
 .btn-sm i { font-size: .875rem; line-height: 1; }
+/* v3.83：详情弹窗里「复制原名 / 落盘名」的迷你图标按钮 */
+.btn-xs { display: inline-flex; height: 1.5rem; align-items: center; gap: .25rem; border-radius: .375rem;
+          border: 1px solid color-mix(in oklab, var(--color-base-content) 15%, transparent);
+          padding: 0 .4rem; font-size: .6875rem; font-weight: 500;
+          color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
+          background: transparent; cursor: pointer; white-space: nowrap;
+          transition: all var(--dur-fast) var(--ease-soft); }
+.btn-xs:hover { background: color-mix(in oklab, var(--color-base-content) 8%, transparent); }
+.btn-xs:active { transform: scale(.96); }
+.btn-xs i { font-size: .75rem; line-height: 1; }
 /* v3.43：过滤开启时常亮（类比 seg-btn.on），避免用户忘了自己加过规则 */
 .btn-sm.filter-on { border-color: color-mix(in oklab, var(--color-warning) 45%, transparent);
                     background: color-mix(in oklab, var(--color-warning) 12%, transparent);

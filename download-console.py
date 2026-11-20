@@ -5,6 +5,7 @@
    API 与 v2.2 完全兼容，任务/设置数据路径不变"""
 import base64, hashlib, io, json, os, re, select, shutil, socket, ssl, stat as statmod, subprocess, sys, tarfile, threading, time
 from datetime import datetime as _dt
+from concurrent.futures import ThreadPoolExecutor
 import unicodedata, urllib.error, urllib.parse, urllib.request, uuid, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -85,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.82"
+APP_VERSION = "v3.83"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -199,7 +200,16 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             "proxyUrl": "",
             # 兼容字段：v3.74~v3.76 的 pkProxyMode，由 _norm_settings 与 netMode 同步；
             # 请求层已不再读取，保留只为老配置 / 老前端平滑升级。
-            "pkProxyMode": "direct"}
+            "pkProxyMode": "direct",
+            # ── v3.83 长文件名安全命名（docs/LONG-FILENAME-DOWNLOAD-DESIGN.md）──
+            # 只作用于「新创建」的任务：老任务没有 naming=v2 标记，永远走旧逻辑。
+            # 源端永远用云端原始文件名，只有落盘名会被清洗 / 截断 / 加哈希后缀。
+            "safeNaming": True,          # 总开关：关掉后新任务恢复 v3.82 及以前的原样命名
+            "safeNameMaxBytes": 180,     # 单个落盘文件名的 UTF-8 字节上限（Linux 单组件通常 255）
+            "safeNameHashLen": 12,       # 哈希后缀长度，输入 = 账号 + 完整源相对路径
+            "safePathMaxBytes": 240,     # 相对路径总字节上限，给 Windows 根路径前缀留余量
+            "stuckWatchdogMin": 10,      # v2 任务无进度自动终止阈值（分钟），0 = 关闭
+            "fileRetryMax": 3}           # 单文件瞬时/未知错误重试次数（退避 2s / 8s / 30s）
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
 ORDER_BY_OPTIONS = ("", "size,descending", "size,ascending", "name,ascending",
@@ -1292,6 +1302,13 @@ def _norm_settings(raw):
     num("multiThreadCutoffMB", 1, 1024)
     num("retries", 0, 100)
     num("transfersClearedAt", 0, 4102444800, float)
+    # v3.83 安全命名：字节上限 / 哈希长度 / 看门狗 / 单文件重试都钳到安全区间
+    num("safeNameMaxBytes", 64, 240)
+    num("safeNameHashLen", 6, 24)
+    num("safePathMaxBytes", 120, 1024)
+    num("stuckWatchdogMin", 0, 1440)
+    num("fileRetryMax", 0, 10)
+    d["safeNaming"] = _truthy(d.get("safeNaming", True))
     d["proxy"] = bool(d.get("proxy"))
     d["downloadProxy"] = bool(d.get("downloadProxy", True))
     d["advancedMode"] = _truthy(d.get("advancedMode", False))
@@ -1503,6 +1520,280 @@ def describe_filter(f):
     return " · ".join(bits)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# v3.83 长文件名安全命名（docs/LONG-FILENAME-DOWNLOAD-DESIGN.md）
+#
+# 核心原则：源端永远用云端原始文件名，目标端永远用安全落盘名。
+#   · 只有「新任务」会带 naming=v2 标记，老任务完全走旧逻辑，行为不变；
+#   · 正常文件名原样保留，只有被清洗过 / 超长的名字才追加 ~哈希 后缀；
+#   · 哈希输入 = 账号 + 完整源相对路径，同一源文件无论何时重算都得到同一个落盘名；
+#   · 原名 ↔ 落盘名的对应关系写进每卷的 .cloudshuttle-name-map.json，可追溯。
+# ────────────────────────────────────────────────────────────────────────────
+WIN_RESERVED = set('<>:"/\\|?*')
+WIN_DEVICE_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def truncate_utf8(s, limit_bytes):
+    """按 UTF-8 字节截断，绝不切出半个汉字（按字符截断对中文基本无效）。"""
+    b = str(s or "").encode("utf-8")
+    if len(b) <= limit_bytes:
+        return str(s or "")
+    return b[:max(0, int(limit_bytes))].decode("utf-8", "ignore")
+
+
+def clean_segment(s):
+    """单个路径段清洗：NFC 归一 → Windows 非法字符/控制字符换 _ → 去首尾空格句点 → 设备名加前缀。"""
+    s = unicodedata.normalize("NFC", str(s or ""))
+    s = "".join("_" if ch in WIN_RESERVED or ord(ch) < 32 else ch for ch in s)
+    s = s.strip(" .")
+    if not s:
+        s = "unnamed"
+    if s.split(".")[0].upper() in WIN_DEVICE_NAMES:
+        s = "_" + s
+    return s
+
+
+def _name_digest(remote, src_rel, hash_len=12):
+    return hashlib.sha256(
+        (str(remote) + "\x00" + str(src_rel)).encode("utf-8")
+    ).hexdigest()[:max(6, int(hash_len or 12))]
+
+
+def safe_basename(original, remote, src_rel, max_bytes=180, hash_len=12):
+    """原始文件名 → 安全落盘名。没清洗也没超长就原样返回，避免满屏哈希名。"""
+    raw = unicodedata.normalize("NFC", str(original or ""))
+    cleaned = clean_segment(raw)
+    stem, ext = os.path.splitext(cleaned)
+    if ext:
+        body = clean_segment(ext[1:])
+        ext = "" if body == "unnamed" else "." + body
+        if len(ext.encode("utf-8")) > 32:          # 超长扩展名同样按字节截断
+            ext = truncate_utf8(ext, 32).rstrip(" .")
+    # 仅「设备名加 _ 前缀」不算改动，不需要再挂哈希（_CON.mp4 已经可读且唯一）
+    only_device_prefix = (cleaned == "_" + raw)
+    need_hash = (len(cleaned.encode("utf-8")) > max_bytes) or (cleaned != raw and not only_device_prefix)
+    if not need_hash:
+        return cleaned
+    suffix = "~" + _name_digest(remote, src_rel, hash_len)
+    budget = max_bytes - len(suffix.encode("utf-8")) - len(ext.encode("utf-8")) - 1
+    if budget < 16:
+        budget = 16
+    stem = truncate_utf8(stem, budget).rstrip(" .") or "file"
+    return stem + suffix + ext
+
+
+def safe_relpath(src_rel, remote, max_name_bytes=180, max_total=240, hash_len=12):
+    """目录段逐段清洗 + 相对路径总字节封顶。
+
+    总长度超限时先压缩目录段（保留哈希保证唯一），再压缩文件主名；
+    目录层级实在太深时折叠中间层为一个哈希目录，绝不把文件名截没。"""
+    parts = [p for p in str(src_rel or "").split("/") if p not in ("", ".", "..")]
+    if not parts:
+        return ""
+    full = "/".join(parts)
+    dirs, leaf = parts[:-1], parts[-1]
+    safe_dirs = [safe_basename(p, remote, full, max_bytes=min(120, max_name_bytes), hash_len=hash_len)
+                 for p in dirs]
+    safe_leaf = safe_basename(leaf, remote, full, max_bytes=max_name_bytes, hash_len=hash_len)
+    rel = "/".join(safe_dirs + [safe_leaf])
+    if len(rel.encode("utf-8")) <= max_total:
+        return rel
+    # 第二档：目录段压成「8 字节前缀 + ~哈希」，文件主名按剩余预算再截
+    short_dirs = [truncate_utf8(sp, 8).rstrip(" .") + "~" + _name_digest(remote, full + "\x00" + p, hash_len)
+                  for p, sp in zip(dirs, safe_dirs)]
+    stem, ext = os.path.splitext(safe_leaf)
+
+    def _fit(dir_list):
+        used = len("/".join(dir_list).encode("utf-8")) + (1 if dir_list else 0)
+        keep = max(16, max_total - used - len(ext.encode("utf-8")))
+        return truncate_utf8(stem, keep).rstrip(" .") + ext
+
+    leaf2 = _fit(short_dirs)
+    if len(("/".join(short_dirs + [leaf2])).encode("utf-8")) > max_total + 32 and len(short_dirs) > 1:
+        short_dirs = [short_dirs[0], "~" + _name_digest(remote, full, hash_len)]
+        leaf2 = _fit(short_dirs)
+    return "/".join(short_dirs + [leaf2])
+
+
+def build_name_map(files, remote, src_base="", s=None):
+    """扫描阶段一次性生成全部「源相对路径 → 安全相对路径」映射并消解冲突。
+
+    files: rclone operations/list 的条目（Path / Size）。返回 list[dict]，按源路径排序，
+    顺序固定 → 冲突时追加的 -2 / -3 序号在重启、续传后不会漂移。"""
+    s = s or DEFAULTS
+    mb = int(s.get("safeNameMaxBytes") or 180)
+    hl = int(s.get("safeNameHashLen") or 12)
+    mt = int(s.get("safePathMaxBytes") or 240)
+    entries, used = [], {}
+    rows = sorted((f for f in files if isinstance(f, dict) and not f.get("IsDir")),
+                  key=lambda f: str(f.get("Path") or ""))
+    for f in rows:
+        rel = str(f.get("Path") or "").strip("/")
+        if not rel:
+            continue
+        src_full = (str(src_base).strip("/") + "/" + rel).strip("/")
+        safe = safe_relpath(rel, remote, max_name_bytes=mb, max_total=mt, hash_len=hl)
+        parent, _, leaf = safe.rpartition("/")
+        stem, ext = os.path.splitext(leaf)
+        key_dir = parent.casefold()
+        bucket = used.setdefault(key_dir, set())
+        candidate, n = leaf, 2
+        while candidate.casefold() in bucket:
+            candidate = "%s-%d%s" % (stem, n, ext)     # 截断撞名 / 大小写撞名：追加序号
+            n += 1
+        bucket.add(candidate.casefold())
+        safe = (parent + "/" if parent else "") + candidate
+        entries.append({"src": rel, "srcFull": src_full, "dst": safe,
+                        "size": int(f.get("Size") or 0), "status": "pending",
+                        "attempts": 0, "error": ""})
+    return entries
+
+
+# ── 映射清单（每卷一份，隐藏文件；原子写 + 锁内串行）────────────────────────
+NAME_MAP_VERSION = 2
+NAME_MAP_FILENAME = ".cloudshuttle-name-map.json"
+NAME_MAPS = {}                 # path -> data（常驻内存，任务启动时加载一次）
+NAME_MAP_DIRTY = set()         # 有待落盘变更的 path，由 flush_name_maps 批量写
+NAME_MAP_LOCK = threading.RLock()
+
+
+def _name_map_path(volume):
+    root = str((volume or {}).get("console") or "").strip()
+    if root and os.path.isdir(root):
+        return os.path.join(root, NAME_MAP_FILENAME)
+    return os.path.join(DATA_DIR, NAME_MAP_FILENAME)   # 卷不可写时退回数据目录，不丢追溯能力
+
+
+def load_name_map(volume):
+    path = _name_map_path(volume)
+    with NAME_MAP_LOCK:
+        if path in NAME_MAPS:
+            return NAME_MAPS[path]
+        d = _read_json(path, None)
+        if not isinstance(d, dict) or d.get("version") != NAME_MAP_VERSION \
+                or not isinstance(d.get("entries"), dict):
+            if isinstance(d, dict) and d:
+                try:                    # 旧版本不自动迁移：备份成 .old 后重建 v2
+                    if not os.path.exists(path + ".old"):
+                        shutil.copy2(path, path + ".old")
+                except Exception:
+                    pass
+            d = {"version": NAME_MAP_VERSION, "updated": "", "entries": {}}
+        NAME_MAPS[path] = d
+        return d
+
+
+def save_name_map(volume, data=None):
+    path = _name_map_path(volume)
+    with NAME_MAP_LOCK:
+        d = data or NAME_MAPS.get(path) or load_name_map(volume)
+        d["updated"] = time.strftime("%F %T")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _write_json(path, d)
+        except Exception:
+            pass
+        NAME_MAP_DIRTY.discard(path)
+
+
+def flush_name_maps():
+    """把标记为脏的清单批量落盘（worker 每轮进度写盘时顺带调用）。"""
+    with NAME_MAP_LOCK:
+        paths = [p for p in NAME_MAP_DIRTY if NAME_MAPS.get(p)]
+    for p in paths:
+        with NAME_MAP_LOCK:
+            d = NAME_MAPS.get(p)
+            d["updated"] = time.strftime("%F %T")
+            try:
+                _write_json(p, d)
+            except Exception:
+                pass
+            NAME_MAP_DIRTY.discard(p)
+
+
+def get_safe_path(volume, remote, src_rel):
+    ent = load_name_map(volume)["entries"].get(str(remote) + ":" + str(src_rel))
+    return str((ent or {}).get("safe") or "")
+
+
+def record_file_state(volume, remote, src_rel, _flush=False, **fields):
+    """更新单个文件的映射条目（原名 / 落盘名 / 大小 / 状态 / 错误 / 时间）。"""
+    try:
+        with NAME_MAP_LOCK:
+            d = load_name_map(volume)
+            key = str(remote) + ":" + str(src_rel)
+            ent = d["entries"].setdefault(key, {"original": str(src_rel), "remote": str(remote)})
+            ent.update(fields)
+            ent["updated"] = time.strftime("%F %T")
+            NAME_MAP_DIRTY.add(_name_map_path(volume))
+        if _flush:
+            save_name_map(volume)
+    except Exception:
+        pass    # 清单只用于追溯，写失败绝不能拖垮下载
+
+
+# ── 每个目录任务一份「文件级执行计划」，避免把几千条明细塞回 jobs.json ──────
+JOB_FILES_DIR = os.path.join(DATA_DIR, "jobfiles")
+
+
+def _plan_path(job_id):
+    return os.path.join(JOB_FILES_DIR, "%s.json" % int(job_id))
+
+
+def load_file_plan(job_id):
+    d = _read_json(_plan_path(job_id), None)
+    return d if isinstance(d, dict) and isinstance(d.get("entries"), list) else None
+
+
+def save_file_plan(job_id, plan):
+    try:
+        os.makedirs(JOB_FILES_DIR, exist_ok=True)
+        _write_json(_plan_path(job_id), plan)
+    except Exception:
+        pass
+
+
+# ── 错误分类：文件级 / 账号级 / 磁盘权限 / 瞬时 / 未知 ──────────────────────
+FILE_FATAL_KEYS = (
+    "file name too long", "filename too long", "name too long", "path too long",
+    "file name or extension is too long", "文件名或扩展名太长", "路径太长",
+)
+DISK_FATAL_KEYS = (
+    "no space left", "permission denied", "access denied", "read-only file system", "disk full",
+)
+TRANSIENT_KEYS = (
+    "timeout", "timed out", "tls handshake", "eof", "i/o timeout",
+    "connection reset", "connection refused", "temporarily unavailable",
+)
+
+
+def classify_error(msg, context=""):
+    """返回 (类别, 友好提示)。类别 ∈ FILE_FATAL / ACCOUNT_FATAL / DISK_FATAL / TRANSIENT / UNKNOWN。"""
+    raw = str(msg or "")
+    low = raw.lower()
+    for k in FILE_FATAL_KEYS:
+        if k in low:
+            return "FILE_FATAL", "文件名或路径超出文件系统限制（原始：%s）" % mask_secret(raw[:160])
+    ctx = str(context or "").lower()
+    if "invalid argument" in low and (any(t in (low + ctx) for t in ("name", "path", "file", "文件名"))
+                                      or "/" in ctx or "\\" in ctx):
+        return "FILE_FATAL", "文件名不被目标文件系统接受（原始：%s）" % mask_secret(raw[:160])
+    fatal = _fatal_job_error(raw)          # 既有业务错误（额度 / 凭证 / captcha…）
+    if fatal:
+        return "ACCOUNT_FATAL", fatal[1]
+    for k in DISK_FATAL_KEYS:
+        if k in low:
+            return "DISK_FATAL", "磁盘空间不足或没有写入权限（原始：%s）" % mask_secret(raw[:160])
+    for k in TRANSIENT_KEYS:
+        if k in low:
+            return "TRANSIENT", raw
+    return "UNKNOWN", raw
+
+
 def launch_job(job, s):
     proxy = bool(job.get("proxy"))
     if proxy and not ensure_proxy_rc():
@@ -1510,12 +1801,17 @@ def launch_job(job, s):
         job["error"] = "代理守护进程（%d）启动失败，请检查代理客户端与 %s 容器" % (PROXY_RC_PORT, RCLONE_CONTAINER)
         return False
     move = job["mode"] == "move"
+    if not job.get("single_file") and job.get("naming") == "v2":
+        # v3.83：目录任务不再用 sync/copy（它会原样保留文件名），
+        # 改为「列目录 → 生成映射 → 线程池逐文件 copyfile」，错误按文件隔离。
+        return _start_safe_dir_job(job, s)
     if job.get("single_file"):
         # sync/copy 的 srcFs/dstFs 都必须是目录，单文件必须用专用接口；
         # src_dir / dst_dir / leaf 由 start 在预检判定为文件后写进 job。
+        # v3.83：源端永远用原始文件名，目标端用安全落盘名（无 safe_leaf 即旧任务，原样）。
         method = "operations/movefile" if move else "operations/copyfile"
         kv = dict(srcFs=job["src_dir"], srcRemote=job["leaf"],
-                  dstFs=job["dst_dir"], dstRemote=job["leaf"], _async="true")
+                  dstFs=job["dst_dir"], dstRemote=job.get("safe_leaf") or job["leaf"], _async="true")
     else:
         method = "sync/move" if move else "sync/copy"
         kv = dict(srcFs=job["src"], dstFs=job["dest"], _async="true",
@@ -1542,11 +1838,301 @@ def launch_job(job, s):
         job["state"] = "running"
         job["error"] = ""        # 清掉上次「源目录已空」等残留提示，避免误导
         job["curfile"] = ""
+        if job.get("single_file") and job.get("naming") == "v2":
+            job["curfile"] = job.get("leaf") or ""
+            record_file_state(job_volume(job), job.get("remote"), job.get("subpath"),
+                              safe=job.get("safe_leaf") or job.get("leaf"),
+                              original=job.get("subpath"), status="running", _flush=True)
         return True
     except Exception as e:
         job["state"] = "error"
         job["error"] = "启动失败: %s" % str(e)[:150]
         return False
+
+# ────────────────────────────────────────────────────────────────────────────
+# v3.83 目录任务：逐文件安全命名下载（阶段 2）
+#   旧的 sync/copy 会原样保留云端文件名，遇到超长名只会整批反复重试。
+#   这里改成：列目录 → 一次性生成映射并消解冲突 → 线程池逐文件 copyfile。
+#   同步调用（不开 _async）是为了让错误归属到具体文件：坏文件标 failed 继续下一个，
+#   账号级 / 磁盘级错误才中止整个任务。
+# ────────────────────────────────────────────────────────────────────────────
+SAFE_JOBS = {}                 # job_id -> {"stop": Event}；暂停信号 + 重启兜底判定
+SAFE_JOBS_LOCK = threading.Lock()
+SAFE_BACKOFF = (2, 8, 30)      # 瞬时错误指数退避（秒）
+FILE_RC_TIMEOUT = 3600         # 单文件同步 copyfile 的硬超时
+
+
+class _JobAbort(Exception):
+    """账号级 / 磁盘级错误：中止整个目录任务，state 为要落入的终态。"""
+
+    def __init__(self, state, msg):
+        super().__init__(msg)
+        self.state, self.msg = state, str(msg)
+
+
+def _safe_stop_event(job_id):
+    with SAFE_JOBS_LOCK:
+        ent = SAFE_JOBS.get(job_id)
+        return ent["stop"] if ent else None
+
+
+def _safe_requested_stop(job_id):
+    ev = _safe_stop_event(job_id)
+    return bool(ev and ev.is_set())
+
+
+def _start_safe_dir_job(job, s):
+    with SAFE_JOBS_LOCK:
+        old = SAFE_JOBS.get(job["id"])
+        if old:
+            old["stop"].set()          # 理论上不会重复启动，兜底停掉旧线程
+        SAFE_JOBS[job["id"]] = {"stop": threading.Event()}
+    job["jobid"] = None                # 没有 rclone 异步 job，进度由工作线程自己写
+    job["started_ts"] = time.time()
+    job["state"] = "running"
+    job["phase"] = "scan"
+    job["error"] = ""
+    job["curfile"] = ""
+    job["speed"] = 0
+    job["eta"] = None
+    # start 是「先 launch 再 append + save_jobs」，工作线程若立刻按 id 读 jobs.json
+    # 会拿不到任务而直接退出（任务永远 running）。把快照一并传过去，读盘只用于进度回写。
+    threading.Thread(target=_safe_dir_worker, args=(job["id"], dict(job)), daemon=True).start()
+    return True
+
+
+def expand_source_files(job):
+    """递归列出源目录全部文件（只读），目录任务的下载过滤规则在这里继续生效。"""
+    kv = dict(fs=job["src"], remote="", recurse=True,
+              _timeout=300, _proxy=bool(job.get("proxy")), _strict=True)
+    fopt = build_filter_opt(job.get("filter") or {})
+    if fopt:
+        kv["_filter"] = json.dumps(fopt, ensure_ascii=False)
+    r = rc("operations/list", **kv)
+    return [e for e in (r.get("list") or []) if isinstance(e, dict) and not e.get("IsDir")]
+
+
+def _dest_index(job):
+    """一次性列出目标目录已有文件：避免每个文件都单独 stat（每次 rc 都是一次 docker exec）。"""
+    try:
+        r = rc("operations/list", fs=job["dest"], remote="", recurse=True,
+               _timeout=300, _proxy=bool(job.get("proxy")))
+        return {str(e.get("Path") or ""): int(e.get("Size") or 0)
+                for e in (r.get("list") or []) if isinstance(e, dict) and not e.get("IsDir")}
+    except Exception:
+        return {}       # 目标目录还没建 / 暂时列不出：按空处理，复制阶段的错误再分类
+
+
+def transfer_one(job, entry, s, existing, made_dirs, xlock=None):
+    """同步复制单个文件：源端原名 → 目标端安全名。返回 (status, error)。
+
+    existing 是目标目录快照（会被本函数就地更新），made_dirs 缓存已建目录。
+    两者被线程池里的多个 worker 共享，读写都必须走 xlock —— 否则一边遍历
+    casefold 一边有别的线程 pop，会抛 dictionary changed size during iteration。"""
+    xlock = xlock or threading.Lock()
+    proxy = bool(job.get("proxy"))
+    src_fs, dst_fs = job["src"], job["dest"]
+    rel, safe, size = entry["src"], entry["dst"], int(entry.get("size") or 0)
+    # 1) 已存在文件：同大小跳过；不同大小先改名保留再重下，绝不静默覆盖
+    with xlock:
+        exists = safe in existing
+        if exists and int(existing[safe]) == size:
+            return "skipped", ""
+        if not exists and safe.casefold() in {p.casefold() for p in existing}:
+            return "failed", "目标目录已存在大小写相近的同名文件，为避免覆盖已跳过，请手动处理后重试"
+        if exists:
+            conflict = "%s.conflict-%s" % (safe, time.strftime("%Y%m%d%H%M%S"))
+            try:
+                rc("operations/movefile", srcFs=dst_fs, srcRemote=safe,
+                   dstFs=dst_fs, dstRemote=conflict, _timeout=120, _proxy=proxy, _strict=True)
+                existing[conflict] = existing.pop(safe)
+            except Exception as e:
+                return "failed", "目标有同名不同大小的文件，保留旧文件时改名失败：%s" % mask_secret(str(e)[:140])
+        parent = safe.rpartition("/")[0]
+        need_mkdir = bool(parent) and parent not in made_dirs
+        if need_mkdir:
+            made_dirs.add(parent)
+    if need_mkdir:
+        try:
+            rc("operations/mkdir", fs=dst_fs, remote=parent,
+               _timeout=60, _proxy=proxy, _strict=True)
+        except Exception:
+            pass            # 目录多半已存在；真建不出来会在 copyfile 报出具体原因
+    # 2) 复制：瞬时 / 未知错误按 2s / 8s / 30s 退避重试，确定性错误立刻归类
+    attempts = max(0, int(s.get("fileRetryMax") or 0)) + 1
+    last = ""
+    for i in range(attempts):
+        if _safe_requested_stop(job["id"]):
+            return "pending", ""
+        try:
+            rc("operations/copyfile", srcFs=src_fs, srcRemote=rel,
+               dstFs=dst_fs, dstRemote=safe, _timeout=FILE_RC_TIMEOUT,
+               _proxy=proxy, _strict=True)
+            with xlock:
+                existing[safe] = size
+            if job.get("mode") == "move":
+                try:        # 只有复制成功才删云端源；删失败不抹掉下载本身的成功
+                    rc("operations/deletefile", fs=src_fs, remote=rel,
+                       _timeout=120, _proxy=proxy, _strict=True)
+                except Exception as e:
+                    return "done", "已下载，但删除云端源文件失败：%s" % mask_secret(str(e)[:120])
+            return "done", ""
+        except Exception as e:
+            last = str(e)
+            kind, friendly = classify_error(last, context=rel)
+            if kind == "FILE_FATAL":
+                return "failed", friendly
+            if kind == "ACCOUNT_FATAL":
+                st_ = _fatal_job_error(last)
+                raise _JobAbort(st_[0] if st_ else "error", friendly)
+            if kind == "DISK_FATAL":
+                raise _JobAbort("stopped", friendly + "；已停止任务，处理后点「继续」")
+            if i < attempts - 1:
+                time.sleep(SAFE_BACKOFF[min(i, len(SAFE_BACKOFF) - 1)])
+    return "failed", "重试 %d 次仍失败：%s" % (attempts - 1, mask_secret(last[:200]))
+
+
+def _safe_dir_worker(job_id, snapshot=None):
+    job = snapshot or _xfer_fetch(job_id)
+    if not job:
+        return
+    s = load_settings()
+    vol = job_volume(job)
+
+    def bail(state, msg):
+        _xfer_patch(job_id, state=state, error=str(msg)[:400], phase="",
+                    speed=0, eta=None, curfile="")
+        flush_name_maps()
+
+    try:
+        try:
+            files = expand_source_files(job)
+        except Exception as e:
+            st_ = _fatal_job_error(str(e))
+            return bail(st_[0] if st_ else "error",
+                        st_[1] if st_ else ("扫描源目录失败：%s" % mask_secret(str(e)[:200])))
+        entries = build_name_map(files, job.get("remote"), job.get("subpath") or "", s)
+        total = sum(e["size"] for e in entries)
+        plan = {"version": 2, "remote": job.get("remote"), "src": job.get("src"),
+                "dest": job.get("dest"), "entries": entries}
+        # 续传：同一次任务的计划文件还在，就把已完成的文件状态接回来（映射不漂移）
+        prev = load_file_plan(job_id)
+        if prev and prev.get("src") == plan["src"] and prev.get("dest") == plan["dest"]:
+            old = {e.get("src"): e for e in prev["entries"]}
+            for e in entries:
+                o = old.get(e["src"])
+                if o and o.get("dst") == e["dst"] and o.get("status") in ("done", "skipped"):
+                    e["status"] = o["status"]
+        save_file_plan(job_id, plan)
+        if not entries:
+            return bail("done", "源目录为空，或文件全被过滤规则跳过，没有需要下载的内容")
+
+        state = {"bytes": sum(e["size"] for e in entries if e["status"] in ("done", "skipped")),
+                 "lastPatch": 0.0, "lastPlan": 0.0, "lastBytes": 0, "lastTs": time.time(),
+                 "active": {}, "abort": None}
+        state["lastBytes"] = state["bytes"]
+        plock = threading.Lock()
+        existing, made_dirs = _dest_index(job), set()
+        xlock = threading.Lock()
+
+        def patch(force=False):
+            with plock:
+                now = time.time()
+                if not force and now - state["lastPatch"] < 1.0:
+                    return
+                dt = max(0.001, now - state["lastTs"])
+                speed = max(0.0, (state["bytes"] - state["lastBytes"]) / dt)
+                state["lastTs"], state["lastBytes"], state["lastPatch"] = now, state["bytes"], now
+                done = sum(1 for e in entries if e["status"] in ("done", "skipped"))
+                failed = sum(1 for e in entries if e["status"] == "failed")
+                fields = dict(bytes=state["bytes"], total=total, speed=round(speed, 1),
+                              eta=(max(0, total - state["bytes"]) / speed if speed > 0 else None),
+                              filesTotal=len(entries), filesDone=done, filesFailed=failed,
+                              files=len(state["active"]),
+                              curfile=next(iter(state["active"].values()), ""))
+                if force or now - state["lastPlan"] > 5.0:
+                    state["lastPlan"] = now
+                    save_file_plan(job_id, plan)
+            _xfer_patch(job_id, **fields)
+            flush_name_maps()
+
+        def run_one(e):
+            if state["abort"] is not None or _safe_requested_stop(job_id):
+                return                      # 保持 pending，下次继续从这里接着下
+            e["status"] = "running"
+            with plock:
+                state["active"][e["src"]] = e["src"]     # curfile 始终显示原始相对路径
+            try:
+                st, err = transfer_one(job, e, s, existing, made_dirs, xlock)
+                e["status"] = "pending" if st == "pending" else st
+                e["error"] = err or ""
+                e["attempts"] = int(e.get("attempts") or 0) + 1
+                if st in ("done", "skipped"):
+                    with plock:
+                        state["bytes"] += e["size"]
+                record_file_state(vol, job.get("remote"), e["srcFull"], safe=e["dst"],
+                                  original=e["srcFull"], size=e["size"], status=e["status"],
+                                  attempts=e["attempts"], error=e["error"])
+            except _JobAbort as ex:
+                state["abort"] = ex
+                e["status"], e["error"] = "failed", ex.msg
+                ev = _safe_stop_event(job_id)
+                if ev:
+                    ev.set()      # 让其余文件尽快退出；在飞的 copyfile 等它自然返回
+            except Exception as ex:
+                e["status"], e["error"] = "failed", mask_secret(str(ex)[:200])
+            finally:
+                with plock:
+                    state["active"].pop(e["src"], None)
+                patch()
+
+        _xfer_patch(job_id, state="running", phase="copy", total=total,
+                    bytes=state["bytes"], filesTotal=len(entries), error="")
+        workers = max(1, min(8, int(s.get("transfers") or 4)))
+        todo = [e for e in entries if e["status"] == "pending"]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(run_one, todo))
+        patch(force=True)
+
+        cur = _xfer_fetch(job_id) or {}
+        if state["abort"] is not None:
+            ex = state["abort"]
+            return bail(ex.state, ex.msg)
+        if cur.get("state") == "stopped":       # 用户点了暂停：不要覆盖成其它终态
+            _xfer_patch(job_id, speed=0, eta=None, phase="", curfile="",
+                        error="已暂停（点「继续」会跳过已完成文件接着传）")
+            return
+        # verifying：文件数与字节数对账（逐文件复制时已按大小校验过目标）
+        _xfer_patch(job_id, phase="check", speed=0, eta=None, curfile="")
+        done = sum(1 for e in entries if e["status"] in ("done", "skipped"))
+        skipped = sum(1 for e in entries if e["status"] == "skipped")
+        failed = [e for e in entries if e["status"] == "failed"]
+        got = sum(e["size"] for e in entries if e["status"] in ("done", "skipped"))
+        if not done and failed:
+            return bail("error", "全部 %d 个文件都下载失败：%s" % (len(failed), failed[0]["error"][:200]))
+        notes = []
+        if failed:
+            notes.append("%d 个文件失败，其余 %d 个已完成；点「详情」查看原因并可仅重试失败项"
+                         % (len(failed), done))
+        if job.get("mode") == "move":
+            if not failed:
+                try:    # 全部成功后清空源目录里的空壳（保留根目录本身）
+                    rc("operations/rmdirs", fs=job["src"], remote="", leaveRoot=True,
+                       _timeout=300, _proxy=bool(job.get("proxy")))
+                except Exception:
+                    pass
+            if skipped:
+                notes.append("%d 个文件目标已存在而跳过，对应云端源文件保留未删" % skipped)
+        _xfer_patch(job_id, state="done", phase="", speed=0, eta=None, curfile="",
+                    bytes=got, total=total, error="；".join(notes),
+                    filesDone=done, filesFailed=len(failed))
+        flush_name_maps()
+    except Exception as e:
+        bail("error", "目录下载异常终止：%s" % mask_secret(str(e)[:250]))
+    finally:
+        with SAFE_JOBS_LOCK:
+            SAFE_JOBS.pop(job_id, None)
+
 
 def track_transferred(job, transferring):
     """core/stats 不提供『已完成文件』历史，只能靠轮询 transferring 列表的差异推断：
@@ -1583,6 +2169,16 @@ FATAL_JOB_ERRORS = (
     # 用户照着做也修不好。真实原因是 token 失效后 rclone 回退直登，配置里却没账号密码。
     ("no username", "error", "账号 Token 已失效（rclone 回退直登时缺账号密码），请到账号页点该账号的「重新登录」重新采集"),
     ("account_not_found", "error", "云端账号不存在，请检查账号配置"),
+    # v3.83：文件名 / 路径超出文件系统限制是确定性失败，重试 100 次也不会成功。
+    # 必须让任务立刻脱离 running，否则就是「永远下载中、0 速度、进度不动」的假死。
+    # 对 v2 目录任务，这类错误在 transfer_one 里按 FILE_FATAL 只标记单个文件，不走这里。
+    ("file name too long", "error", "文件名超出文件系统长度限制，已终止（v3.83 起新任务会自动安全命名后下载）"),
+    ("filename too long", "error", "文件名超出文件系统长度限制，已终止（v3.83 起新任务会自动安全命名后下载）"),
+    ("name too long", "error", "文件名超出文件系统长度限制，已终止（v3.83 起新任务会自动安全命名后下载）"),
+    ("path too long", "error", "路径超出文件系统长度限制，已终止（可缩短保存目录名后重试）"),
+    ("file name or extension is too long", "error", "文件名或扩展名太长，已终止（v3.83 起新任务会自动安全命名后下载）"),
+    ("文件名或扩展名太长", "error", "文件名或扩展名太长，已终止（v3.83 起新任务会自动安全命名后下载）"),
+    ("路径太长", "error", "路径超出文件系统长度限制，已终止（可缩短保存目录名后重试）"),
 )
 
 # v3.47：凭证类终态要把对应账号立刻标成「需重新登录」（账号徽标变红 + 行内出按钮）。
@@ -3433,6 +4029,29 @@ def job_live(job):
             job["curfile"] = ""
             job["error"] = "控制台重启过，转移已中断（点「继续」会跳过已传完的文件接着传）"
         return
+    if job.get("naming") == "v2" and not job.get("single_file"):
+        # v3.83 目录任务：由 _safe_dir_worker 线程推进度，没有 rclone 异步 job 可查。
+        with SAFE_JOBS_LOCK:
+            alive = job["id"] in SAFE_JOBS
+        if job.get("state") == "running" and not alive:
+            job["state"] = "stopped"
+            job["speed"] = 0
+            job["eta"] = None
+            job["phase"] = ""
+            job["curfile"] = ""
+            job["error"] = "控制台重启过，下载已中断（点「继续」会跳过已完成文件接着传）"
+        return
+    if job.get("naming") == "v2" and job.get("single_file") \
+            and job.get("state") in ("done", "stopped", "error"):
+        # 单文件安全命名：终态时把结果回写映射清单，原名 ↔ 落盘名可追溯
+        if job.get("_mapState") != job["state"]:
+            job["_mapState"] = job["state"]
+            record_file_state(job_volume(job), job.get("remote"), job.get("subpath"),
+                              safe=job.get("safe_leaf") or job.get("leaf"),
+                              original=job.get("subpath"), size=int(job.get("bytes") or 0),
+                              status=job["state"], error=str(job.get("error") or "")[:200],
+                              _flush=True)
+        return
     jid = job.get("jobid")
     if not jid or job["state"] not in ("running",):
         return
@@ -3538,6 +4157,17 @@ def stop_job_entry(j):
         return
     if j.get("kind") == "xfer":
         _xfer_kill(j)
+        j["state"] = "stopped"
+        j["speed"] = 0
+        j["eta"] = None
+        j["phase"] = ""
+        j["curfile"] = ""
+        return
+    if j.get("naming") == "v2" and not j.get("single_file"):
+        # v3.83 目录任务：通知工作线程停止接收新文件，在飞的 copyfile 等它返回
+        ev = _safe_stop_event(j["id"])
+        if ev:
+            ev.set()
         j["state"] = "stopped"
         j["speed"] = 0
         j["eta"] = None
@@ -3832,15 +4462,49 @@ def sample_history():
     except Exception:
         pass
 
+def _stuck_watchdog(j, s):
+    """v3.83 卡住看门狗（只作用于 v2 任务，旧任务行为完全不变）。
+
+    判定刻意保守：字节数整个窗口没动 **且** 当前速度为 0 **且** 没有在传文件，
+    才认定卡死。大文件单线程复制可能十几分钟不涨字节，但那时 files>0，不会误杀。"""
+    if j.get("naming") != "v2" or j.get("state") != "running":
+        return
+    minutes = float(s.get("stuckWatchdogMin") or 0)
+    if minutes <= 0:
+        return
+    now = time.time()
+    cur = int(j.get("bytes") or 0)
+    prev = j.get("_progBytes")
+    # 注意不能用 `j.get("_progBytes") or -1`：0 字节是合法进度，会被或运算吃掉
+    if prev is None or cur != int(prev) or not j.get("_progAt"):
+        j["_progBytes"], j["_progAt"] = cur, now
+        return
+    if j.get("speed") or j.get("files"):
+        j["_progAt"] = now          # 有速度 / 有在传文件 = 还活着，重新计窗口
+        return
+    if now - float(j["_progAt"]) < minutes * 60:
+        return
+    try:
+        stop_job_entry(j)
+    except Exception:
+        pass
+    j["state"] = "error"
+    j["speed"], j["eta"], j["curfile"], j["phase"] = 0, None, "", ""
+    j["error"] = ("任务超过 %d 分钟没有任何进度，已自动终止（疑似卡住）；"
+                  "点「继续」可跳过已完成文件重试" % int(minutes))
+
+
 def poll_jobs_live():
     """后端兜底轮询任务终态：不再依赖浏览器一直开着。
     与 jobs action 同样在 LOCK 内执行，保证 jobs.json 读写串行。"""
     with LOCK:
         jobs = load_jobs()
+        s = load_settings()
         before = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
         for j in jobs:
             if j["state"] == "running":
                 job_live(j)
+                _stuck_watchdog(j, s)
         if json.dumps(jobs, ensure_ascii=False, sort_keys=True) != before:
             save_jobs(jobs)
 
@@ -6112,6 +6776,10 @@ def api(action, body):
             if flt:
                 job["filter"] = flt
                 job["filterText"] = describe_filter(flt)
+            # v3.83：安全命名只作用于「新创建」的任务；老任务没有 naming 字段，
+            # 继续走 v3.82 及以前的原样命名逻辑，升级不会影响在跑 / 排队的旧任务。
+            if s.get("safeNaming", True):
+                job["naming"] = "v2"
             if is_file:
                 parent, _, leaf = sub.rpartition("/")
                 job["single_file"] = True
@@ -6119,6 +6787,12 @@ def api(action, body):
                 job["src_dir"] = "%s:%s" % (body["remote"], parent)
                 # 指定保存目录时 dest 本身就是目标目录；否则目标目录是该卷的根
                 job["dst_dir"] = dest if folder else vroot
+                if job.get("naming") == "v2":
+                    # 源端仍用 leaf（原名），只有落盘名换成安全名
+                    job["safe_leaf"] = safe_basename(
+                        leaf, body["remote"], sub,
+                        max_bytes=int(s.get("safeNameMaxBytes") or 180),
+                        hash_len=int(s.get("safeNameHashLen") or 12))
             launched_ok = True
             if running < s["maxConcurrent"]:
                 launched_ok = launch_job(job, s)
@@ -6407,6 +7081,39 @@ def api(action, body):
             save_jobs(jobs)
         return {"ok": True}
 
+    if action == "jobretryfailed":
+        # v3.83：只把目录任务里「失败」的文件重置为待下载，已完成 / 已跳过的一律不动
+        with LOCK:
+            s = load_settings()
+            jobs = load_jobs()
+            job = next((j for j in jobs if j.get("id") == body.get("id")), None)
+            if not job:
+                return {"error": "任务不存在"}
+            if job.get("naming") != "v2" or job.get("single_file"):
+                return {"error": "只有安全命名的目录任务支持按文件重试"}
+            if job.get("state") in ("running", "queued"):
+                return {"error": "任务正在运行或排队中，请先暂停再重试失败项"}
+            plan = load_file_plan(job["id"])
+            if not plan:
+                return {"error": "没有找到该任务的文件清单，请直接点「继续」"}
+            n = 0
+            for e in plan["entries"]:
+                if e.get("status") == "failed":
+                    e["status"], e["error"], e["attempts"] = "pending", "", 0
+                    n += 1
+            if not n:
+                return {"error": "没有失败的文件需要重试"}
+            save_file_plan(job["id"], plan)
+            job["error"] = ""
+            job["filesFailed"] = 0
+            running = sum(1 for j in jobs if j["state"] == "running")
+            if running < s["maxConcurrent"]:
+                launch_job(job, s)
+            else:
+                job["state"] = "queued"
+            save_jobs(jobs)
+        return {"ok": True, "count": n}
+
     if action == "jobreproxy":
         # 切换单个任务的下载路径并立即重启：停掉旧 rclone job → 换守护进程重新 launch
         with LOCK:
@@ -6434,8 +7141,16 @@ def api(action, body):
                 # 转移任务可能挂着 rclone 子进程，删记录前先收掉，避免孤儿进程
                 if j["id"] == body.get("id") and j.get("kind") == "xfer":
                     _xfer_kill(j)
+                if j["id"] == body.get("id") and j.get("naming") == "v2":
+                    ev = _safe_stop_event(j["id"])
+                    if ev:
+                        ev.set()
             jobs = [j for j in jobs if j["id"] != body.get("id")]
             save_jobs(jobs)
+        try:                    # v3.83：文件级执行计划随任务记录一起删，不留下孤儿 JSON
+            os.remove(_plan_path(body.get("id")))
+        except Exception:
+            pass
         return {"ok": True}
 
     if action == "stats":
@@ -6465,7 +7180,9 @@ def api(action, body):
                       "multiThreadStreams", "multiThreadCutoffMB", "retries",
                       "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
                       "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
-                      "transfersClearedAt", "nasHomeUrl", "proxyUrl", "netMode"):
+                      "transfersClearedAt", "nasHomeUrl", "proxyUrl", "netMode",
+                      "safeNaming", "safeNameMaxBytes", "safeNameHashLen",
+                      "safePathMaxBytes", "stuckWatchdogMin", "fileRetryMax"):
                 if k in body:
                     s[k] = body[k]
             # v3.77：两个旧开关不再由前端单独控制，统一跟随全局模式
@@ -6531,6 +7248,11 @@ def api(action, body):
                 if j.get("kind") == "xfer":
                     try:
                         _xfer_kill(j)
+                    except Exception:
+                        pass
+                if j.get("naming") == "v2":
+                    try:        # v3.83：一并清掉该任务的文件级执行计划
+                        os.remove(_plan_path(j["id"]))
                     except Exception:
                         pass
             save_jobs(keep)
@@ -6709,6 +7431,31 @@ def api(action, body):
             return {"error": "任务不存在"}
         d = {"job": job, "transferring": [], "files": [], "diskTotal": 0,
              "diskCount": 0, "exists": False, "truncated": False}
+        if job.get("naming") == "v2":
+            # v3.83：详情里同时给出原名与落盘名，以及文件级进度 / 失败清单
+            d["naming"] = "v2"
+            d["originalName"] = job.get("leaf") or basename_of(job.get("subpath") or "")
+            d["safeName"] = job.get("safe_leaf") or ""
+            plan = None if job.get("single_file") else load_file_plan(job["id"])
+            if plan:
+                entries = plan.get("entries") or []
+                d["fileStats"] = {
+                    "total": len(entries),
+                    "done": sum(1 for e in entries if e.get("status") in ("done", "skipped")),
+                    "failed": sum(1 for e in entries if e.get("status") == "failed"),
+                    "pending": sum(1 for e in entries if e.get("status") in ("pending", "running")),
+                }
+                fails = [{"src": e.get("src"), "dst": e.get("dst"),
+                          "error": e.get("error") or "", "attempts": e.get("attempts") or 0}
+                         for e in entries if e.get("status") == "failed"]
+                d["failedFiles"] = fails[:200]
+                d["failedTruncated"] = len(fails) > 200
+                d["nameMap"] = [{"src": e.get("src"), "dst": e.get("dst"),
+                                 "status": e.get("status"), "size": e.get("size") or 0}
+                                for e in entries if e.get("src") != e.get("dst")][:200]
+                d["transferring"] = [{"name": e.get("src"), "bytes": 0,
+                                      "total": e.get("size") or 0, "speed": 0}
+                                     for e in entries if e.get("status") == "running"][:20]
         if job["state"] == "running" and job.get("jobid"):
             try:
                 s = rc("core/stats", group="job/%d" % job["jobid"],

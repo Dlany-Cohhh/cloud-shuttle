@@ -20,12 +20,13 @@ curl -s -X POST http://<控制台地址>/api \
 | `settings` / `savesettings` | 读取 / 保存控制台设置 |
 | `accounts` / `accttest` / `acctpurge` | 账号列表 / 单账号测试 / 清理无 type 的残留配置段 |
 | `jobs` / `start` / `stop` / `resume` / `remove` | 任务列表 / 启动 / 停止 / 断点续传 / 删除 |
+| `jobretryfailed` | v3.83：仅重试目录任务里失败的文件，已完成的不会重复下载 |
 | `dirs` / `localdirs` / `scanpath` | 云盘与本地目录浏览 |
 | `localfiles` / `localrenamebatch` | 本地文件浏览 / NAS 侧重命名（批量与单项共用，items 传 1 项即单项） |
 | `renamebatch` | 云盘目录内批量重命名 |
 | `version` | 版本与运行状态 |
 
-## 全部 action（由源码自动提取，共 81 个）
+## 全部 action（由源码自动提取，共 82 个）
 
 - `about`
 - `accounts`
@@ -60,6 +61,7 @@ curl -s -X POST http://<控制台地址>/api \
 - `history`
 - `jobdetail`
 - `jobreproxy`
+- `jobretryfailed`
 - `jobs`
 - `localdirs`
 - `localfiles`
@@ -187,4 +189,20 @@ grep -n 'action ==' download-console.py
 
 注意与 `cloudlink` 区分：`cloudlink` 走 `rclone link`，返回的是**临时下载直链**，
 不是可转存的分享链接。
+
+### 长文件名安全命名（v3.83+）
+
+新任务会带 `naming: "v2"` 标记；老任务没有该字段，行为与 v3.82 完全一致。
+
+| 接口 / 字段 | 说明 |
+| --- | --- |
+| `savesettings` | 新增 `safeNaming`（总开关，默认开）、`safeNameMaxBytes`（180）、`safeNameHashLen`（12）、`safePathMaxBytes`（240）、`stuckWatchdogMin`（10，0 = 关闭）、`fileRetryMax`（3） |
+| `start` 返回的 job | `naming`（`v2`）；单文件任务另有 `leaf`（原始文件名）与 `safe_leaf`（安全落盘名） |
+| `jobs` 中的 v2 目录任务 | `filesTotal` / `filesDone` / `filesFailed` 文件级计数；`phase` 为 `scan` / `copy` / `check`；`curfile` 始终是**原始**相对路径 |
+| `jobdetail` | 新增 `naming` / `originalName` / `safeName`；目录任务另有 `fileStats{total,done,failed,pending}`、`failedFiles[]`（`src` 原路径 / `dst` 落盘路径 / `error` / `attempts`，最多 200 条）、`nameMap[]`（被改名文件的对照表） |
+| `jobretryfailed` | 入参 `id`；把计划里 `failed` 的文件重置为待下载并重新排队，返回 `{ok, count}`。任务在跑 / 排队时拒绝 |
+
+落盘映射写在每个下载卷根目录的 `.cloudshuttle-name-map.json`（v2，原子写）；
+每个目录任务的文件级执行计划在数据目录 `jobfiles/<任务id>.json`，删除任务记录时一并清理。
+设计细节见 [LONG-FILENAME-DOWNLOAD-DESIGN.md](LONG-FILENAME-DOWNLOAD-DESIGN.md)。
 

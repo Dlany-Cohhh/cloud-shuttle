@@ -2,9 +2,9 @@
 
 > **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
-![version](https://img.shields.io/badge/version-v3.82-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
+![version](https://img.shields.io/badge/version-v3.83-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
-**当前版本 v3.82** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
+**当前版本 v3.83** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 
@@ -125,7 +125,7 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 | 模块 | 能力 |
 | --- | --- |
 | 账号管理 | 多账号列表、导入 / 采集 Token、重新登录、编辑改名、单账号测试、**一键测试全部**（3 路并发 + 进度）、容量与凭证状态、清理残留配置段 |
-| 下载任务 | 分享链接解析、批量建任务、启停 / 断点续传 / 重试、实时速度与进度、并发数与定时启停、磁盘空间保护、高级 rclone 参数、代理逐任务切换、任务详情与错误诊断 |
+| 下载任务 | 分享链接解析、批量建任务、启停 / 断点续传 / 重试、实时速度与进度、并发数与定时启停、磁盘空间保护、高级 rclone 参数、代理逐任务切换、任务详情与错误诊断、**长文件名安全命名（v3.83）** |
 | 云盘浏览 | 目录浏览、在线播放、对比测速、一致性校验、批量重命名（模板 / 正则 / 序号，先预览再执行）、回收站、分享提取次数管理、查重与导出 |
 | 本地文件 | 浏览 / 播放 / 下载、M3U 与 CSV 导出、批量解压、**单项重命名**（文件夹 / 文件）、**批量重命名**（模板 / 正则 / 序号，整批预检 + 失败回滚）、一致性校验 |
 | 统计 | 实时速度、24 小时曲线、14 天下载量、账号容量、已完成传输、rclone 健康指标 |
@@ -134,6 +134,8 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 | 界面与维护 | 32 套主题 + 跟随昼夜、侧栏折叠、版本与更新检查、一键下载升级 / 回滚、发行包校验与自动重启 |
 
 几个实现上值得一提的点：
+
+- **长文件名安全命名（v3.83）**：新任务源端永远用云端原始文件名，落盘名自动清洗 / 按 UTF-8 字节截断并加 `~哈希` 后缀（正常文件名原样保留），原名 ↔ 落盘名写进每卷的 `.cloudshuttle-name-map.json`。目录任务改为逐文件复制，单个文件失败不再拖住整批，支持「仅重试失败项」；文件名过长等确定性错误立即终态化，不再永远显示「下载中」。设置里可一键关闭回滚，旧任务行为不变。详见 [docs/LONG-FILENAME-DOWNLOAD-DESIGN.md](docs/LONG-FILENAME-DOWNLOAD-DESIGN.md)。
 
 - **逐任务选代理**：rclone-backend 内跑两个 rcd（5572 直连 / 5573 经 mihomo 代理），任务可单独指定走哪条链路，不必重建容器。
 - **Token 保活**：PikPak 的 `refresh_token` 单次轮换，谁刷新谁必须立刻落盘；控制台配合每小时的续期脚本，并识别 rclone 回写产生的无 `type` 空壳段。
@@ -316,7 +318,7 @@ curl -s http://localhost:5566/api -H 'Content-Type: application/json' \
   -d '{"action":"accounts"}'
 ```
 
-共 65 个 `action`，覆盖账号、任务、云盘、本地文件、统计、设置、分享、解压与在线更新等，完整清单与参数见 [docs/API.md](docs/API.md)。更新相关的 4 个 action 是 `updatecheck` / `updateapply` / `updatestate` / `updaterollback`：
+共 82 个 `action`，覆盖账号、任务、云盘、本地文件、统计、设置、分享、解压与在线更新等，完整清单与参数见 [docs/API.md](docs/API.md)。更新相关的 4 个 action 是 `updatecheck` / `updateapply` / `updatestate` / `updaterollback`：
 
 ```bash
 # 检查最新版本（force=true 跳过 10 分钟缓存）

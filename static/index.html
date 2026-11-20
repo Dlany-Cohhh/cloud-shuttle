@@ -819,6 +819,9 @@
                     <span v-if="j.filterText" class="badge-pill bg-warning/15 text-warning" :title="'下载过滤：' + j.filterText">
                       <i class="ti ti-filter"></i>已过滤
                     </span>
+                    <span v-if="j.naming==='v2'" class="badge-pill bg-secondary/15 text-secondary" title="v3.83 安全命名：源端用云端原始文件名，落盘名自动清洗 / 截断 / 加哈希，原名可在详情里追溯">
+                      <i class="ti ti-shield-check mr-0.5"></i>安全命名
+                    </span>
                     <span v-if="j.cleaned" class="badge-pill bg-base-content/10 text-base-content/50">已清理</span>
                     <div class="flex shrink-0 gap-1.5">
                       <button class="btn-sm" @click="openDetail(j.id)"><i class="ti ti-info-circle"></i>详情</button>
@@ -856,7 +859,9 @@
                     <template v-else>
                       <span>{{j.pct.toFixed(1)}}%</span>
                       <span>{{fmt(j.bytes)}} / {{j.total>0?fmt(j.total):'--'}}</span>
+                      <span v-if="j.filesTotal" class="text-base-content/50">已完成 {{j.filesDone||0}} / {{j.filesTotal}} 个文件<template v-if="j.filesFailed"><span class="text-error">（{{j.filesFailed}} 个失败）</span></template></span>
                     </template>
+                    <span v-if="j.state==='running' && j.phaseStr" class="text-info">{{j.phaseStr}}</span>
                     <span v-if="j.state==='running'" class="text-info">{{j.speedStr}}</span>
                     <span v-if="j.state==='running'">剩余 {{j.etaStr}}</span>
                     <span v-if="j.state==='running' && j.curfile" class="max-w-48 truncate text-accent" :title="j.curfile">正在传 {{j.curfile}}</span>
@@ -1348,6 +1353,21 @@
                   </div>
                 </div>
 
+                <!-- v3.83：长文件名安全命名（只作用于新任务，旧任务行为不变） -->
+                <div class="flex flex-wrap items-center gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
+                  <i class="ti ti-shield-check text-lg leading-none text-secondary"></i>
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                      长文件名安全命名
+                      <span class="badge-pill bg-secondary/15 text-secondary">v3.83</span>
+                    </div>
+                    <div class="mt-0.5 text-xs leading-relaxed text-base-content/50">
+                      {{form.safeNaming ? '已开启：新任务落盘名自动清洗 / 截断并加哈希后缀，源端仍用云端原始文件名；原名 ↔ 落盘名写入每卷的 .cloudshuttle-name-map.json；目录任务逐文件下载，单个文件失败不再拖住整批' : '已关闭：新任务恢复旧行为（文件名原样落盘，超长名可能一直显示下载中）。已下载的文件名不会被改回去'}}
+                    </div>
+                  </div>
+                  <input id="sSafeNaming" type="checkbox" class="toggle toggle-primary" v-model="form.safeNaming" aria-label="长文件名安全命名">
+                </div>
+
                 <!-- v3.37：基础 / 高级两块合并为一张卡，高级参数由开关控制显示与生效 -->
                 <div class="flex flex-wrap items-center gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
                   <i class="ti ti-adjustments text-lg leading-none text-info"></i>
@@ -1408,6 +1428,27 @@
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sEmpty">保留空目录</label>
                   <input id="sEmpty" type="checkbox" class="toggle toggle-primary" v-model="form.createEmptySrcDirs">
                   <span class="text-xs text-base-content/50">--create-empty-src-dirs · 默认开，目录结构 1:1（对目录任务生效）</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sSafeNameMax">落盘名字节上限 / 哈希长度</label>
+                  <input id="sSafeNameMax" type="number" min="64" max="240" class="fld w-24" v-model.number="form.safeNameMaxBytes">
+                  <input type="number" min="6" max="24" class="fld w-24" v-model.number="form.safeNameHashLen" aria-label="哈希后缀长度">
+                  <span class="text-xs text-base-content/50">单个文件名 UTF-8 字节上限（默认 180，Linux 单组件通常 255）/ 哈希后缀长度（默认 12）</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sSafePathMax">相对路径字节上限</label>
+                  <input id="sSafePathMax" type="number" min="120" max="1024" class="fld w-24" v-model.number="form.safePathMaxBytes">
+                  <span class="text-xs text-base-content/50">默认 240，给 Windows 根路径前缀留余量，避免「文件名合法但完整路径超长」</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sStuck">卡住看门狗（分钟）</label>
+                  <input id="sStuck" type="number" min="0" max="1440" class="fld w-24" v-model.number="form.stuckWatchdogMin">
+                  <span class="text-xs text-base-content/50">默认 10；安全命名任务无速度、无在传文件且字节长期不涨时自动终止，0 = 关闭</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sFileRetry">单文件重试次数</label>
+                  <input id="sFileRetry" type="number" min="0" max="10" class="fld w-24" v-model.number="form.fileRetryMax">
+                  <span class="text-xs text-base-content/50">默认 3，瞬时 / 未知错误按 2s / 8s / 30s 退避；文件名过长等确定性错误不重试</span>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sLogLevel">日志级别 / 文件</label>
@@ -1939,6 +1980,10 @@
               <div class="text-xs tabular-nums text-base-content/60">
                 {{detail.job.total>0?(detail.job.bytes/detail.job.total*100).toFixed(1):0}}% · {{fmt(detail.job.bytes)}} / {{detail.job.total>0?fmt(detail.job.total):'--'}} · {{fmtSpeed(detail.job.speed)}}
               </div>
+              <div v-if="detail.fileStats" class="text-xs tabular-nums text-base-content/60">
+                已完成 {{detail.fileStats.done}} / {{detail.fileStats.total}} 个文件（{{detail.fileStats.total? (detail.fileStats.done/detail.fileStats.total*100).toFixed(1):0}}%）
+                <span v-if="detail.fileStats.failed" class="text-error">· {{detail.fileStats.failed}} 个失败</span>
+              </div>
             </div>
             <div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
               <span class="text-base-content/40">来源</span><span class="truncate tabular-nums" :title="detail.job.src">{{detail.job.src}}</span>
@@ -1949,6 +1994,18 @@
               <span class="text-base-content/40">下载路径</span><span v-if="detail.job.method==='externalshare'">PikPak 服务端原生转存（不消耗下载配额）</span>
               <span v-else>{{detail.job.proxy ? '经 代理（独立守护进程 5573）' : '直连（主守护进程 5572）'}}</span>
               <span class="text-base-content/40">开始</span><span class="tabular-nums">{{detail.job.started}}</span>
+              <template v-if="detail.naming==='v2'">
+                <span class="text-base-content/40">命名方式</span>
+                <span class="text-secondary">安全命名 v2 · 源端用原始文件名，落盘用安全名（清洗 / 截断 / 哈希后缀）</span>
+                <template v-if="detail.job.single_file">
+                  <span class="text-base-content/40">原始文件名</span>
+                  <span class="flex min-w-0 items-center gap-1.5"><span class="min-w-0 flex-1 break-all" :title="detail.originalName">{{detail.originalName}}</span>
+                    <button class="btn-xs shrink-0" title="复制原始文件名" @click="copyText(detail.originalName)"><i class="ti ti-copy"></i></button></span>
+                  <span class="text-base-content/40">落盘文件名</span>
+                  <span class="flex min-w-0 items-center gap-1.5"><span class="min-w-0 flex-1 break-all" :title="detail.safeName || detail.originalName">{{detail.safeName || detail.originalName}}</span>
+                    <button class="btn-xs shrink-0" title="复制落盘文件名" @click="copyText(detail.safeName || detail.originalName)"><i class="ti ti-copy"></i></button></span>
+                </template>
+              </template>
             </div>
             <div v-if="detail.job.state==='running'">
               <div class="mb-1 flex items-center gap-2 text-sm font-medium text-base-content/80">
@@ -1961,6 +2018,37 @@
               </div>
               <div v-if="!detail.transferring.length" class="py-2 text-xs text-base-content/40">暂无进行中的文件传输</div>
             </div>
+            <!-- v3.83：失败文件清单（只影响单个文件，不阻塞整个目录任务） -->
+            <div v-if="detail.failedFiles && detail.failedFiles.length">
+              <div class="mb-1 flex flex-wrap items-center gap-2 text-sm font-medium text-base-content/80">
+                <i class="ti ti-alert-triangle text-error"></i>失败文件（{{detail.fileStats ? detail.fileStats.failed : detail.failedFiles.length}}）
+                <button class="btn-sm warn ml-auto" title="只重试下面这些失败的文件，已完成的不会重复下载" @click="retryFailedFiles(detail.job.id)"><i class="ti ti-rotate"></i>仅重试失败项</button>
+              </div>
+              <div class="max-h-60 overflow-y-auto rounded-xl border border-error/20 px-3">
+                <div v-for="(f,i) in detail.failedFiles" :key="i" class="flex flex-col gap-1 border-t border-base-content/8 py-2 text-xs first:border-t-0">
+                  <div class="flex items-center gap-2">
+                    <span class="min-w-0 flex-1 break-all" :title="'原始路径：' + f.src">{{f.src}}</span>
+                    <button class="btn-sm shrink-0" title="复制原始文件名 / 相对路径" @click="copyText(f.src)"><i class="ti ti-copy"></i>原名</button>
+                    <button class="btn-sm shrink-0" title="复制落盘相对路径（安全名）" @click="copyText(f.dst)"><i class="ti ti-copy"></i>落盘路径</button>
+                  </div>
+                  <div class="break-all text-base-content/50">落盘为 {{f.dst}} · 已尝试 {{f.attempts}} 次</div>
+                  <div class="break-all text-error">{{f.error}}</div>
+                </div>
+                <div v-if="detail.failedTruncated" class="py-2 text-center text-xs text-base-content/40">失败较多，仅显示前 200 条</div>
+              </div>
+            </div>
+            <!-- v3.83：原名 ↔ 落盘名对照（只列出被改名的文件） -->
+            <details v-if="detail.nameMap && detail.nameMap.length" class="rounded-xl border border-base-content/10 px-3 py-2">
+              <summary class="cursor-pointer text-sm font-medium text-base-content/80">
+                <i class="ti ti-arrows-exchange text-secondary"></i> 原名 ↔ 落盘名对照（{{detail.nameMap.length}} 个被安全改名的文件）
+              </summary>
+              <div class="mt-2 max-h-60 overflow-y-auto">
+                <div v-for="(m,i) in detail.nameMap" :key="i" class="border-t border-base-content/8 py-2 text-xs first:border-t-0">
+                  <div class="break-all" :title="'原始路径：' + m.src">{{m.src}}</div>
+                  <div class="break-all text-base-content/50">→ {{m.dst}} · {{fmt(m.size)}} · {{m.status==='failed'?'失败':(m.status==='pending'||m.status==='running'?'待下载':'已完成')}}</div>
+                </div>
+              </div>
+            </details>
             <div v-if="detail.job.state==='done' || detail.exists">
               <div class="mb-1 flex flex-wrap items-center gap-2 text-sm font-medium text-base-content/80">
                 <i class="ti ti-folder text-secondary"></i>磁盘文件

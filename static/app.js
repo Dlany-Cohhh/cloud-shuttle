@@ -216,7 +216,10 @@ Vue.createApp({
               advancedMode: false,
               multiThreadStreams: 8, multiThreadCutoffMB: 64, orderBy: "size,descending",
               bwLimitOn: false, bwLimit: "5M", retries: 10, timeout: "1m", idleTimeout: "10m",
-              createEmptySrcDirs: true, logLevel: "INFO", logFile: "" },
+              createEmptySrcDirs: true, logLevel: "INFO", logFile: "",
+              /* v3.83 长文件名安全命名 */
+              safeNaming: true, safeNameMaxBytes: 180, safeNameHashLen: 12,
+              safePathMaxBytes: 240, stuckWatchdogMin: 10, fileRetryMax: 3 },
       saving: false,
       bwSel: "off",
       bwBps: null,
@@ -804,7 +807,8 @@ Vue.createApp({
             ? ({ running: "解压中", done: "已解压", stopped: "已暂停", error: "出错", queued: "排队中" }[j.state] || "")
             : null,
           phaseStr: unzip ? (j.phase || (j.state === "running" ? "解压中" : ""))
-                          : (xfer && j.state === "running" ? (PHASE[j.phase] || "") : ""),
+                          : ((xfer || (j.naming === "v2" && !j.single_file)) && j.state === "running"
+                              ? (PHASE[j.phase] || "") : ""),
           title: unzip
             ? (j.engine === "local"
                 ? "解压 " + (j.name || j.subpath || "") + " → " + (j.dest || "同目录")
@@ -2827,6 +2831,13 @@ Vue.createApp({
         createEmptySrcDirs: s.createEmptySrcDirs ?? true,
         logLevel: s.logLevel || "INFO",
         logFile: s.logFile || "",
+        /* v3.83：缺省与后端 DEFAULTS 保持一致，否则保存设置会把新字段丢掉 */
+        safeNaming: s.safeNaming ?? true,
+        safeNameMaxBytes: s.safeNameMaxBytes ?? 180,
+        safeNameHashLen: s.safeNameHashLen ?? 12,
+        safePathMaxBytes: s.safePathMaxBytes ?? 240,
+        stuckWatchdogMin: s.stuckWatchdogMin ?? 10,
+        fileRetryMax: s.fileRetryMax ?? 3,
       };
     },
     async resetSettings() {
@@ -3204,6 +3215,16 @@ Vue.createApp({
       this.detailOpen = false;
       this.detail = null;
       this.detailId = null;
+    },
+    /* v3.83：只重试目录任务里失败的文件，已完成的不会重复下载 */
+    async retryFailedFiles(id) {
+      try {
+        const d = await this.api("jobretryfailed", { id });
+        if (d.error) { this.toast(d.error, "error"); return; }
+        this.toast("已重新排队 " + (d.count || 0) + " 个失败文件", "ok");
+        await this.loadDetail(true);
+      } catch (e) { this.toast("重试失败：" + e.message, "error"); }
+      this.refresh();
     },
     /* v3.42：详情弹窗「磁盘文件」→ 本地文件页，并定位到该任务的下载目录。
        目录若已被移动/删除，自动退到上一级，避免只看到一句冷冰冰的「不存在」。 */
