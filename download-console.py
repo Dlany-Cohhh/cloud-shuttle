@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.92"
+APP_VERSION = "v3.93"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -203,6 +203,11 @@ CONSOLE_PORT = int(os.environ.get("PORT") or 5566)             # 控制台 HTTP 
 RC_PORT = int(os.environ.get("RC_PORT") or 5572)               # rclone 主守护进程（直连 rc）
 PROXY_RC_PORT = int(os.environ.get("PROXY_RC_PORT") or 5573)   # 代理下载守护进程
 CONSOLE_PUBLIC_HOST = os.environ.get("CONSOLE_PUBLIC_HOST", "localhost:5566")
+# v3.93：两个容器都是 host 网络，控制台容器里 127.0.0.1:RC_PORT 直接可达，
+# 所以 RC 默认走 HTTP 直连——不再为每次调用 `docker exec` 起一个 rclone 进程。
+# HTTP 不可用（非 host 网络部署、rcd 没起来）时自动回退 exec，行为与旧版一致。
+RC_TRANSPORT = os.environ.get("RC_TRANSPORT", "http").strip().lower()   # http | exec
+RC_HTTP_FALLBACK = os.environ.get("RC_HTTP_FALLBACK", "1") != "0"
 RC = ["docker", "exec", RCLONE_CONTAINER, "rclone", "rc", "--rc-addr", "127.0.0.1:%d" % RC_PORT,
       "--rc-user", RCLONE_RC_USER, "--rc-pass", RCLONE_RC_PASS]
 LOCK = threading.RLock()
@@ -278,6 +283,35 @@ def pk_vip_active(base):
     v = str(b.get("vip_status") or "").strip().lower()
     return v in VIP_ACTIVE_STATES
 
+def _rc_auth_header():
+    tok = base64.b64encode(("%s:%s" % (RCLONE_RC_USER, RCLONE_RC_PASS)).encode()).decode()
+    return "Basic " + tok
+
+
+def _rc_http_call(port, method, kv, timeout):
+    """v3.93：HTTP 直连 rcd。rclone 的业务错误是「非 200 + JSON 体」，这里照样解析，
+    与 exec 路径返回的 stdout 等价，_strict 才能继续生效。"""
+    body = json.dumps(kv or {}).encode()
+    req = urllib.request.Request("http://127.0.0.1:%d/%s" % (port, method), data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": _rc_auth_header()})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:          # job not found 等：500 + JSON
+        raw = e.read().decode("utf-8", "replace") if e.fp else ""
+    try:
+        return json.loads(raw or "{}")
+    except Exception:
+        raise RuntimeError("rc %s 返回无法解析：%s" % (method, (raw or "")[:200]))
+
+
+def _rc_exec_call(prefix, method, kv, timeout):
+    args = prefix + [method] + ["%s=%s" % (k, v) for k, v in (kv or {}).items()]
+    return subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=timeout)
+
+
 def rc(method, _timeout=120, _strict=False, _proxy=False, **kv):
     """_timeout 供持锁路径（如 jobs 轮询里的状态查询）设短超时，避免 rclone 卡住拖死接口。
     _strict=True 时额外检查返回体里的 error 字段并抛异常：rclone RC 出错是
@@ -285,12 +319,28 @@ def rc(method, _timeout=120, _strict=False, _proxy=False, **kv):
     （历史 bug：job/status 返回 job not found 时任务永远卡在 running）。默认 False，
     以保持其余 action 的既有行为。"""
     base = RC_PROXY if _proxy else RC
-    args = base + [method] + ["%s=%s" % (k, v) for k, v in kv.items()]
-    p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=_timeout)
-    try:
-        d = json.loads(p.stdout)
-    except Exception:
-        raise RuntimeError("rc %s 失败: %s%s" % (method, p.stdout[:200], p.stderr[:200]))
+    port = PROXY_RC_PORT if _proxy else RC_PORT
+    d = None
+    http_err = None
+    if RC_TRANSPORT != "exec":
+        try:
+            d = _rc_http_call(port, method, kv, _timeout)
+        except Exception as he:
+            http_err = he
+            d = None
+    if d is None:
+        if RC_TRANSPORT != "exec" and not RC_HTTP_FALLBACK:
+            raise RuntimeError("rc %s 本地控制面 %d 无响应（%.0fs 超时）：%s"
+                               % (method, port, _timeout, http_err))
+        try:
+            p = _rc_exec_call(base, method, kv, _timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("rc %s 本地 rclone 控制面 %.0fs 无响应"
+                               "（不是源端慢；rclone 可能繁忙或容器异常）" % (method, _timeout))
+        try:
+            d = json.loads(p.stdout)
+        except Exception:
+            raise RuntimeError("rc %s 失败: %s%s" % (method, p.stdout[:200], p.stderr[:200]))
     if _strict and isinstance(d, dict) and d.get("error"):
         raise RuntimeError("rc %s: %s" % (method, str(d["error"])[:200]))
     return d
@@ -550,9 +600,8 @@ def proxy_rcd_cmd():
 
 def _proxy_rc_ping():
     try:
-        p = subprocess.run(RC_PROXY + ["core/version"], capture_output=True,
-                           text=True, encoding="utf-8", errors="replace", timeout=6)
-        return p.returncode == 0 and "version" in (p.stdout or "")
+        v = rc("core/version", _timeout=6, _proxy=True)
+        return bool(isinstance(v, dict) and v.get("version"))
     except Exception:
         return False
 
@@ -1845,6 +1894,12 @@ TRANSIENT_KEYS = (
     "timeout", "timed out", "tls handshake", "eof", "i/o timeout",
     "connection reset", "connection refused", "temporarily unavailable",
 )
+# v3.93：两类超时在 rclone 报错里长得很像，但方向完全相反，必须分开提示。
+RC_TIMEOUT_HINTS = (
+    ("i/o timeout", "下载源读取超时（源端慢或线路抖动，可重试）"),
+    ("timeout awaiting response headers", "与下载源握手超时（多为代理/线路问题，可重试）"),
+    ("context deadline exceeded", "本地等待超过截止时间（控制面或线路慢，可重试）"),
+)
 
 
 def classify_error(msg, context=""):
@@ -1862,7 +1917,16 @@ def classify_error(msg, context=""):
         # v3.84：必须在 _fatal_job_error 之前判定。下载接口报 captcha / unauthorized
         # 之前先撞上的往往是 connection reset / i/o timeout，这类抖动重试就好，
         # 不能归到账号类终态，否则任务会被判死、账号被标红「需重新登录」。
-        return "TRANSIENT", "网络抖动（连接被重置或超时），可重试（原始：%s）" % mask_secret(raw[:160])
+        # v3.93：把「本地控制面超时」与「源端超时」分开，排障不再指向错的方向。
+        hint = "网络抖动（连接被重置或超时）"
+        if "本地控制面" in raw or "本地 rclone 控制面" in raw:
+            hint = "控制台连不到本地 rclone（控制面超时，不是源端慢；先看 rclone 容器）"
+        else:
+            for k, h in RC_TIMEOUT_HINTS:
+                if k in low:
+                    hint = h
+                    break
+        return "TRANSIENT", "%s，可重试（原始：%s）" % (hint, mask_secret(raw[:160]))
     fatal = _fatal_job_error(raw)          # 既有业务错误（额度 / 凭证 / captcha…）
     if fatal:
         return "ACCOUNT_FATAL", fatal[1]
@@ -1942,12 +2006,14 @@ SAFE_JOBS_LOCK = threading.Lock()
 SAFE_LIVE = {}                 # job_id -> worker 的内存 state；详情页读它的 live 采样
                                # v3.92：异步 copyfile 之后 job 不再有单一 jobid，
                                # 详情页原先读 core/stats 的路径失效，文件级进度恒为 0
+SAFE_THREADS = {}              # job_id -> worker Thread；stop/remove 用它等在飞任务退出
 SAFE_BACKOFF = (2, 8, 30)      # 瞬时错误指数退避（秒）
 FILE_RC_TIMEOUT = 3600         # 单文件 copyfile 的硬超时（含异步轮询总时长）
 COPY_POLL_INTERVAL = 1.0       # 异步 copyfile 状态轮询间隔（秒）
 LIVE_SAMPLE_INTERVAL = 2.0     # 目录任务「在传字节 / 速度」采样间隔（秒）
 STALL_MIN_SPEED = 50 * 1024    # 低于该速度视为「龟速」（字节/秒）
 STALL_SECONDS = 300            # 连续龟速超过该秒数就取消，让位给后面的文件
+PARTIAL_ORPHAN_SECONDS = 24 * 3600   # 目标目录里超过 24h 没动的 *.partial 视为孤儿分片
 
 
 class _JobAbort(Exception):
@@ -1990,6 +2056,100 @@ def _safe_requested_stop(job_id):
     return bool(ev and ev.is_set())
 
 
+def wait_worker_exit(job_id, timeout=10.0):
+    """v3.93：等某个任务的 worker 线程真正退出，返回 (等待秒数, 是否仍在跑)。
+
+    只对由本进程拉起的线程有意义（控制台重启过的老任务没有线程，直接视为已退出）。
+    join 放在 LOCK 之外调用，避免把「停止」以外的接口一起堵住。
+    """
+    with SAFE_JOBS_LOCK:
+        th = SAFE_THREADS.get(job_id)
+    if not th or not th.is_alive():
+        with SAFE_JOBS_LOCK:
+            SAFE_THREADS.pop(job_id, None)
+        return 0.0, False
+    t0 = time.time()
+    try:
+        th.join(timeout=max(0.1, float(timeout)))
+    except Exception:
+        return round(time.time() - t0, 1), th.is_alive()
+    elapsed = round(time.time() - t0, 1)
+    alive = th.is_alive()
+    if not alive:
+        with SAFE_JOBS_LOCK:
+            SAFE_THREADS.pop(job_id, None)
+    return elapsed, alive
+
+
+def fix_permissions(local_dir, dir_mode=0o755, file_mode=0o644):
+    """v3.93：把 rclone 建出来的 0000 权限修回来（目录 0755 / 文件 0644）。
+
+    只处理 mode 恰为 0 的条目，绝不改动用户自己设过的权限；只 stat + chmod，
+    不读内容，所以哪怕目录很大也只是一次元数据遍历。返回 (改目录数, 改文件数)。
+    """
+    if not local_dir or not os.path.isdir(local_dir):
+        return 0, 0
+    nd = nf = 0
+    for root, dirs, files in os.walk(local_dir):
+        for d in dirs:
+            p = os.path.join(root, d)
+            try:
+                if statmod.S_IMODE(os.stat(p).st_mode) == 0:
+                    os.chmod(p, dir_mode)
+                    nd += 1
+            except OSError:
+                continue
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                if statmod.S_IMODE(os.stat(p).st_mode) == 0:
+                    os.chmod(p, file_mode)
+                    nf += 1
+            except OSError:
+                continue
+    return nd, nf
+
+
+def cleanup_orphan_partials(local_dir, now=None, max_age=PARTIAL_ORPHAN_SECONDS):
+    """v3.93：清理 rclone 中断后留下的孤儿分片（`<名字>.<hash>.partial`）。
+
+    只删「超过 max_age 没被改动」的：正在传的分片 mtime 是新鲜的，不会被误删。
+    返回 (删除个数, 释放字节)。单个文件失败就跳过，不影响任务本身。
+    """
+    if not local_dir or not os.path.isdir(local_dir):
+        return 0, 0
+    now = time.time() if now is None else now
+    n = freed = 0
+    for root, _dirs, files in os.walk(local_dir):
+        for f in files:
+            if not f.lower().endswith(".partial"):
+                continue
+            p = os.path.join(root, f)
+            try:
+                st_ = os.stat(p)
+                if now - st_.st_mtime < max_age:
+                    continue
+                os.remove(p)
+                n += 1
+                freed += st_.st_size
+            except OSError:
+                continue
+    return n, freed
+
+
+def log_event(job_id, event, **kw):
+    """v3.93：每个文件一条结构化日志，docker logs 里可以直接 grep event=skip。
+
+    字段按 key=value 拼接，值里的空白压成下划线，保证一条决策占一行、便于对账。
+    """
+    try:
+        parts = ["%s=%s" % (k, re.sub(r"\s+", "_", str(v))[:120]) for k, v in kw.items()]
+        print("%s [job %s] event=%s %s"
+              % (time.strftime("%F %T"), job_id, event, " ".join(parts)), flush=True)
+    except Exception:
+        pass
+
+
 def _start_safe_dir_job(job, s):
     with SAFE_JOBS_LOCK:
         old = SAFE_JOBS.get(job["id"])
@@ -2006,7 +2166,10 @@ def _start_safe_dir_job(job, s):
     job["eta"] = None
     # start 是「先 launch 再 append + save_jobs」，工作线程若立刻按 id 读 jobs.json
     # 会拿不到任务而直接退出（任务永远 running）。把快照一并传过去，读盘只用于进度回写。
-    threading.Thread(target=_safe_dir_worker, args=(job["id"], dict(job)), daemon=True).start()
+    th = threading.Thread(target=_safe_dir_worker, args=(job["id"], dict(job)), daemon=True)
+    th.start()
+    with SAFE_JOBS_LOCK:              # v3.93：让 stop/remove 能等这条线程真正退出
+        SAFE_THREADS[job["id"]] = th
     return True
 
 
@@ -2141,12 +2304,14 @@ def transfer_one(job, entry, s, existing, made_dirs, xlock=None, speed_of=None,
     with xlock:
         exists = safe in existing
         if exists and int(existing[safe]) == size:
+            log_event(job["id"], "skip", file=safe, size=size, why="同名同大小已存在")
             return "skipped", ""
         # v3.88：兼容历史任务按「源原名」落盘的文件。v3.83 之前的老任务不做安全命名，
         # 文件名原样落盘；新任务按 safe 名（截断 + ~hash）落盘，两者名字不同，
         # 只看 safe 名会把已下好的文件判成「缺失」而整批重下（实测 5 对、约 4 GB）。
         # 这里额外认一次「源相对路径同名 + 同大小」：命中即视为已下载，不重复传。
         if not exists and rel != safe and rel in existing and int(existing[rel]) == size:
+            log_event(job["id"], "skip", file=rel, size=size, why="源原名同大小已存在")
             return "skipped", ""
         if not exists and safe.casefold() in {p.casefold() for p in existing}:
             return "failed", "目标目录已存在大小写相近的同名文件，为避免覆盖已跳过，请手动处理后重试"
@@ -2169,6 +2334,7 @@ def transfer_one(job, entry, s, existing, made_dirs, xlock=None, speed_of=None,
         except Exception:
             pass            # 目录多半已存在；真建不出来会在 copyfile 报出具体原因
     # 2) 复制：瞬时 / 未知错误按 2s / 8s / 30s 退避重试，确定性错误立刻归类
+    log_event(job["id"], "copy", file=safe, size=size, src=rel)
     attempts = max(0, int(s.get("fileRetryMax") or 0)) + 1
     last = ""
     for i in range(attempts):
@@ -2255,6 +2421,12 @@ def _safe_dir_worker(job_id, snapshot=None):
         except Exception as ie:
             # v3.91：索引失败绝不能当空目录继续——那会把已下好的文件整批重下。
             return bail("error", str(ie))
+        try:      # v3.93：顺手清掉 24h 以上的孤儿分片（正在传的 mtime 是新的，不会误删）
+            n_orphan, freed = cleanup_orphan_partials(local_dest(str(job.get("dest") or "")))
+            if n_orphan:
+                log_event(job_id, "cleanup", partials=n_orphan, freed_mb=round(freed / 1048576.0, 2))
+        except Exception:
+            pass
         made_dirs = set()
         xlock = threading.Lock()
 
@@ -2341,6 +2513,8 @@ def _safe_dir_worker(job_id, snapshot=None):
                 if st == "stalled":
                     e["status"], e["error"] = "deferred", err or ""
                     e["attempts"] = int(e.get("attempts") or 0) + 1
+                    log_event(job_id, "stalled", file=e["dst"], size=e["size"],
+                              why=err or "连续低速", attempts=e["attempts"])
                     record_file_state(vol, job.get("remote"), e["srcFull"], safe=e["dst"],
                                       original=e["srcFull"], size=e["size"], status="deferred",
                                       attempts=e["attempts"], error=e["error"])
@@ -2351,6 +2525,9 @@ def _safe_dir_worker(job_id, snapshot=None):
                 if st in ("done", "skipped"):
                     with plock:
                         state["bytes"] += e["size"]
+                    log_event(job_id, st, file=e["dst"], size=e["size"])
+                elif st == "failed":
+                    log_event(job_id, "failed", file=e["dst"], size=e["size"], why=e["error"][:120])
                 record_file_state(vol, job.get("remote"), e["srcFull"], safe=e["dst"],
                                   original=e["srcFull"], size=e["size"], status=e["status"],
                                   attempts=e["attempts"], error=e["error"])
@@ -2394,6 +2571,12 @@ def _safe_dir_worker(job_id, snapshot=None):
             sampler.join(timeout=LIVE_SAMPLE_INTERVAL + 2)
             with plock:
                 state["live"] = {}          # 收尾后不再有「在传」分量，避免终态字节虚高
+        try:      # v3.93：rclone 建出来的 0000 权限修回来（只改 mode 为 0 的条目）
+            nd, nf = fix_permissions(local_dest(str(job.get("dest") or "")))
+            if nd or nf:
+                log_event(job_id, "chmod", dirs=nd, files=nf)
+        except Exception:
+            pass
         patch(force=True)
 
         cur = _xfer_fetch(job_id) or {}
@@ -2446,6 +2629,7 @@ def _safe_dir_worker(job_id, snapshot=None):
         with SAFE_JOBS_LOCK:
             SAFE_JOBS.pop(job_id, None)
             SAFE_LIVE.pop(job_id, None)
+            SAFE_THREADS.pop(job_id, None)
 
 
 def track_transferred(job, transferring):
@@ -7091,9 +7275,35 @@ def api(action, body):
             # v3.87：没指定 folder 时落到「下载子目录/任务名」，与历史任务（/data/Downloads/xxx）
             # 保持一致。v3.83 起这里少了 Downloads 层，新建任务会写进卷根（/data/绿帽学院），
             # 与已有数据不是同一目录，rclone 无从判断「已下过」，只能整目录重下。
-            dest = dedupe_dest(vroot + "/" + (folder if folder else
-                                              (DOWNLOAD_SUBDIR + "/" + name)), fs=vroot)
             src = "%s:%s" % (body["remote"], sub) if sub else "%s:" % body["remote"]
+            base_dest = vroot + "/" + (folder if folder else (DOWNLOAD_SUBDIR + "/" + name))
+            force = bool(body.get("force"))
+            warn = ""
+            # v3.93：同一个源重复建任务只会抢带宽、还可能两个线程同时写同一个文件；
+            # 而旧版 dedupe_dest 会在这时造出「目录-2」，等于把已有数据全部重下一遍。
+            live = next((j for j in jobs if j.get("src") == src
+                         and j.get("state") in ("running", "queued")), None)
+            if live and not force:
+                return {"error": "同一个源已有任务在跑（id %s，落点 %s）。重复建任务只会抢带宽、"
+                                 "还可能同时写同一个文件；等它结束，或带 force=true 才并行。"
+                                 % (live.get("id"), live.get("dest")),
+                        "duplicate": True, "existing": live.get("id")}
+            prev = next((j for j in jobs if j.get("src") == src
+                         and j.get("state") not in ("running", "queued")
+                         and not j.get("single_file")), None)
+            if force:
+                dest = base_dest
+            elif prev and str(prev.get("dest") or "").startswith(vroot + "/"):
+                # 直接沿用同源旧任务的落点：既不会造出「-2」，也能按名字+大小跳过已下好的文件
+                dest = prev["dest"]
+                warn = ("沿用同源旧任务 %s 的落点 %s（已完成的文件会按「名字+大小」跳过，不会重下）"
+                        % (prev.get("id"), dest))
+            else:
+                dest = dedupe_dest(base_dest, fs=vroot)
+                if dest != base_dest:
+                    warn = ("目标目录 %s 已存在，落点改为 %s：这一份会从头下载。"
+                            "要接着用已有数据请显式指定 folder，或带 force=true"
+                            % (base_dest, dest))
             # 必须先定下 proxy：预检与后续 launch_job 都依赖它。
             # v3.31 曾把赋值放在预检之后，导致批量下载全程抛
             # UnboundLocalError: cannot access local variable 'proxy'。
@@ -7110,7 +7320,9 @@ def api(action, body):
                    "subpath": sub, "src": src,
                    "mode": body.get("mode", "copy"), "dest": dest, "state": "queued",
                    "started": time.strftime("%m-%d %H:%M"), "bytes": 0, "total": 0,
-                   "speed": 0, "eta": None, "error": "", "proxy": proxy}
+                   "speed": 0, "eta": None, "error": "", "proxy": proxy,
+                   # v3.93：记下建任务时的版本，列表里可区分「哪版建的」同名任务
+                   "createdVersion": APP_VERSION, "createdAt": int(time.time() * 1000)}
             if flt:
                 job["filter"] = flt
                 job["filterText"] = describe_filter(flt)
@@ -7138,6 +7350,8 @@ def api(action, body):
             save_jobs(jobs)
             if not launched_ok:
                 return {"error": "启动失败: %s" % (job.get("error") or "未知原因"), "job": job}
+            if warn:
+                return {"job": job, "warn": warn}
             return {"job": job}
 
     if action == "scanpath":
@@ -7340,6 +7554,10 @@ def api(action, body):
         # 现在给整轮查询一个总预算，超预算的 running 任务本轮沿用上次状态。
         with LOCK:
             jobs = load_jobs()
+            # v3.93：列表里补版本/创建时间，同名任务才分得清「哪版建的」
+            for j in jobs:
+                if not j.get("version"):
+                    j["version"] = j.get("createdVersion") or "旧版"
             try:
                 before = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
             except Exception:
@@ -7363,15 +7581,22 @@ def api(action, body):
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
 
     if action == "stop":
+        tid = body.get("id")
         with LOCK:
             jobs = load_jobs()
             for j in jobs:
-                if j["id"] == body.get("id") and j["state"] in ("running", "queued"):
+                if j["id"] == tid and j["state"] in ("running", "queued"):
                     stop_job_entry(j)
             save_jobs(jobs)
-        return {"ok": True}
+        # v3.93：等 worker 线程真正退出后再返回。在飞的 copyfile 会被 job/stop 打断，
+        # 以前这里立刻返回，界面显示「已暂停」但 rclone 里还在传，下一次建任务就抢带宽。
+        waited, alive = wait_worker_exit(tid, timeout=float(body.get("wait") or 10))
+        return {"ok": True, "waited": waited, "alive": alive}
 
     if action == "resume":
+        if wait_worker_exit(body.get("id"), timeout=0.2)[1]:
+            return {"error": "该任务的旧工作线程还没退出（正在中断在飞文件），等几秒再点「继续」，"
+                             "否则新旧线程会同时写同一个文件"}
         with LOCK:
             s = load_settings()
             jobs = load_jobs()
@@ -7477,17 +7702,25 @@ def api(action, body):
                     "error": "" if ok else (job.get("error") or "启动失败")}
 
     if action == "remove":
+        tid = body.get("id")
         with LOCK:
             jobs = load_jobs()
             for j in jobs:
                 # 转移任务可能挂着 rclone 子进程，删记录前先收掉，避免孤儿进程
-                if j["id"] == body.get("id") and j.get("kind") == "xfer":
+                if j["id"] == tid and j.get("kind") == "xfer":
                     _xfer_kill(j)
-                if j["id"] == body.get("id") and j.get("naming") == "v2":
-                    ev = _safe_stop_event(j["id"])
+                if j["id"] == tid and j.get("naming") == "v2":
+                    ev = _safe_stop_event(tid)
                     if ev:
                         ev.set()
-            jobs = [j for j in jobs if j["id"] != body.get("id")]
+        # v3.93：线程还在收尾就删记录，会让它继续往已删除的任务写进度/计划文件。
+        # 先等在飞文件中断，再删；等不到就拒绝并提示用户先「停止」。
+        waited, alive = wait_worker_exit(tid, timeout=float(body.get("wait") or 10))
+        if alive:
+            return {"error": "任务仍在收尾（在飞文件还没中断），等几秒再删记录", "alive": True}
+        with LOCK:
+            jobs = load_jobs()
+            jobs = [j for j in jobs if j["id"] != tid]
             save_jobs(jobs)
         try:                    # v3.83：文件级执行计划随任务记录一起删，不留下孤儿 JSON
             os.remove(_plan_path(body.get("id")))
@@ -7895,7 +8128,19 @@ def api(action, body):
             email = str((ident or {}).get("email") or "") if isinstance(ident, dict) else ""
             cred = cred_health(k, v, meta) if atype == "pikpak" else None
             out.append({"name": k, "type": atype, "email": email, "cred": cred})
-        return {"accounts": out, "ghosts": ghosts}
+        # v3.93：账号页只刷一排超时时，用户看不出「某几个账号凭证已经彻底死了」。
+        # 这里聚合一次，前端可以只渲染一条提示 + 直接去重新登录。
+        dead = [{"name": a["name"], "note": (a.get("cred") or {}).get("note", "")}
+                for a in out
+                if isinstance(a.get("cred"), dict) and a["cred"].get("state") == "dead"]
+        alerts = []
+        if dead:
+            alerts.append({"kind": "cred_dead", "level": "error",
+                           "title": "%d 个账号凭证已失效" % len(dead),
+                           "text": "、".join(d["name"] for d in dead[:5])
+                                   + "，点对应账号的「重新登录」重新采集 Token",
+                           "accounts": dead})
+        return {"accounts": out, "ghosts": ghosts, "alerts": alerts}
 
     if action == "providers":
         return {"providers": PROVIDERS}
