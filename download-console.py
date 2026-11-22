@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.89"
+APP_VERSION = "v3.90"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1940,7 +1940,9 @@ def launch_job(job, s):
 SAFE_JOBS = {}                 # job_id -> {"stop": Event}；暂停信号 + 重启兜底判定
 SAFE_JOBS_LOCK = threading.Lock()
 SAFE_BACKOFF = (2, 8, 30)      # 瞬时错误指数退避（秒）
-FILE_RC_TIMEOUT = 3600         # 单文件同步 copyfile 的硬超时
+FILE_RC_TIMEOUT = 3600         # 单文件 copyfile 的硬超时（含异步轮询总时长）
+COPY_POLL_INTERVAL = 1.0       # 异步 copyfile 状态轮询间隔（秒）
+LIVE_SAMPLE_INTERVAL = 2.0     # 目录任务「在传字节 / 速度」采样间隔（秒）
 
 
 class _JobAbort(Exception):
@@ -2004,6 +2006,52 @@ def _dest_index(job):
         return {}       # 目标目录还没建 / 暂时列不出：按空处理，复制阶段的错误再分类
 
 
+def _copy_one_async(job, entry, s, proxy):
+    """v3.90：单文件复制改为 rclone 异步 job，让「暂停」能真正中断在飞传输。
+
+    旧的同步 copyfile 会把工作线程死死堵在一次 HTTP 调用里，stop 只置事件、
+    remove 只删记录，谁都打不断它；反复暂停/重建后残留 copyfile 越积越多，
+    实测几十条连接互抢带宽，把每条都压到几 KB/s（面板设 2 并发、实际 8 条以上）。
+    现在拿到 jobid 后轮询 job/status：
+      - 每秒检查暂停事件，一旦暂停立刻 job/stop，传输真正被取消，返回 pending；
+      - 顺带注入 _job_config（multi-thread-streams 等），与旧式任务参数保持一致。
+    返回 ("done", "") / ("pending", "")；可重试错误继续抛异常，交给外层分类。"""
+    rel, safe = entry["src"], entry["dst"]
+    cfg = _job_config(s)
+    # 单文件 copyfile 用不上 Transfers/Checkers，真正影响速度的是分块并发。
+    # 旧版这里完全不注入，设置页的 multi-thread-streams 对目录任务等于摆设；
+    # 即使高级模式关着也补上（cutoff 以下的小文件 rclone 自己不会分块）。
+    cfg.setdefault("MultiThreadStreams", max(1, int(s.get("multiThreadStreams") or 1)))
+    cfg.setdefault("MultiThreadCutoff", max(1, int(s.get("multiThreadCutoffMB") or 1)) * 1048576)
+    r = rc("operations/copyfile", srcFs=job["src"], srcRemote=rel,
+           dstFs=job["dest"], dstRemote=safe, _async="true",
+           _config=json.dumps(cfg),
+           _timeout=120, _proxy=proxy, _strict=True)
+    jid = r.get("jobid")
+    if not jid:
+        return "done", ""          # 对端忽略 _async、已同步完成（兼容旧行为）
+    deadline = time.time() + FILE_RC_TIMEOUT
+    while True:
+        if _safe_requested_stop(job["id"]):
+            try:
+                rc("job/stop", jobid=jid, _timeout=10, _proxy=proxy)
+            except Exception:
+                pass                # 取消失败也要退出：任务已暂停，不能继续占着 worker
+            return "pending", ""
+        st = rc("job/status", jobid=jid, _timeout=20, _proxy=proxy, _strict=True)
+        if st.get("finished"):
+            if st.get("success"):
+                return "done", ""
+            raise RuntimeError("rc operations/copyfile: %s" % str(st.get("error") or "未知错误")[:300])
+        if time.time() > deadline:
+            try:
+                rc("job/stop", jobid=jid, _timeout=10, _proxy=proxy)
+            except Exception:
+                pass
+            raise RuntimeError("rc operations/copyfile: 超过 %d 秒未完成" % FILE_RC_TIMEOUT)
+        time.sleep(COPY_POLL_INTERVAL)
+
+
 def transfer_one(job, entry, s, existing, made_dirs, xlock=None):
     """同步复制单个文件：源端原名 → 目标端安全名。返回 (status, error)。
 
@@ -2052,9 +2100,9 @@ def transfer_one(job, entry, s, existing, made_dirs, xlock=None):
         if _safe_requested_stop(job["id"]):
             return "pending", ""
         try:
-            rc("operations/copyfile", srcFs=src_fs, srcRemote=rel,
-               dstFs=dst_fs, dstRemote=safe, _timeout=FILE_RC_TIMEOUT,
-               _proxy=proxy, _strict=True)
+            st_, _ = _copy_one_async(job, entry, s, proxy)
+            if st_ == "pending":
+                return "pending", ""       # 暂停时已 job/stop 中断，保留待续传状态
             with xlock:
                 existing[safe] = size
             if job.get("mode") == "move":
@@ -2116,7 +2164,7 @@ def _safe_dir_worker(job_id, snapshot=None):
 
         state = {"bytes": sum(e["size"] for e in entries if e["status"] in ("done", "skipped")),
                  "lastPatch": 0.0, "lastPlan": 0.0, "lastBytes": 0, "lastTs": time.time(),
-                 "active": {}, "abort": None}
+                 "active": {}, "abort": None, "live": {}}
         state["lastBytes"] = state["bytes"]
         plock = threading.Lock()
         existing, made_dirs = _dest_index(job), set()
@@ -2132,16 +2180,52 @@ def _safe_dir_worker(job_id, snapshot=None):
                 state["lastTs"], state["lastBytes"], state["lastPatch"] = now, state["bytes"], now
                 done = sum(1 for e in entries if e["status"] in ("done", "skipped"))
                 failed = sum(1 for e in entries if e["status"] == "failed")
-                fields = dict(bytes=state["bytes"], total=total, speed=round(speed, 1),
-                              eta=(max(0, total - state["bytes"]) / speed if speed > 0 else None),
+                # v3.90：面板字节数与速度要算「正在传」的部分。旧版只统计 done/skipped，
+                # 大文件传到 99% 面板也一动不动；速度改成 rclone 实测值，避免
+                # dt 被压到 0.001s 时算出几十 GB/s 的假速度。
+                live = dict(state.get("live") or {})
+                inflight = sum(v[0] for v in live.values())
+                live_speed = sum(v[1] for v in live.values())
+                shown = state["bytes"] + inflight
+                if live_speed > 0:
+                    speed = live_speed
+                cur = next((v[2] for v in live.values()), "") or next(iter(state["active"].values()), "")
+                fields = dict(bytes=shown, total=total, speed=round(speed, 1),
+                              eta=(max(0, total - shown) / speed if speed > 0 else None),
                               filesTotal=len(entries), filesDone=done, filesFailed=failed,
-                              files=len(state["active"]),
-                              curfile=next(iter(state["active"].values()), ""))
+                              files=len(live) or len(state["active"]),
+                              curfile=cur)
                 if force or now - state["lastPlan"] > 5.0:
                     state["lastPlan"] = now
                     save_file_plan(job_id, plan)
             _xfer_patch(job_id, **fields)
             flush_name_maps()
+
+        # v3.90：定时采样 core/stats，把本任务正在传的文件字节/速度喂给 patch。
+        # 没有它 patch 只会在文件结束时触发，计划文件几十分钟不更新、curfile 停在旧名字。
+        live_stop = threading.Event()
+        name_of = {}
+        for e in entries:
+            name_of[e["src"]] = e["src"]
+            name_of[e["dst"]] = e["src"]
+
+        def sample_live():
+            while not live_stop.is_set():
+                try:
+                    st = rc("core/stats", _timeout=15, _proxy=bool(job.get("proxy")))
+                    live = {}
+                    for t in (st.get("transferring") or []):
+                        nm = str(t.get("name") or "")
+                        key = name_of.get(nm)
+                        if key:
+                            live[key] = (int(t.get("bytes") or 0), float(t.get("speed") or 0), nm)
+                    with plock:
+                        state["live"] = live
+                    patch()
+                except Exception:
+                    pass            # 采样失败不影响下载本身，下一轮再试
+                live_stop.wait(LIVE_SAMPLE_INTERVAL)
+
 
         def run_one(e):
             if state["abort"] is not None or _safe_requested_stop(job_id):
@@ -2177,8 +2261,16 @@ def _safe_dir_worker(job_id, snapshot=None):
                     bytes=state["bytes"], filesTotal=len(entries), error="")
         workers = max(1, min(8, int(s.get("transfers") or 4)))
         todo = [e for e in entries if e["status"] == "pending"]
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(run_one, todo))
+        sampler = threading.Thread(target=sample_live, daemon=True)
+        sampler.start()
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(run_one, todo))
+        finally:
+            live_stop.set()
+            sampler.join(timeout=LIVE_SAMPLE_INTERVAL + 2)
+            with plock:
+                state["live"] = {}          # 收尾后不再有「在传」分量，避免终态字节虚高
         patch(force=True)
 
         cur = _xfer_fetch(job_id) or {}
@@ -4594,6 +4686,8 @@ def _stuck_watchdog(j, s):
         return
     if now - float(j["_progAt"]) < minutes * 60:
         return
+    if int(j.get("filesFailed") or 0) > 0:
+        return          # v3.90：已有明确失败原因，别用「疑似卡住」盖掉真正的报错
     try:
         stop_job_entry(j)
     except Exception:
