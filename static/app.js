@@ -233,6 +233,7 @@ Vue.createApp({
       toasts: [],
       apiErr: "",
       pollBusy: false,
+      pollFail: 0,
       pollStatsBusy: false,
       _tid: 0,
       charts: {},
@@ -1073,11 +1074,17 @@ Vue.createApp({
           else if (ver !== this.bootVer && ver !== this.newVer) this.newVer = ver;
         }
         this.apiErr = "";
+        this.pollFail = 0;
       } catch (e) {
-        /* 后端不可达横幅：成功时清空、失败时点亮。abort = 8 秒超时，给中文提示 */
+        /* 后端不可达横幅：成功时清空、失败时点亮。abort = 8 秒超时，给中文提示
+           v3.98：单次抖动不该马上点亮红条（一次 8 秒超时往往只是链路抖了一下），
+           连续两次失败才显示，并把次数带进提示，方便判断是偶发还是持续。 */
+        this.pollFail = (this.pollFail || 0) + 1;
         const msg = (e && e.message) || "";
         const aborted = (e && e.name === "AbortError") || /abort/i.test(msg);
-        this.apiErr = aborted ? "请求超时（8 秒无响应）" : (msg || "网络错误");
+        this.apiErr = this.pollFail < 2 ? "" : (aborted
+          ? "请求超时（8 秒无响应，已连续 " + this.pollFail + " 次）"
+          : ((msg || "网络错误") + "（已连续 " + this.pollFail + " 次）"));
       } finally {
         this.pollBusy = false;
       }

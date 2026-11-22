@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.97"
+APP_VERSION = "v3.98"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -4864,6 +4864,31 @@ def _sharesave_worker(job_id):
             XSHARE.discard(job_id)
 
 
+JOBS_SNAP = {"ts": 0.0, "payload": None}   # 1.2 秒内的 jobs 响应复用（多标签页高频轮询）
+JOBS_LIVE_TTL = 1.2
+JOB_LIVE_TMO = 4.0      # 单次 job/status、core/stats 上限（原来是 8 秒，两个调用就吃掉整轮预算）
+
+
+# job_live 会改的字段；写回磁盘时只合并这些，别把「停止 / 改名 / 删任务」的结果覆盖掉
+JOB_LIVE_KEYS = ("bytes", "total", "speed", "eta", "files", "curfile", "phase",
+                 "transferred", "_xf", "_miss", "_mapState", "filesDone", "filesFailed")
+
+
+def _merge_live_job(tgt, src):
+    """把锁外查到的进度合并进最新读出的任务记录。
+
+    state 只在目标仍是 running/queued 时才跟着变 —— 否则用户刚点了「停止」，
+    这边一轮迟到的 job_live 会把它改回 running。
+    """
+    for k in JOB_LIVE_KEYS:
+        if k in src:
+            tgt[k] = src[k]
+    if src.get("state") != tgt.get("state") and tgt.get("state") in ("running", "queued"):
+        tgt["state"] = src.get("state")
+    if src.get("error"):
+        tgt["error"] = src["error"]
+
+
 def job_live(job):
     if job.get("kind") == "unzip":
         # 解压任务由各自的线程推进度（云端轮询 / 本地解压），这里不管进度，
@@ -4915,12 +4940,12 @@ def job_live(job):
         return
     pxy = bool(job.get("proxy"))
     try:
-        st = rc("job/status", _timeout=8, _strict=True, _proxy=pxy, jobid=jid)
+        st = rc("job/status", _timeout=JOB_LIVE_TMO, _strict=True, _proxy=pxy, jobid=jid)
         job["_miss"] = 0          # 连续失败计数归零（仅 job not found 时累加）
         if st.get("finished"):
             # 完成时补取一次统计，把最终 bytes/total 落盘（否则秒完成/重启后永远是 0/0）
             try:
-                s = rc("core/stats", _timeout=8, _proxy=pxy, group="job/%d" % jid)
+                s = rc("core/stats", _timeout=JOB_LIVE_TMO, _proxy=pxy, group="job/%d" % jid)
                 job["bytes"] = s.get("bytes", 0)
                 job["total"] = s.get("totalBytes", 0)
                 job["speed"] = s.get("speed", 0)
@@ -4955,7 +4980,7 @@ def job_live(job):
                     except Exception:
                         pass
             return
-        s = rc("core/stats", _timeout=8, _proxy=pxy, group="job/%d" % jid)
+        s = rc("core/stats", _timeout=JOB_LIVE_TMO, _proxy=pxy, group="job/%d" % jid)
         job["bytes"] = s.get("bytes", 0)
         job["total"] = s.get("totalBytes", 0)
         job["speed"] = s.get("speed", 0)
@@ -4971,7 +4996,7 @@ def job_live(job):
             # 轮询停止，会错过 finished；此时 stats 分组仍保留最终字节数，
             # 先据此补判「已下载完成」，避免误报成「守护进程重启、任务中断」。
             try:
-                s = rc("core/stats", _timeout=8, _proxy=pxy, group="job/%d" % jid)
+                s = rc("core/stats", _timeout=JOB_LIVE_TMO, _proxy=pxy, group="job/%d" % jid)
                 got = int(s.get("bytes") or 0)
                 total = int(s.get("totalBytes") or 0)
                 if total > 0 and got >= total and not (s.get("transferring") or []):
@@ -7987,33 +8012,55 @@ def api(action, body):
         # core/stats）。同时跑 3 个任务时这里会串行 40s+，接口超过前端 8s 超时，
         # 界面直接报「请求超时」，且长时间持 LOCK 把「停止/暂停」也堵住。
         # 现在给整轮查询一个总预算，超预算的 running 任务本轮沿用上次状态。
+        # v3.98：真正的原因不是"轮询太频繁"，而是 job_live 整段跑在 LOCK 里 ——
+        # 一个慢 rc 调用就同时卡住 stop/save/其它标签页的轮询，8 秒超时横幅就是这么来的。
+        # 现在：LOCK 只在读盘/写盘那一瞬间持有，job_live 在锁外跑完再把进度合并写回；
+        # 1.2 秒内的重复轮询直接复用上一份结果（多标签页/一秒一刷不会重复打 rc）。
+        now = time.time()
+        snap = JOBS_SNAP.get("payload")
+        if snap is not None and now - JOBS_SNAP["ts"] < JOBS_LIVE_TTL:
+            return snap
         with LOCK:
             jobs = load_jobs()
             # v3.93：列表里补版本/创建时间，同名任务才分得清「哪版建的」
             for j in jobs:
                 if not j.get("version"):
                     j["version"] = j.get("createdVersion") or "旧版"
+        try:
+            before = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            before = None
+        deadline = time.time() + 4.0
+        for j in jobs:
+            if time.time() > deadline and j.get("state") == "running":
+                continue          # 本轮跳过，保留上次落盘的状态
             try:
-                before = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
-            except Exception:
-                before = None
-            deadline = time.time() + 6.0
-            for j in jobs:
-                if time.time() > deadline and j.get("state") == "running":
-                    continue          # 本轮跳过，保留上次落盘的状态
                 job_live(j)
-            try:
-                after = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
             except Exception:
-                after = None
-            # 前端每 2s 轮询一次；状态没变就不必反复写盘（序列化失败时退回保守保存）
-            if before is None or after is None or before != after:
-                save_jobs(jobs)
-        return {"jobs": jobs, "settings": load_settings(),
-                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
-                        "diskTotal": STATE.get("diskTotal"), "storages": storages(),
-                        "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
-                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
+                pass              # 单个任务查失败不该让整张列表报错
+        try:
+            after = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            after = None
+        # 只写回「本轮真的查到进度」的那几个字段，避免把别人刚改的（停止/改名/删任务）覆盖掉
+        if before is None or after is None or before != after:
+            with LOCK:
+                cur = load_jobs()
+                by_id = {}
+                for j in cur:
+                    by_id[j.get("id")] = j
+                for j in jobs:
+                    tgt = by_id.get(j.get("id"))
+                    if isinstance(tgt, dict):
+                        _merge_live_job(tgt, j)
+                save_jobs(cur)
+        payload = {"jobs": jobs, "settings": load_settings(),
+                   "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
+                             "diskTotal": STATE.get("diskTotal"), "storages": storages(),
+                             "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
+                   "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
+        JOBS_SNAP.update({"ts": time.time(), "payload": payload})
+        return payload
 
     if action == "stop":
         tid = body.get("id")
@@ -9798,7 +9845,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps({"error": "缺少参数：remote（请选择账号）"}).encode())
                 return
+            t0 = time.time()
             out = json.dumps(api(action, body)).encode()
+            dt = time.time() - t0
+            # v3.98：前端有 8 秒看门狗，但到底是"服务端慢"还是"网络慢"看不出来。
+            # 超过 2 秒的动作打到容器日志，下次弹「请求超时」时能直接对账。
+            if dt >= 2.0:
+                print("%s 慢请求 %-12s %5.1fs" % (time.strftime("%F %T"), action or "-", dt), flush=True)
             self._send(200, "application/json; charset=utf-8", out)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return   # 客户端已断开，别再回包（否则 stderr 打一串 traceback）
