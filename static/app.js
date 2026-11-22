@@ -219,10 +219,15 @@ Vue.createApp({
               createEmptySrcDirs: true, logLevel: "INFO", logFile: "",
               /* v3.83 长文件名安全命名 */
               safeNaming: true, safeNameMaxBytes: 180, safeNameHashLen: 12,
-              safePathMaxBytes: 240, stuckWatchdogMin: 10, fileRetryMax: 3 },
+              safePathMaxBytes: 240, stuckWatchdogMin: 10, fileRetryMax: 3,
+              /* v3.94 自动测速调优 */
+              autoTune: true, autoTuneSeconds: 45, autoTuneSettle: 20 },
       saving: false,
       bwSel: "off",
       bwBps: null,
+      /* v3.94 自动测速调优 */
+      atInfo: null,
+      atBusy: false,
 
       /* 反馈 */
       toasts: [],
@@ -2803,6 +2808,58 @@ Vue.createApp({
       } catch (e) { this.toast("设置失败：" + e.message, "error"); }
     },
 
+    /* ---------- v3.94 自动测速调优 ---------- */
+    async loadAutoTune() {
+      try {
+        const d = await this.api("autotuneinfo");
+        if (d && !d.error) {
+          this.atInfo = d;
+          this.atBusy = !!(d.run && d.run.running);
+        }
+      } catch (e) { /* 老版本后端没有这个动作时静默 */ }
+    },
+    atBenchTarget() {
+      const list = this.jobs || [];
+      return list.find(j => j.state === "running" && j.naming === "v2" && !j.single_file)
+          || list.find(j => j.state === "running") || null;
+    },
+    async atBench() {
+      if (this.atBusy) { this.toast("测速还在进行中", "info"); return; }
+      const j = this.atBenchTarget();
+      if (!j) {
+        this.toast("先让一个目录任务跑起来（点「继续」），测速需要对在下的任务逐档试跑", "error");
+        return;
+      }
+      const secs = Number(this.form.autoTuneSeconds || 45);
+      const settle = Number(this.form.autoTuneSettle || 20);
+      const mins = Math.max(1, Math.round(4 * (secs + settle + 6) / 60));
+      if (!confirm(`开始自动测速？
+
+对任务 #${j.id} 依次试 4 档并发（每档 ${secs} 秒，前面 ${settle} 秒稳定期），约 ${mins} 分钟。
+每换一档都会中断正在传的文件，被中断的字节需要重下（人工测速也有这个代价）。
+结束后自动写回实测最快档并继续下载。`)) return;
+      try {
+        const d = await this.api("autotune", { id: j.id, seconds: secs, settle: settle });
+        if (d.error) { this.toast(d.error, "error"); return; }
+        this.atBusy = true;
+        this.toast("测速已开始：" + (d.candidates || []).join(" / ") + "，约 "
+                   + Math.max(1, Math.round((d.etaSeconds || 0) / 60)) + " 分钟", "ok");
+        this.atPoll();
+      } catch (e) { this.toast("测速启动失败：" + e.message, "error"); }
+    },
+    atPoll() {
+      if (!this.atBusy) return;
+      this.loadAutoTune().then(() => {
+        const run = (this.atInfo && this.atInfo.run) || {};
+        if (run.running) { setTimeout(() => this.atPoll(), 3000); return; }
+        this.atBusy = false;
+        if (run.error) this.toast("测速中止：" + run.error, "error");
+        else if (run.note) this.toast(run.note, "ok");
+        /* 后端已写回最优档：重新拉设置并回填表单，避免表单还停在旧并发 */
+        this.refresh().then(() => { this.fillForm(); this.loadAutoTune(); });
+      });
+    },
+
     /* ---------- 设置 ---------- */
     fillForm() {
       const s = this.settings || {};
@@ -2838,6 +2895,10 @@ Vue.createApp({
         safePathMaxBytes: s.safePathMaxBytes ?? 240,
         stuckWatchdogMin: s.stuckWatchdogMin ?? 10,
         fileRetryMax: s.fileRetryMax ?? 3,
+        /* v3.94 自动测速调优 */
+        autoTune: s.autoTune ?? true,
+        autoTuneSeconds: s.autoTuneSeconds ?? 45,
+        autoTuneSettle: s.autoTuneSettle ?? 20,
       };
     },
     async resetSettings() {
@@ -4097,6 +4158,7 @@ Vue.createApp({
     this.refresh();
     this.refreshStats();
     this.loadBw();
+    this.loadAutoTune();   /* v3.94：设置页显示上次测速结果 */
     this.api("version").then(d => {
       if (d && d.version) this.rcloneVer = d.version;
       if (d && d.consoleVersion) this.consoleVer = d.consoleVersion;

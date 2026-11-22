@@ -24,6 +24,8 @@ curl -s -X POST http://<控制台地址>/api \
 | `dirs` / `localdirs` / `scanpath` | 云盘与本地目录浏览 |
 | `localfiles` / `localrenamebatch` | 本地文件浏览 / NAS 侧重命名（批量与单项共用，items 传 1 项即单项） |
 | `renamebatch` | 云盘目录内批量重命名 |
+| `autotune` / `autotuneinfo` | v3.94：发起自动测速调优（异步）/ 查进度与历史成绩 |
+| `tput` | v3.94：量一次目标目录真实吞吐（MB/s），不改动任务 |
 | `version` | 版本与运行状态 |
 
 ## 全部 action（由源码自动提取，共 82 个）
@@ -129,6 +131,10 @@ grep -n 'action ==' download-console.py
 | `localdirs` | `volumes` | 按空间分组的已有目录：`root`（rclone 侧根）/ `console` / `name` / `dirs`；顶层 `dirs` 仍是主卷平铺列表（兼容旧前端） |
 | `localfiles` | 空路径 | 顶层返回存储空间列表：`dirs` 每项带 `volumeRoot` / `freeGB` / `totalGB`，`volumes` 为完整卷信息；卷内路径为控制台绝对路径 |
 | `start` / `urldl` | `volume` | 可选，传 `localdirs.volumes[].root`，缺省 = 主卷（`/data` 对应卷） |
+| `savesettings` | `autoTune` / `autoTuneSeconds` / `autoTuneSettle` | v3.94 自动测速调优：总开关（默认开）、每档测速窗口（15–300 秒，默认 45）、每档稳定期（5–120 秒，默认 20） |
+| `autotune` | `id` / `seconds` / `settle` | v3.94：对指定目录任务逐档试并发，结束后写回最快档并继续下载；异步，用 `autotuneinfo` 轮询 |
+| `autotuneinfo` | — | v3.94：`best`（最优档）、`history`（最近 5 次成绩）、`run`（进行中状态）、`maxConns`（连接上限 16） |
+| `tput` | `id` / `seconds` | v3.94：目标目录真实落盘吞吐（MB/s），口径与测速一致 |
 
 磁盘空间保护按任务的目标卷判断（`start` / `resume` 的报错会指明具体哪块空间不足）。
 

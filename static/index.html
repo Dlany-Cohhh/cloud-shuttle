@@ -1383,6 +1383,25 @@
                   <input id="sAdvMode" type="checkbox" class="toggle toggle-primary" v-model="form.advancedMode" aria-label="启用高级传输参数">
                 </div>
 
+                <!-- v3.94：自动测速调优（把「逐档试跑 → 取最快 → 写回」自动化） -->
+                <div class="flex flex-wrap items-center gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
+                  <i class="ti ti-gauge text-lg leading-none text-accent"></i>
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                      自动测速调优
+                      <span class="badge-pill bg-accent/15 text-accent">v3.94</span>
+                    </div>
+                    <div class="mt-0.5 text-xs leading-relaxed text-base-content/50">
+                      {{form.autoTune ? '已开启：任务启动时自动套用实测最优档（不用再手填并发）' : '已关闭：完全按上方手填参数启动'}}<span v-if="atInfo && atInfo.best"> · 上次最快 {{atInfo.best.label}}（{{atInfo.best.rate}} MB/s）</span><span v-if="atInfo && atInfo.run && atInfo.run.running"> · 正在测速：{{atInfo.run.step}}</span>
+                    </div>
+                    <div class="mt-0.5 text-[11px] leading-relaxed text-base-content/40">
+                      测速口径 = 目标目录真实落盘增量（MB/s）；候选档一律 ≤ 16 连接——实测 24 连接起会被服务端限速到原来的 1/20
+                    </div>
+                  </div>
+                  <button class="btn btn-sm btn-ghost" :disabled="atBusy" @click="atBench()">{{atBusy ? '测速中…' : '立即测速'}}</button>
+                  <input id="sAutoTune" type="checkbox" class="toggle toggle-primary" v-model="form.autoTune" aria-label="自动测速调优">
+                </div>
+
                 <div v-if="form.advancedMode" class="flex flex-col gap-4 border-t border-base-content/10 pt-4 fade-slide-in">
                 <div class="flex flex-wrap items-center gap-3">
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sMts">单文件多线程流数</label>

@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.93"
+APP_VERSION = "v3.94"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -257,7 +257,13 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             "safeNameHashLen": 12,       # 哈希后缀长度，输入 = 账号 + 完整源相对路径
             "safePathMaxBytes": 240,     # 相对路径总字节上限，给 Windows 根路径前缀留余量
             "stuckWatchdogMin": 10,      # v2 任务无进度自动终止阈值（分钟），0 = 关闭
-            "fileRetryMax": 3}           # 单文件瞬时/未知错误重试次数（退避 2s / 8s / 30s）
+            "fileRetryMax": 3,           # 单文件瞬时/未知错误重试次数（退避 2s / 8s / 30s）
+            # ── v3.94 自动测速调优（docs/AUTOTUNE-DESIGN.md）──
+            # 开启后：任务启动时自动套用「实测最优档」；测速把「并发×流数」逐档试一遍，
+            # 用目标目录真实落盘增量（MB/s）判优劣，不信任 rclone core/stats 自报速度。
+            "autoTune": True,            # 总开关
+            "autoTuneSeconds": 45,       # 每档测速窗口（秒）
+            "autoTuneSettle": 20}        # 每档启动后的稳定期（秒，不计入成绩）
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
 ORDER_BY_OPTIONS = ("", "size,descending", "size,ascending", "name,ascending",
@@ -1433,6 +1439,10 @@ def _norm_settings(raw):
     num("safePathMaxBytes", 120, 1024)
     num("stuckWatchdogMin", 0, 1440)
     num("fileRetryMax", 0, 10)
+    # v3.94 自动测速调优：窗口与稳定期钳到合理区间，避免误填 0 秒或 1 小时
+    num("autoTuneSeconds", 15, 300)
+    num("autoTuneSettle", 5, 120)
+    d["autoTune"] = _truthy(d.get("autoTune", True))
     d["safeNaming"] = _truthy(d.get("safeNaming", True))
     d["proxy"] = bool(d.get("proxy"))
     d["downloadProxy"] = bool(d.get("downloadProxy", True))
@@ -1941,6 +1951,7 @@ def classify_error(msg, context=""):
 
 def launch_job(job, s):
     proxy = bool(job.get("proxy"))
+    s = autotune_profile_for(s, job.get("id"))    # v3.94：单文件 / 旧式目录任务也走最优档
     if proxy and not ensure_proxy_rc():
         job["state"] = "error"
         job["error"] = "代理守护进程（%d）启动失败，请检查代理客户端与 %s 容器" % (PROXY_RC_PORT, RCLONE_CONTAINER)
@@ -2173,6 +2184,217 @@ def _start_safe_dir_job(job, s):
     return True
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# v3.94 自动测速调优：把「手测不同并发档 → 取最快 → 写回设置」自动化
+#
+# "口径" 很重要：rclone 的 core/stats.speed 会把「被取消后重试的字节」重复计入，
+# 实测出现过 12 MB/s 自报速度而磁盘 108 秒零增长。所以这里一律用**目标目录真实
+# 落盘增量**作为成绩，与手工验证的口径完全一致。
+#   ── 为什么不能无脑加并发 ──
+#   实测（PikPak 会员号）：2 文件 × 8 流（16 连接）= 2.2 MB/s；
+#   3 文件 × 8 流（24 连接）= 0.11 MB/s；2 × 16（32 连接）= 0.07 MB/s。
+#   服务端按「账号连接数」静默限流，超过阈值不是变快而是塌一个数量级。
+#   因此候选档一律限制在 AUTOTUNE_MAX_CONNS 以内。
+# ────────────────────────────────────────────────────────────────────────────
+AUTOTUNE_FILE = os.path.join(DATA_DIR, "autotune.json")
+AUTOTUNE_LOCK = threading.Lock()
+AUTOTUNE_RUN = {}                  # 当前 / 最近一次测速的内存态，供 autotuneinfo 轮询
+AUTOTUNE_CANDIDATES = ((2, 8), (1, 16), (2, 4), (3, 4))
+AUTOTUNE_MAX_CONNS = 16            # 实测超过 16 连接必被服务端猛限速
+
+
+def _at_read():
+    try:
+        d = _read_json(AUTOTUNE_FILE, {})
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _at_write(d):
+    try:
+        _write_json(AUTOTUNE_FILE, d)
+    except Exception:
+        pass
+
+
+def dir_bytes(dest):
+    """目标目录当前真实占用（字节）。基准是本地挂载路径，不含 .partial 之外的临时项。"""
+    p = local_dest(str(dest or ""))
+    if not p or not os.path.isdir(p):
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(p):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def measure_rate(dest, seconds, settle=0):
+    """返回真实吞吐（MB/s）：先让连接稳定 settle 秒，再测 seconds 秒的落盘增量。"""
+    if settle:
+        time.sleep(max(0, int(settle)))
+    b0, t0 = dir_bytes(dest), time.time()
+    time.sleep(max(1, int(seconds)))
+    dt = max(0.001, time.time() - t0)
+    return (dir_bytes(dest) - b0) / dt / 1048576.0
+
+
+def at_label(t, mts):
+    return "%dx%d" % (int(t), int(mts))
+
+
+def at_best():
+    b = _at_read().get("best") or {}
+    try:
+        t, m = int(b.get("transfers") or 0), int(b.get("mts") or 0)
+    except Exception:
+        return None
+    if t < 1 or m < 1:
+        return None
+    return {"transfers": t, "mts": m, "rate": float(b.get("rate") or 0),
+            "label": b.get("label") or at_label(t, m), "at": b.get("at")}
+
+
+def autotune_profile_for(s, job_id=None):
+    """v3.94：开启自动调优且已学到最优档时，任务按该档启动（不改用户设置以外的语义）。"""
+    if not _truthy((s or {}).get("autoTune", DEFAULTS.get("autoTune", False))):
+        return s
+    b = at_best()
+    if not b:
+        return s
+    if (int(s.get("transfers") or 0) == b["transfers"]
+            and int(s.get("multiThreadStreams") or 0) == b["mts"]):
+        return s
+    s = dict(s)
+    s["transfers"], s["multiThreadStreams"] = b["transfers"], b["mts"]
+    if job_id:
+        try:
+            log_event(job_id, "autotune-apply", profile=b["label"],
+                      rate=b["rate"], why="沿用实测最优档")
+        except Exception:
+            pass
+    return s
+
+
+def _at_stop_job(job_id, wait=15):
+    with LOCK:
+        jobs = load_jobs()
+        for j in jobs:
+            if j.get("id") == job_id and j.get("state") in ("running", "queued"):
+                stop_job_entry(j)
+        save_jobs(jobs)
+    return wait_worker_exit(job_id, timeout=wait)
+
+
+def _at_start_job(job_id, s):
+    """等价于点「继续」的下载部分：把指定任务按给定设置拉起来（不走云端预检，省时间）。"""
+    with LOCK:
+        jobs = load_jobs()
+        j = next((x for x in jobs if x.get("id") == job_id), None)
+        if not j:
+            return False, "任务不存在"
+        if j.get("state") in ("running", "queued"):
+            return True, ""
+        j.update(state="queued", error="", phase="", speed=0, curfile="")
+        ok = launch_job(j, s)
+        save_jobs(jobs)
+        return bool(ok), "" if ok else str(j.get("error") or "启动失败")
+
+
+def _autotune_worker(job_id, seconds, settle, candidates):
+    """逐档试跑：停任务 → 套档 → 启动 → 稳定 settle → 测 seconds 秒落盘增量 → 停。
+
+    代价说明：每换一档都会取消在飞文件，被打断的字节要重下（这是人工测速也有
+    的代价）。所以只测 4 档、窗口 45 秒，并把成绩写到 autotune.json 供下次直接复用。"""
+    prev = load_settings()
+    res = {"running": True, "job": job_id, "step": "准备", "results": [],
+           "best": None, "started": time.time(), "error": "", "note": ""}
+    with AUTOTUNE_LOCK:
+        AUTOTUNE_RUN.clear()
+        AUTOTUNE_RUN.update(res)
+    try:
+        job = next((j for j in load_jobs() if j.get("id") == job_id), None)
+        if not job:
+            raise RuntimeError("任务不存在")
+        if job.get("kind") == "xfer" or job.get("single_file") or job.get("naming") != "v2":
+            raise RuntimeError("只有「安全命名」的目录任务支持测速（逐文件下载才能按档切换）")
+        others = [j for j in load_jobs()
+                  if j.get("state") in ("running", "queued") and j.get("id") != job_id]
+        if others:
+            raise RuntimeError("还有 %d 个任务在跑，先暂停它们再测速，否则测到的是叠加带宽"
+                               % len(others))
+        plan = load_file_plan(job_id) or {}
+        pending = [e for e in (plan.get("entries") or [])
+                   if e.get("status") not in ("done", "skipped")]
+        if not pending:
+            raise RuntimeError("这个任务没有待下载的文件，无需测速")
+        dest = job.get("dest")
+        _at_stop_job(job_id)
+        results = []
+        for t, m in candidates:
+            t, m = int(t), int(m)
+            if t * m > AUTOTUNE_MAX_CONNS:
+                continue
+            AUTOTUNE_RUN.update(step="%s 测速中" % at_label(t, m), results=list(results))
+            s = dict(prev)
+            s["transfers"], s["multiThreadStreams"] = t, m
+            save_settings(s)
+            ok, err = _at_start_job(job_id, s)
+            if not ok:
+                raise RuntimeError("启动任务失败：%s" % err)
+            rate = measure_rate(dest, seconds, settle=settle)
+            _at_stop_job(job_id)
+            results.append({"label": at_label(t, m), "transfers": t, "mts": m,
+                            "rate": round(rate, 2)})
+            try:
+                log_event(job_id, "autotune", profile=at_label(t, m), rate=round(rate, 2))
+            except Exception:
+                pass
+            AUTOTUNE_RUN.update(results=list(results))
+        if not results:
+            raise RuntimeError("没有可用的候选档位")
+        best = max(results, key=lambda r: (r["rate"], -r["transfers"] * r["mts"]))
+        st = _at_read()
+        hist = [h for h in (st.get("history") or []) if isinstance(h, dict)][-19:]
+        hist.append({"at": time.time(), "job": job_id, "seconds": seconds,
+                     "settle": settle, "results": results, "best": best["label"]})
+        st["history"] = hist
+        st["best"] = {"transfers": best["transfers"], "mts": best["mts"],
+                      "rate": best["rate"], "label": best["label"], "at": time.time()}
+        _at_write(st)
+        s = dict(load_settings())
+        s["transfers"], s["multiThreadStreams"] = best["transfers"], best["mts"]
+        save_settings(s)
+        _at_start_job(job_id, s)
+        res.update(step="完成", best=best, results=results, running=False,
+                   note="实测最快 %.2f MB/s（%s），已写回设置并继续下载"
+                        % (best["rate"], best["label"]))
+        try:
+            log_event(job_id, "autotune-done", best=best["label"], rate=best["rate"])
+        except Exception:
+            pass
+    except Exception as e:
+        # 失败也要先把任务拉起来，并把设置退回测速前的样子（已保存的历史成绩不动）
+        msg = mask_secret(str(e)[:200])
+        try:
+            b = at_best()
+            s = dict(prev)
+            if b:
+                s["transfers"], s["multiThreadStreams"] = b["transfers"], b["mts"]
+            save_settings(s)
+            _at_start_job(job_id, s)
+        except Exception:
+            pass
+        res.update(running=False, error=msg, step="中止")
+    finally:
+        with AUTOTUNE_LOCK:
+            AUTOTUNE_RUN.update(res)
+
+
 def expand_source_files(job):
     """递归列出源目录全部文件（只读），目录任务的下载过滤规则在这里继续生效。"""
     kv = dict(fs=job["src"], remote="", recurse=True,
@@ -2375,7 +2597,7 @@ def _safe_dir_worker(job_id, snapshot=None):
     job = snapshot or _xfer_fetch(job_id)
     if not job:
         return
-    s = load_settings()
+    s = autotune_profile_for(load_settings(), job_id)   # v3.94：套用实测最优档
     vol = job_volume(job)
 
     def bail(state, msg):
@@ -7747,12 +7969,49 @@ def api(action, body):
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
                 "netMode": net_mode(), "proxyScope": proxy_scope()}
 
+    if action == "autotune":
+        if AUTOTUNE_RUN.get("running"):
+            return {"error": "已有一次测速在进行（%s），等它跑完" % (AUTOTUNE_RUN.get("step") or "")}
+        jid = body.get("id")
+        if not jid:
+            return {"error": "请指定要测速的任务"}
+        s = load_settings()
+        secs = int(body.get("seconds") or s.get("autoTuneSeconds") or 45)
+        settle = int(body.get("settle") or s.get("autoTuneSettle") or 20)
+        cands = [(2, 8), (1, 16), (2, 4), (3, 4)]
+        threading.Thread(target=_autotune_worker, args=(jid, secs, settle, cands),
+                         daemon=True).start()
+        # 先占位，避免并发点两次都通过上面的 running 判定
+        AUTOTUNE_RUN.update({"running": True, "job": jid, "step": "准备",
+                             "results": [], "best": None, "error": "", "note": ""})
+        return {"ok": True, "candidates": [at_label(*c) for c in cands],
+                "seconds": secs, "settle": settle,
+                "etaSeconds": len(cands) * (secs + settle + 6)}
+
+    if action == "autotuneinfo":
+        st = _at_read()
+        return {"ok": True, "best": at_best(),
+                "history": (st.get("history") or [])[-5:],
+                "run": dict(AUTOTUNE_RUN),
+                "candidates": [at_label(*c) for c in AUTOTUNE_CANDIDATES],
+                "maxConns": AUTOTUNE_MAX_CONNS}
+
+    if action == "tput":
+        job = next((j for j in load_jobs() if j.get("id") == body.get("id")), None)
+        if not job:
+            return {"error": "任务不存在"}
+        secs = max(5, min(120, int(body.get("seconds") or 20)))
+        return {"ok": True, "seconds": secs,
+                "mbps": round(measure_rate(job.get("dest"), secs), 2),
+                "destBytes": dir_bytes(job.get("dest"))}
+
     if action == "savesettings":
         with LOCK:
             old = load_settings()
             s = dict(old)
             for k in ("maxConcurrent", "diskMinGB", "diskQuotaGB", "transfers", "checkers",
                       "multiThreadStreams", "multiThreadCutoffMB", "retries",
+                      "autoTune", "autoTuneSeconds", "autoTuneSettle",
                       "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
                       "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
                       "transfersClearedAt", "nasHomeUrl", "proxyUrl", "netMode",
