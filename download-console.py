@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.91"
+APP_VERSION = "v3.92"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1939,6 +1939,9 @@ def launch_job(job, s):
 # ────────────────────────────────────────────────────────────────────────────
 SAFE_JOBS = {}                 # job_id -> {"stop": Event}；暂停信号 + 重启兜底判定
 SAFE_JOBS_LOCK = threading.Lock()
+SAFE_LIVE = {}                 # job_id -> worker 的内存 state；详情页读它的 live 采样
+                               # v3.92：异步 copyfile 之后 job 不再有单一 jobid，
+                               # 详情页原先读 core/stats 的路径失效，文件级进度恒为 0
 SAFE_BACKOFF = (2, 8, 30)      # 瞬时错误指数退避（秒）
 FILE_RC_TIMEOUT = 3600         # 单文件 copyfile 的硬超时（含异步轮询总时长）
 COPY_POLL_INTERVAL = 1.0       # 异步 copyfile 状态轮询间隔（秒）
@@ -1953,6 +1956,27 @@ class _JobAbort(Exception):
     def __init__(self, state, msg):
         super().__init__(msg)
         self.state, self.msg = state, str(msg)
+
+
+def build_live_transferring(entries, lives):
+    """v3.92：把 worker 采样到的「在传」字节/速度还原成详情页的 transferring 列表。
+
+    entries 是计划文件里的文件清单（status=running 才算在传），lives 是
+    state["live"]：{原相对路径: (已传字节, 实时速度, rclone 显示的 name)}。
+    采样缺失时退化为 0，不影响详情页其余字段。
+    """
+    out = []
+    for e in entries:
+        if e.get("status") != "running":
+            continue
+        v = lives.get(e.get("src")) or (0, 0, "")
+        out.append({"name": e.get("src"),
+                    "bytes": int(v[0] or 0),
+                    "total": int(e.get("size") or 0),
+                    "speed": float(v[1] or 0)})
+        if len(out) >= 20:
+            break
+    return out
 
 
 def _safe_stop_event(job_id):
@@ -2220,6 +2244,11 @@ def _safe_dir_worker(job_id, snapshot=None):
                  "lastPatch": 0.0, "lastPlan": 0.0, "lastBytes": 0, "lastTs": time.time(),
                  "active": {}, "abort": None, "live": {}, "allowDefer": True}
         state["lastBytes"] = state["bytes"]
+        try:
+            with SAFE_JOBS_LOCK:
+                SAFE_LIVE[job_id] = state          # v3.92：详情页从这里读在传字节/速度
+        except Exception:
+            pass
         plock = threading.Lock()
         try:
             existing = _dest_index(job)
@@ -2416,6 +2445,7 @@ def _safe_dir_worker(job_id, snapshot=None):
     finally:
         with SAFE_JOBS_LOCK:
             SAFE_JOBS.pop(job_id, None)
+            SAFE_LIVE.pop(job_id, None)
 
 
 def track_transferred(job, transferring):
@@ -7765,9 +7795,11 @@ def api(action, body):
                 d["nameMap"] = [{"src": e.get("src"), "dst": e.get("dst"),
                                  "status": e.get("status"), "size": e.get("size") or 0}
                                 for e in entries if e.get("src") != e.get("dst")][:200]
-                d["transferring"] = [{"name": e.get("src"), "bytes": 0,
-                                      "total": e.get("size") or 0, "speed": 0}
-                                     for e in entries if e.get("status") == "running"][:20]
+                with SAFE_JOBS_LOCK:
+                    live_state = SAFE_LIVE.get(job["id"]) or {}
+                lives = dict(live_state.get("live") or {})
+                # v3.92：用 worker 的实时采样填字节/速度，不再写死 0
+                d["transferring"] = build_live_transferring(entries, lives)
         if job["state"] == "running" and job.get("jobid"):
             try:
                 s = rc("core/stats", group="job/%d" % job["jobid"],
