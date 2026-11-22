@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.86"
+APP_VERSION = "v3.87"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -4282,6 +4282,11 @@ def stop_job_entry(j):
 # 注意别和 compose 里的 DOWNLOAD_ROOT（宿主机路径）混：那是 volume 左侧，这是容器内右侧。
 RCLONE_DATA_ROOT = (os.environ.get("RCLONE_DATA_ROOT") or "/data").strip().rstrip("/") or "/data"
 DOWNLOAD_ROOT = (os.environ.get("CONSOLE_DOWNLOAD_ROOT") or "").strip().rstrip("/") or "/vol2/download"
+# v3.87：CONSOLE_DOWNLOAD_SUBDIR 以前只写在文档里、代码没读，导致新建任务直接写进卷根
+# （/data/绿帽学院），而历史任务都在 /data/Downloads/绿帽学院 下，同一批文件被判成「没下过」
+# 又要整目录重下。这里真正把它接上：folder 缺省时用「下载子目录/任务名」拼 dest。
+DOWNLOAD_SUBDIR = ((os.environ.get("CONSOLE_DOWNLOAD_SUBDIR") or "").strip().strip("/")
+                   or "Downloads")
 LEGACY_VOLUME = {"rclone": RCLONE_DATA_ROOT, "console": DOWNLOAD_ROOT, "host": ""}
 
 
@@ -6824,8 +6829,14 @@ def api(action, body):
             sub = body.get("path", "").strip("/")
             name = basename_of(sub) if sub else body["remote"]
             folder = str(body.get("folder") or "").strip("/")
-            if folder and not re.match(r'^[\w\u4e00-\u9fff][\w\u4e00-\u9fff -]{0,60}$', folder):
-                return {"error": "保存目录名不合法（单层：中英文/数字/空格/连字符）"}
+            # v3.87：folder 允许最多 4 层（每层仍按原来的安全字符集校验），
+            # 这样 API / 批量脚本能精确指定「Downloads/子目录」，与历史任务的 dest 对齐。
+            if folder:
+                parts = folder.split("/")
+                if len(parts) > 4 or not all(
+                        p and re.match(r'^[\w\u4e00-\u9fff][\w\u4e00-\u9fff -]{0,60}$', p)
+                        for p in parts):
+                    return {"error": "保存目录名不合法（最多 4 层，每层中英文/数字/空格/连字符）"}
             # v3.57 可选存储空间：body["volume"] 传 rclone 侧根（localdirs 返回的 volumes），
             # 缺省 = 主卷；保护门槛按目标卷的有效剩余判断，不再一刀切拦全部任务
             vol_req = str(body.get("volume") or "").strip().rstrip("/")
@@ -6842,7 +6853,11 @@ def api(action, body):
             if vf is not None and vf < disk_min:
                 return {"error": "「%s」空间保护中（剩余 %.1f GB），请清理该卷或到设置里调低阈值"
                                  % (vol.get("name") or vroot, vf)}
-            dest = dedupe_dest(vroot + "/" + (folder if folder else name), fs=vroot)
+            # v3.87：没指定 folder 时落到「下载子目录/任务名」，与历史任务（/data/Downloads/xxx）
+            # 保持一致。v3.83 起这里少了 Downloads 层，新建任务会写进卷根（/data/绿帽学院），
+            # 与已有数据不是同一目录，rclone 无从判断「已下过」，只能整目录重下。
+            dest = dedupe_dest(vroot + "/" + (folder if folder else
+                                              (DOWNLOAD_SUBDIR + "/" + name)), fs=vroot)
             src = "%s:%s" % (body["remote"], sub) if sub else "%s:" % body["remote"]
             # 必须先定下 proxy：预检与后续 launch_job 都依赖它。
             # v3.31 曾把赋值放在预检之后，导致批量下载全程抛
