@@ -263,7 +263,7 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             # 用目标目录真实落盘增量（MB/s）判优劣，不信任 rclone core/stats 自报速度。
             "autoTune": True,            # 总开关
             "autoTuneSeconds": 45,       # 每档测速窗口（秒）
-            "autoTuneSettle": 20}        # 每档启动后的稳定期（秒，不计入成绩）
+            "autoTuneSettle": 30}        # 每档启动后「等落盘」的耐心（秒，真正的计分从首次增长开始）
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
 ORDER_BY_OPTIONS = ("", "size,descending", "size,ascending", "name,ascending",
@@ -2245,6 +2245,24 @@ def measure_rate(dest, seconds, settle=0):
     return (dir_bytes(dest) - b0) / dt / 1048576.0
 
 
+def wait_growth(dest, timeout=120, step=3, need=2 * 1048576):
+    """v3.94：等「真的开始落盘」再计分。
+
+    换档后 worker 要先列源目录（159 个文件走一次网络）、建映射、索引目标目录，
+    这段时间磁盘几乎不动。实测这时候直接开 25 秒窗口，会把第一名打成 0.11 MB/s，
+    最后一名的偶然突发又被记成 7.66 —— 结论完全反了。所以先等 3 秒内涨 2MB，
+    等不到就返回 None（这一档按 0 计，并标注「无增长」）。"""
+    t0 = time.time()
+    b = dir_bytes(dest)
+    while time.time() - t0 < timeout:
+        time.sleep(step)
+        nb = dir_bytes(dest)
+        if nb - b >= need:
+            return time.time() - t0
+        b = nb
+    return None
+
+
 def at_label(t, mts):
     return "%dx%d" % (int(t), int(mts))
 
@@ -2262,7 +2280,12 @@ def at_best():
 
 
 def autotune_profile_for(s, job_id=None):
-    """v3.94：开启自动调优且已学到最优档时，任务按该档启动（不改用户设置以外的语义）。"""
+    """v3.94：开启自动调优且已学到最优档时，任务按该档启动（不改用户设置以外的语义）。
+
+    注意：测速期间必须原样返回——否则每次试跑都会被「已存最优档」覆盖回去，
+    四档实际都在跑同一档，成绩全是假的（v3.94 首轮实测踩到过）。"""
+    if AUTOTUNE_RUN.get("running"):
+        return s
     if not _truthy((s or {}).get("autoTune", DEFAULTS.get("autoTune", False))):
         return s
     b = at_best()
@@ -2324,6 +2347,10 @@ def _autotune_worker(job_id, seconds, settle, candidates):
             raise RuntimeError("任务不存在")
         if job.get("kind") == "xfer" or job.get("single_file") or job.get("naming") != "v2":
             raise RuntimeError("只有「安全命名」的目录任务支持测速（逐文件下载才能按档切换）")
+        emsg = str(job.get("error") or "").lower()
+        if "captcha" in emsg or "风控" in emsg or "重新登录" in emsg:
+            raise RuntimeError("账号正在人工验证（captcha / 风控），先去账号页「重新登录」过完安全验证，"
+                               "否则每档都会被风控拦下、任务也跑不起来")
         others = [j for j in load_jobs()
                   if j.get("state") in ("running", "queued") and j.get("id") != job_id]
         if others:
@@ -2348,10 +2375,16 @@ def _autotune_worker(job_id, seconds, settle, candidates):
             ok, err = _at_start_job(job_id, s)
             if not ok:
                 raise RuntimeError("启动任务失败：%s" % err)
-            rate = measure_rate(dest, seconds, settle=settle)
+            # 先等真正落盘（列目录 / 建索引期间磁盘不动），避免把启动开销算成速度
+            warm = wait_growth(dest, timeout=int(settle) + 90)
+            if warm is None:
+                rate, wnote = 0.0, "无增长"
+            else:
+                rate, wnote = measure_rate(dest, seconds, settle=0), ""
             _at_stop_job(job_id)
             results.append({"label": at_label(t, m), "transfers": t, "mts": m,
-                            "rate": round(rate, 2)})
+                            "rate": round(rate, 2), "warm": round(warm or 0, 1),
+                            "note": wnote})
             try:
                 log_event(job_id, "autotune", profile=at_label(t, m), rate=round(rate, 2))
             except Exception:
@@ -2359,7 +2392,23 @@ def _autotune_worker(job_id, seconds, settle, candidates):
             AUTOTUNE_RUN.update(results=list(results))
         if not results:
             raise RuntimeError("没有可用的候选档位")
-        best = max(results, key=lambda r: (r["rate"], -r["transfers"] * r["mts"]))
+        ranked = sorted(results, key=lambda r: r["rate"], reverse=True)
+        best = ranked[0]
+        second = ranked[1]["rate"] if len(ranked) > 1 else 0.0
+        # v3.94：某一档高出第二名 2 倍以上时先复核一遍，防「偶然突发」被当成最优
+        if best["rate"] >= 1.0 and best["rate"] > 2.0 * second:
+            AUTOTUNE_RUN.update(step="复核 %s" % best["label"])
+            s = dict(prev)
+            s["transfers"], s["multiThreadStreams"] = best["transfers"], best["mts"]
+            save_settings(s)
+            ok, err = _at_start_job(job_id, s)
+            warm2 = wait_growth(dest, timeout=int(settle) + 90) if ok else None
+            rate2 = measure_rate(dest, seconds) if warm2 is not None else 0.0
+            _at_stop_job(job_id)
+            best = dict(best)
+            best["confirm"] = round(rate2, 2)
+            best["rate"] = round(min(best["rate"], rate2), 2)   # 取两次的保守值
+            ranked[0] = best
         st = _at_read()
         hist = [h for h in (st.get("history") or []) if isinstance(h, dict)][-19:]
         hist.append({"at": time.time(), "job": job_id, "seconds": seconds,

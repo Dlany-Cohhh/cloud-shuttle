@@ -132,10 +132,47 @@ class ApplyProfileTest(_Base):
         s = {"autoTune": True, "transfers": 2, "multiThreadStreams": 8}
         self.assertEqual(m.autotune_profile_for(s), s)
 
+    def test_probe_running_bypasses_best(self):
+        """测速进行中不能被「已存最优档」覆盖，否则四档其实都在跑同一档。"""
+        m._at_write({"best": {"transfers": 2, "mts": 8, "rate": 2.2, "label": "2x8"}})
+        s = {"autoTune": True, "transfers": 4, "multiThreadStreams": 4}
+        old = dict(m.AUTOTUNE_RUN)
+        try:
+            m.AUTOTUNE_RUN.update({"running": True})
+            self.assertEqual(m.autotune_profile_for(s), s)
+        finally:
+            m.AUTOTUNE_RUN.clear()
+            m.AUTOTUNE_RUN.update(old)
+
     def test_no_best_yet(self):
         m.AUTOTUNE_FILE = os.path.join(self.tmp, "empty.json")
         s = {"autoTune": True, "transfers": 4, "multiThreadStreams": 16}
         self.assertEqual(m.autotune_profile_for(s), s)
+
+
+class GrowthGateTest(_Base):
+    """换档后有列目录/建索引的空窗，必须等真增长才计分（v3.94 实测踩过的坑）。"""
+
+    def test_returns_none_when_idle(self):
+        d = os.path.join(self.tmp, "idle2")
+        os.makedirs(d)
+        t0 = time.time()
+        self.assertIsNone(m.wait_growth(d, timeout=4, step=1))
+        self.assertLess(time.time() - t0, 6)
+
+    def test_returns_after_growth(self):
+        d = os.path.join(self.tmp, "grow")
+        os.makedirs(d)
+
+        def late_writer():
+            time.sleep(2)
+            with open(os.path.join(d, "f.bin"), "wb") as f:
+                f.write(b"z" * (4 * 1048576))
+
+        threading.Thread(target=late_writer, daemon=True).start()
+        waited = m.wait_growth(d, timeout=20, step=1)
+        self.assertIsNotNone(waited)
+        self.assertGreaterEqual(waited, 1.0)
 
 
 class SettingsTest(unittest.TestCase):
@@ -143,7 +180,7 @@ class SettingsTest(unittest.TestCase):
         s = m._norm_settings({})
         self.assertTrue(s["autoTune"])
         self.assertEqual(s["autoTuneSeconds"], 45)
-        self.assertEqual(s["autoTuneSettle"], 20)
+        self.assertEqual(s["autoTuneSettle"], 30)
         s = m._norm_settings({"autoTune": "false", "autoTuneSeconds": 0, "autoTuneSettle": 9999})
         self.assertFalse(s["autoTune"])
         self.assertEqual(s["autoTuneSeconds"], 15)

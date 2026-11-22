@@ -1395,7 +1395,8 @@
                       {{form.autoTune ? '已开启：任务启动时自动套用实测最优档（不用再手填并发）' : '已关闭：完全按上方手填参数启动'}}<span v-if="atInfo && atInfo.best"> · 上次最快 {{atInfo.best.label}}（{{atInfo.best.rate}} MB/s）</span><span v-if="atInfo && atInfo.run && atInfo.run.running"> · 正在测速：{{atInfo.run.step}}</span>
                     </div>
                     <div class="mt-0.5 text-[11px] leading-relaxed text-base-content/40">
-                      测速口径 = 目标目录真实落盘增量（MB/s）；候选档一律 ≤ 16 连接——实测 24 连接起会被服务端限速到原来的 1/20
+                      测速口径 = 目标目录真实落盘增量（MB/s）；候选档一律 ≤ 16 连接。测速会反复中断在传文件，
+                      可能触发 PikPak 人机验证（风控）——账号异常时先「重新登录」过完验证再测，每个账号跑一次就够
                     </div>
                   </div>
                   <button class="btn btn-sm btn-ghost" :disabled="atBusy" @click="atBench()">{{atBusy ? '测速中…' : '立即测速'}}</button>

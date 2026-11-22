@@ -221,7 +221,7 @@ Vue.createApp({
               safeNaming: true, safeNameMaxBytes: 180, safeNameHashLen: 12,
               safePathMaxBytes: 240, stuckWatchdogMin: 10, fileRetryMax: 3,
               /* v3.94 自动测速调优 */
-              autoTune: true, autoTuneSeconds: 45, autoTuneSettle: 20 },
+              autoTune: true, autoTuneSeconds: 45, autoTuneSettle: 30 },
       saving: false,
       bwSel: "off",
       bwBps: null,
@@ -2831,7 +2831,7 @@ Vue.createApp({
         return;
       }
       const secs = Number(this.form.autoTuneSeconds || 45);
-      const settle = Number(this.form.autoTuneSettle || 20);
+      const settle = Number(this.form.autoTuneSettle || 30);
       const mins = Math.max(1, Math.round(4 * (secs + settle + 6) / 60));
       if (!confirm(`开始自动测速？
 
@@ -2898,7 +2898,7 @@ Vue.createApp({
         /* v3.94 自动测速调优 */
         autoTune: s.autoTune ?? true,
         autoTuneSeconds: s.autoTuneSeconds ?? 45,
-        autoTuneSettle: s.autoTuneSettle ?? 20,
+        autoTuneSettle: s.autoTuneSettle ?? 30,
       };
     },
     async resetSettings() {
