@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.87"
+APP_VERSION = "v3.88"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -2018,6 +2018,12 @@ def transfer_one(job, entry, s, existing, made_dirs, xlock=None):
     with xlock:
         exists = safe in existing
         if exists and int(existing[safe]) == size:
+            return "skipped", ""
+        # v3.88：兼容历史任务按「源原名」落盘的文件。v3.83 之前的老任务不做安全命名，
+        # 文件名原样落盘；新任务按 safe 名（截断 + ~hash）落盘，两者名字不同，
+        # 只看 safe 名会把已下好的文件判成「缺失」而整批重下（实测 5 对、约 4 GB）。
+        # 这里额外认一次「源相对路径同名 + 同大小」：命中即视为已下载，不重复传。
+        if not exists and rel != safe and rel in existing and int(existing[rel]) == size:
             return "skipped", ""
         if not exists and safe.casefold() in {p.casefold() for p in existing}:
             return "failed", "目标目录已存在大小写相近的同名文件，为避免覆盖已跳过，请手动处理后重试"
