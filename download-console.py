@@ -2191,15 +2191,17 @@ def _start_safe_dir_job(job, s):
 # 实测出现过 12 MB/s 自报速度而磁盘 108 秒零增长。所以这里一律用**目标目录真实
 # 落盘增量**作为成绩，与手工验证的口径完全一致。
 #   ── 为什么不能无脑加并发 ──
-#   实测（PikPak 会员号）：2 文件 × 8 流（16 连接）= 2.2 MB/s；
-#   3 文件 × 8 流（24 连接）= 0.11 MB/s；2 × 16（32 连接）= 0.07 MB/s。
-#   服务端按「账号连接数」静默限流，超过阈值不是变快而是塌一个数量级。
-#   因此候选档一律限制在 AUTOTUNE_MAX_CONNS 以内。
+#   实测（PikPak 会员号）：4 文件 × 4 流（16 连接）= 4.22 MB/s；8 × 2（16 连接）= 2.48；
+#   2 文件 × 8 流（16 连接）= 2.2；3 文件 × 8 流（24 连接）= 0.11；2 × 16（32 连接）= 0.07。
+#   两个结论：① 服务端按「账号连接数」静默限流，超过阈值不是变快而是塌一个数量级；
+#   ② 连接总数相同的前提下，摊到更多文件更抗「单个慢文件」——慢文件会独占预算，
+#   2 个文件时一个慢一个快，总额度只能吃一半；4 个文件时其它三条能把额度吃满。
+#   因此候选档一律限制在 AUTOTUNE_MAX_CONNS 以内，并把「多文件少流」放在首位。
 # ────────────────────────────────────────────────────────────────────────────
 AUTOTUNE_FILE = os.path.join(DATA_DIR, "autotune.json")
 AUTOTUNE_LOCK = threading.Lock()
 AUTOTUNE_RUN = {}                  # 当前 / 最近一次测速的内存态，供 autotuneinfo 轮询
-AUTOTUNE_CANDIDATES = ((2, 8), (1, 16), (2, 4), (3, 4))
+AUTOTUNE_CANDIDATES = ((4, 4), (2, 8), (1, 16), (8, 2))
 AUTOTUNE_MAX_CONNS = 16            # 实测超过 16 连接必被服务端猛限速
 
 
@@ -7978,7 +7980,7 @@ def api(action, body):
         s = load_settings()
         secs = int(body.get("seconds") or s.get("autoTuneSeconds") or 45)
         settle = int(body.get("settle") or s.get("autoTuneSettle") or 20)
-        cands = [(2, 8), (1, 16), (2, 4), (3, 4)]
+        cands = [(4, 4), (2, 8), (1, 16), (8, 2)]
         threading.Thread(target=_autotune_worker, args=(jid, secs, settle, cands),
                          daemon=True).start()
         # 先占位，避免并发点两次都通过上面的 running 判定
