@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.90"
+APP_VERSION = "v3.91"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1943,6 +1943,8 @@ SAFE_BACKOFF = (2, 8, 30)      # 瞬时错误指数退避（秒）
 FILE_RC_TIMEOUT = 3600         # 单文件 copyfile 的硬超时（含异步轮询总时长）
 COPY_POLL_INTERVAL = 1.0       # 异步 copyfile 状态轮询间隔（秒）
 LIVE_SAMPLE_INTERVAL = 2.0     # 目录任务「在传字节 / 速度」采样间隔（秒）
+STALL_MIN_SPEED = 50 * 1024    # 低于该速度视为「龟速」（字节/秒）
+STALL_SECONDS = 300            # 连续龟速超过该秒数就取消，让位给后面的文件
 
 
 class _JobAbort(Exception):
@@ -1995,27 +1997,54 @@ def expand_source_files(job):
     return [e for e in (r.get("list") or []) if isinstance(e, dict) and not e.get("IsDir")]
 
 
+MISSING_DIR_HINTS = ("directory not found", "object not found", "doesn't exist",
+                     "no such file or directory", "not found")
+INDEX_RETRY_DELAYS = (2, 5)     # 目标目录索引重试间隔（秒）
+
+
+def _is_missing_dir_error(msg):
+    low = str(msg or "").lower()
+    return any(h in low for h in MISSING_DIR_HINTS)
+
+
 def _dest_index(job):
-    """一次性列出目标目录已有文件：避免每个文件都单独 stat（每次 rc 都是一次 docker exec）。"""
-    try:
-        r = rc("operations/list", fs=job["dest"], remote="", recurse=True,
-               _timeout=300, _proxy=bool(job.get("proxy")))
-        return {str(e.get("Path") or ""): int(e.get("Size") or 0)
-                for e in (r.get("list") or []) if isinstance(e, dict) and not e.get("IsDir")}
-    except Exception:
-        return {}       # 目标目录还没建 / 暂时列不出：按空处理，复制阶段的错误再分类
+    """一次性列出目标目录已有文件：避免每个文件都单独 stat（每次 rc 都是一次 docker exec）。
+
+    v3.91：失败不再静默当空目录。旧版任何异常都 `return {}`，等于告诉上层「目录里
+    什么都没有」，于是已下好的文件全被判成缺失、整批重下（v3.88 那批重复下载的温床）。
+    现在：目录不存在仍按空处理（新任务首次下载是正常的），其余错误重试三次后显式抛错，
+    由工作线程把任务标成 error 并说明原因，绝不拿「空目录」糊弄过去。"""
+    last = ""
+    for i in range(3):
+        try:
+            r = rc("operations/list", fs=job["dest"], remote="", recurse=True,
+                   _timeout=300, _proxy=bool(job.get("proxy")))
+            if isinstance(r, dict) and r.get("error"):
+                raise RuntimeError(str(r["error"])[:200])
+            return {str(e.get("Path") or ""): int(e.get("Size") or 0)
+                    for e in (r.get("list") or []) if isinstance(e, dict) and not e.get("IsDir")}
+        except Exception as e:
+            last = str(e)
+            if _is_missing_dir_error(last):
+                return {}           # 目标目录还没建：合法空集合，不是故障
+            if i < 2:
+                time.sleep(INDEX_RETRY_DELAYS[i])
+    raise RuntimeError("目标目录索引失败，无法确认哪些文件已下载（为避免重复拷贝已中止任务）：%s"
+                       % mask_secret(last[:200]))
 
 
-def _copy_one_async(job, entry, s, proxy):
-    """v3.90：单文件复制改为 rclone 异步 job，让「暂停」能真正中断在飞传输。
+def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_speed_of=None):
+    """单文件复制走 rclone 异步 job：暂停能真正中断，龟速能让位。
 
     旧的同步 copyfile 会把工作线程死死堵在一次 HTTP 调用里，stop 只置事件、
     remove 只删记录，谁都打不断它；反复暂停/重建后残留 copyfile 越积越多，
     实测几十条连接互抢带宽，把每条都压到几 KB/s（面板设 2 并发、实际 8 条以上）。
     现在拿到 jobid 后轮询 job/status：
       - 每秒检查暂停事件，一旦暂停立刻 job/stop，传输真正被取消，返回 pending；
-      - 顺带注入 _job_config（multi-thread-streams 等），与旧式任务参数保持一致。
-    返回 ("done", "") / ("pending", "")；可重试错误继续抛异常，交给外层分类。"""
+      - 注入 _job_config（含 multi-thread-streams），与旧式任务参数保持一致；
+      - v3.91：speed_of 给出该文件当前速度，连续 STALL_SECONDS 低于 STALL_MIN_SPEED
+        就取消并返回 stalled，让工作线程把它挪到第二轮，先下完跑得快的文件。
+    返回 ("done","") / ("pending","") / ("stalled","原因")；可重试错误继续抛异常。"""
     rel, safe = entry["src"], entry["dst"]
     cfg = _job_config(s)
     # 单文件 copyfile 用不上 Transfers/Checkers，真正影响速度的是分块并发。
@@ -2031,6 +2060,7 @@ def _copy_one_async(job, entry, s, proxy):
     if not jid:
         return "done", ""          # 对端忽略 _async、已同步完成（兼容旧行为）
     deadline = time.time() + FILE_RC_TIMEOUT
+    low_since = None
     while True:
         if _safe_requested_stop(job["id"]):
             try:
@@ -2049,15 +2079,36 @@ def _copy_one_async(job, entry, s, proxy):
             except Exception:
                 pass
             raise RuntimeError("rc operations/copyfile: 超过 %d 秒未完成" % FILE_RC_TIMEOUT)
+        if allow_defer and speed_of:
+            sp = speed_of(rel)
+            if sp is not None:
+                if sp < STALL_MIN_SPEED:
+                    peer = peer_speed_of() if peer_speed_of else None
+                    if peer is not None and peer < STALL_MIN_SPEED * 2:
+                        low_since = None    # 本任务所有连接都慢：账号/网络整体限速，让位没意义
+                    elif low_since is None:
+                        low_since = time.time()
+                    elif time.time() - low_since >= STALL_SECONDS:
+                        try:
+                            rc("job/stop", jobid=jid, _timeout=10, _proxy=proxy)
+                        except Exception:
+                            pass
+                        return ("stalled", "连续 %d 秒低于 %d KB/s，已让位给其它文件，稍后重试"
+                                % (STALL_SECONDS, STALL_MIN_SPEED // 1024))
+                else:
+                    low_since = None
         time.sleep(COPY_POLL_INTERVAL)
 
 
-def transfer_one(job, entry, s, existing, made_dirs, xlock=None):
+def transfer_one(job, entry, s, existing, made_dirs, xlock=None, speed_of=None,
+                 allow_defer=True, peer_speed_of=None):
     """同步复制单个文件：源端原名 → 目标端安全名。返回 (status, error)。
 
     existing 是目标目录快照（会被本函数就地更新），made_dirs 缓存已建目录。
     两者被线程池里的多个 worker 共享，读写都必须走 xlock —— 否则一边遍历
-    casefold 一边有别的线程 pop，会抛 dictionary changed size during iteration。"""
+    casefold 一边有别的线程 pop，会抛 dictionary changed size during iteration。
+    speed_of(name) 由工作线程提供，返回该文件的实时速度（未知即 None）；
+    allow_defer=False 时不再因龟速让位（第二轮兜底，必须下完）。"""
     xlock = xlock or threading.Lock()
     proxy = bool(job.get("proxy"))
     src_fs, dst_fs = job["src"], job["dest"]
@@ -2100,9 +2151,12 @@ def transfer_one(job, entry, s, existing, made_dirs, xlock=None):
         if _safe_requested_stop(job["id"]):
             return "pending", ""
         try:
-            st_, _ = _copy_one_async(job, entry, s, proxy)
+            st_, _ = _copy_one_async(job, entry, s, proxy, speed_of=speed_of,
+                                     allow_defer=allow_defer, peer_speed_of=peer_speed_of)
             if st_ == "pending":
                 return "pending", ""       # 暂停时已 job/stop 中断，保留待续传状态
+            if st_ == "stalled":
+                return "stalled", _
             with xlock:
                 existing[safe] = size
             if job.get("mode") == "move":
@@ -2164,10 +2218,15 @@ def _safe_dir_worker(job_id, snapshot=None):
 
         state = {"bytes": sum(e["size"] for e in entries if e["status"] in ("done", "skipped")),
                  "lastPatch": 0.0, "lastPlan": 0.0, "lastBytes": 0, "lastTs": time.time(),
-                 "active": {}, "abort": None, "live": {}}
+                 "active": {}, "abort": None, "live": {}, "allowDefer": True}
         state["lastBytes"] = state["bytes"]
         plock = threading.Lock()
-        existing, made_dirs = _dest_index(job), set()
+        try:
+            existing = _dest_index(job)
+        except Exception as ie:
+            # v3.91：索引失败绝不能当空目录继续——那会把已下好的文件整批重下。
+            return bail("error", str(ie))
+        made_dirs = set()
         xlock = threading.Lock()
 
         def patch(force=False):
@@ -2227,6 +2286,18 @@ def _safe_dir_worker(job_id, snapshot=None):
                 live_stop.wait(LIVE_SAMPLE_INTERVAL)
 
 
+        def speed_of(name):
+            """给 transfer_one 用的实时速度查询：直接读采样线程的结果，不再单独发 rc。"""
+            with plock:
+                v = (state.get("live") or {}).get(name)
+            return v[1] if v else None
+
+        def peer_speed_of():
+            """本任务当前最快的一条连接：它也很慢时说明是账号级限速，降级毫无意义。"""
+            with plock:
+                vals = [v[1] for v in (state.get("live") or {}).values()]
+            return max(vals) if vals else None
+
         def run_one(e):
             if state["abort"] is not None or _safe_requested_stop(job_id):
                 return                      # 保持 pending，下次继续从这里接着下
@@ -2234,7 +2305,17 @@ def _safe_dir_worker(job_id, snapshot=None):
             with plock:
                 state["active"][e["src"]] = e["src"]     # curfile 始终显示原始相对路径
             try:
-                st, err = transfer_one(job, e, s, existing, made_dirs, xlock)
+                st, err = transfer_one(job, e, s, existing, made_dirs, xlock,
+                                       speed_of=speed_of,
+                                       allow_defer=bool(state.get("allowDefer")),
+                                       peer_speed_of=peer_speed_of)
+                if st == "stalled":
+                    e["status"], e["error"] = "deferred", err or ""
+                    e["attempts"] = int(e.get("attempts") or 0) + 1
+                    record_file_state(vol, job.get("remote"), e["srcFull"], safe=e["dst"],
+                                      original=e["srcFull"], size=e["size"], status="deferred",
+                                      attempts=e["attempts"], error=e["error"])
+                    return
                 e["status"] = "pending" if st == "pending" else st
                 e["error"] = err or ""
                 e["attempts"] = int(e.get("attempts") or 0) + 1
@@ -2260,12 +2341,25 @@ def _safe_dir_worker(job_id, snapshot=None):
         _xfer_patch(job_id, state="running", phase="copy", total=total,
                     bytes=state["bytes"], filesTotal=len(entries), error="")
         workers = max(1, min(8, int(s.get("transfers") or 4)))
-        todo = [e for e in entries if e["status"] == "pending"]
         sampler = threading.Thread(target=sample_live, daemon=True)
         sampler.start()
         try:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                list(pool.map(run_one, todo))
+            for rnd in (0, 1):
+                todo = [e for e in entries if e["status"] == "pending"]
+                if not todo:
+                    break
+                if rnd == 1:
+                    if _safe_requested_stop(job_id):
+                        break
+                    # 第一轮因「龟速」让位的文件，第二轮必须下完：不再降级。
+                    for e in entries:
+                        if e["status"] == "deferred":
+                            e["status"], e["error"] = "pending", ""
+                    state["allowDefer"] = False
+                    _xfer_patch(job_id, phase="copy", error="", speed=0, curfile="")
+                    todo = [e for e in entries if e["status"] == "pending"]
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(run_one, todo))
         finally:
             live_stop.set()
             sampler.join(timeout=LIVE_SAMPLE_INTERVAL + 2)
@@ -2292,7 +2386,7 @@ def _safe_dir_worker(job_id, snapshot=None):
         # v3.89：还有 pending 就不能标 done。暂停/续传时若旧线程的外层 copyfile 还在飞，
         # 工作线程会把整批文件「看到 stop 就原样保持 pending」，然后一路走到这里被标成
         # done —— 界面显示完成、其实还剩几十 GB 没下（实测 45 个 / 58 GB 被吞）。
-        still = [e for e in entries if e["status"] == "pending"]
+        still = [e for e in entries if e["status"] in ("pending", "deferred")]
         if still:
             _xfer_patch(job_id, state="stopped", phase="", speed=0, eta=None, curfile="",
                         bytes=got, total=total,
