@@ -3,6 +3,26 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.86 — `unauthenticated` 也归到「重新登录」，别再甩英文天书（2026-11-22）
+
+迁移到 `/vol3` 后 `会员号` 重新实例化，rclone 直接回
+`error in ListJSON: couldn't list files: Error "unauthenticated" (16):
+Unauthenticated, please re-login`。这条是**真的凭证失效**（该账号 `refresh_token`
+也被 PikPak 判 `invalid refresh token`），但界面上只有英文原文，用户不知道要去点
+「重新登录」，也无法判断这次到底是不是上次那种网络抖动。
+
+- `RELINK_ERROR_KEYS` 补 `unauthenticated` / `please re-login` / `re-login`。
+- `FATAL_JOB_ERRORS` 补 `unauthenticated` 条目：任务直接进 `error` 并给出中文指引
+  「账号凭证已被 PikPak 作废，请到账号页点『重新登录』……重新采集 Token」。
+- `cloud_precheck()` 出口把凭证类错误统一翻译成可操作提示（含原始摘要），预检失败
+  时不再只回 rclone 原文；网络抖动分支仍在它之前，`connection reset` 依旧判重试。
+- 测试补 1 项（`unauthenticated` → `need_relink` 真、`classify_error` 为
+  `ACCOUNT_FATAL` 且提示含「重新登录」），全量 69 项通过。
+
+> 区分方法：`connection reset by peer` / `i/o timeout` / `tls handshake timeout` 是网络，
+> 稍等重试即可；`unauthenticated` / `invalid_grant` / `invalid refresh token` / `captcha`
+> 是凭证，只能重新登录采集 Token。
+
 ## v3.85 — 修好「截断把网络原因切没了」，v3.84 才真正生效（2026-11-22）
 
 v3.84 上线后用户点「继续」仍弹同一句 `预检源目录失败: ... couldn't get captcha token:

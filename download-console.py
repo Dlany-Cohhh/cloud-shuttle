@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.85"
+APP_VERSION = "v3.86"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -139,6 +139,9 @@ def trim_err(err, keep=300):
 RELINK_ERROR_KEYS = (
     "refreshed by other", "已被别处刷新", "invalid refresh token", "refresh_token 无效",
     "refresh_token 已失效", "invalid_grant", "invalid_token", "unauthorized",
+    # v3.86：PikPak 的 access_token 被服务端作废时回的是 unauthenticated / please re-login，
+    # 以前不在表里，界面上就只剩一串英文天书，用户不知道要去重新登录。
+    "unauthenticated", "please re-login", "re-login",
     "no username", "账号凭据不完整", "captcha", "需重新登录", "请重新登录",
     "重新采集", "鉴权失效", "凭证已失效", "401",
 )
@@ -760,7 +763,15 @@ def cloud_precheck(name, sub="", proxy=False):
             return result[0], ("网络连接被重置/超时（已自动重试 2 次，这不是凭证问题；"
                               "稍等再点「继续」，或给该任务打开代理）：%s"
                               % trim_err(result[1], 220)), result[2]
-    return result[0], trim_err(result[1], 300), result[2]
+    err = trim_err(result[1], 300)
+    if need_relink(err):
+        # v3.86：凭证类错误在预检阶段就翻译成可操作的话。以前直接把 rclone 原文
+        # 「error in ListJSON: couldn't list files: Error "unauthenticated" (16):
+        #  Unauthenticated, please re-login」丢给界面，用户不知道该点哪里。
+        return result[0], ("账号凭证已失效（%s）。这不是网络问题，重试任务没用："
+                          "请到账号页点该账号的「重新登录」，在官方登录页过完安全验证后"
+                          "重新采集 Token，再点任务的「继续」" % err), result[2]
+    return result[0], err, result[2]
 
 
 def pikpak_token_full(rt):
@@ -2232,6 +2243,7 @@ FATAL_JOB_ERRORS = (
     ("storage_quota_exceeded", "stopped", "存储空间不足，处理后点「继续」续传"),
     ("captcha", "error", "PikPak 触发人工验证风控，请到账号页点该账号的「重新登录」，在官方登录页过完安全验证后重新采集 Token"),
     ("unauthorized", "error", "账号鉴权失效，请到账号页点该账号的「重新登录」重新采集 Token"),
+    ("unauthenticated", "error", "账号凭证已被 PikPak 作废（unauthenticated），请到账号页点该账号的「重新登录」，在官方登录页过完安全验证后重新采集 Token"),
     ("invalid_grant", "error", "账号凭证已失效，请到账号页点该账号的「重新登录」重新采集 Token"),
     ("invalid_token", "error", "账号凭证已失效，请到账号页点该账号的「重新登录」重新采集 Token"),
     # v3.47：旧文案「请在账号页补全用户名」指向了一个并不存在的入口 ——

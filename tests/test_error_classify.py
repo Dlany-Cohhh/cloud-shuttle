@@ -26,6 +26,8 @@ REAL_CAPTCHA = ("PikPak 要求人工验证码（code=4002 captcha_invalid）。�
                 "请用「⚡ 全自动获取」从本机浏览器提取")
 REAL_INVALID = "invalid_grant: refresh_token 无效"
 REAL_ROTATED = "这个 refresh_token 已被别处刷新过（refreshed by other）"
+REAL_UNAUTH = ('预检源目录失败: error in ListJSON: couldn\'t list files: '
+               'Error "unauthenticated" (16): Unauthenticated, please re-login')
 
 
 class NetVsCredTest(unittest.TestCase):
@@ -87,6 +89,15 @@ class NetVsCredTest(unittest.TestCase):
         old = RESET_ERR[:150]
         self.assertNotIn("connection reset", old)
         self.assertFalse(m.is_net_error(old))
+
+    def test_unauthenticated_is_relink_and_account_fatal(self):
+        # v3.86：PikPak 作废 token 时回 unauthenticated / please re-login，
+        # 以前不在 RELINK 表里，界面只剩英文原文，用户不知道去点哪里
+        self.assertTrue(m.need_relink(REAL_UNAUTH))
+        self.assertFalse(m.is_net_error(REAL_UNAUTH))
+        kind, hint = m.classify_error(REAL_UNAUTH)
+        self.assertEqual(kind, "ACCOUNT_FATAL")
+        self.assertIn("重新登录", hint)
 
 
 if __name__ == "__main__":
