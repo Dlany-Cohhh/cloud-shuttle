@@ -220,6 +220,30 @@ curl -s -X POST http://127.0.0.1:5566/api -H 'Content-Type: application/json' -d
 
 **实测案例（2026-11-20，fnOS）**：容器是 `docker run` 起的，只挂了 `/vol2/Data-storage`，而该目录其实在系统盘上（54.6 GB），真正的 927 GB 卷 `/vol3` 从未挂进容器，所以只识别出一个存储空间。给两个容器各加 `-v /vol3/downloads:/vol3/downloads` 后识别出两卷；但重建时漏了 `-e RCLONE_RC_USER/RCLONE_RC_PASS` 等 5 个变量，账号页立刻变成「共 0 个」——补回环境变量重建后，9 个账号与两卷全部恢复，磁盘上的文件全程未被改动。
 
+### 4.4 系统盘上的「存储空间」不可写：换挂到真卷
+
+fnOS 这类系统会禁止容器在**系统盘**（`/dev/sda2`，通常就是 `/vol2` 所在分区）里创建新文件：宿主机 admin 能写，任何容器（哪怕 `-u 1000:1000`、哪怕全新临时容器）写都是 `operation not permitted`。表现是任务一开始就 `failed to open source object: ... .partial: operation not permitted`，或预检能过、下载立刻报错。
+
+识别办法：同一容器里对目标目录写探针，同时对照 `df -h` 看该目录落在哪个分区。
+
+```bash
+docker exec rclone-backend sh -c 'echo hi > /data/.wtest && rm -f /data/.wtest && echo WRITE-OK'
+df -h /vol1 /vol2 /vol3     # /vol2 若与 / 同源(如 /dev/sda2)，就是系统盘
+```
+
+修法：把两个容器里指向该目录的挂载**换成真卷的同一宿主目录**。保留原来的容器内路径（`/data`、`/vol2/download`），历史任务 `dest` 就仍然有效，不用改数据：
+
+```bash
+# rclone-backend：/vol2/Data-storage -> /vol3/downloads
+-v /vol3/downloads:/data
+# download-console：/vol2/Data-storage -> /vol3/downloads
+-v /vol3/downloads:/vol2/download
+```
+
+改挂载必须重建容器，按 4.3 的四件套逐项搬齐；重建前确认 `jobs.json` 里没有 `running` 任务。验证三件事：`docker exec ... WRITE-OK`、`accounts` 数量不变、`jobs` 里的历史 `dest` 仍能访问。
+
+> 2026-11-22 实测：`/vol2/Data-storage` 只有 20K 空目录（历史任务其实从未真正落盘），换成 `/vol3/downloads` 后 `rclone mkdir /data` 立即成功，存储空间收敛为一个 927 GB 卷。
+
 ## 5. Token 续期（重要）
 
 PikPak 的 `refresh_token` 是**单次轮换**的，长时间不下任务可能过期。建议 root crontab 每小时跑一次：
