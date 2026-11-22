@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.96"
+APP_VERSION = "v3.97"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -5962,9 +5962,11 @@ def local_rename_batch(rel, items):
 #   PikPak 后端不提供对象哈希，所以内容校验必须读字节；抽样是默认推荐档。
 # ---------------------------------------------------------------------------
 VERIFY_MAX_FILES   = 5000
+VERIFY_LIST_TMO    = (60, 150)             # 递归列目录：首次 + 抖动后重试
 VERIFY_CHUNK       = 32 * 1024
 VERIFY_SAMPLE_MAX  = 20
 VERIFY_FULL_FILES  = 5
+VERIFY_LIST_TIMEOUTS = VERIFY_LIST_TMO
 VERIFY_FULL_TOTAL  = 1024 ** 3             # 单次完整校验最多 1 GiB
 VERIFY_FULL_SINGLE = 300 * 1024 ** 2       # 单文件最多 300 MiB
 VERIFY_TIMEOUT     = 300                   # 整次校验软上限（秒）
@@ -6049,44 +6051,43 @@ def verify_cloud(remote, path):
        scope(file/dir)、target（本次根目录）、truncated、error。"""
     target = "%s:%s" % (remote, path)
     ret = {"files": {}, "targets": {}, "scope": "", "target": target,
-           "truncated": False, "error": ""}
-    try:
-        p = _rclone_run(["lsjson", "--stat", "--log-level", "ERROR", target], timeout=60)
-    except Exception as e:
-        ret["error"] = "云端连接失败：%s" % str(e)[:150]
-        return ret
-    if p.returncode != 0:
-        ret["error"] = "云端路径不存在或无法访问：%s" % (
-            _decode(p.stderr).strip()[:180] or target)
-        return ret
-    try:
-        st = json.loads(_decode(p.stdout) or "{}")
-    except Exception:
-        ret["error"] = "云端返回无法解析"
-        return ret
-    # 单文件：lsjson --stat 直接给出该对象
-    if isinstance(st, dict) and st.get("IsDir") is False:
-        name = _norm_key(st.get("Name") or os.path.basename(path))
-        ret["files"][name] = int(st.get("Size") or 0)
-        ret["targets"][name] = target
-        ret["scope"] = "file"
-        return ret
-    try:
-        p = _rclone_run(["lsjson", "--recursive", "--files-only", "--log-level", "ERROR", target],
-                        timeout=150)
-    except Exception as e:
-        ret["error"] = "云端列目录超时：%s" % str(e)[:120]
-        return ret
-    if p.returncode != 0:
-        ret["error"] = "云端列目录失败：%s" % _decode(p.stderr).strip()[:180]
-        return ret
-    try:
-        lst = json.loads(_decode(p.stdout) or "[]")
-    except Exception:
-        ret["error"] = "云端列表无法解析"
+           "truncated": False, "error": "", "attempts": 0}
+    # v3.97/v3.98 实测：`lsjson --stat` 指向「目录」时在 PikPak 上永远不会返回
+    # （25 秒超时、无输出），所以原来那次「探一下是不是单文件」在目录场景纯属白等 12 秒。
+    # 现在直接递归列一次，用返回值自己判断：单文件只列出一条、且 Path 恰好是它自己的文件名。
+    lst, err, ret["attempts"] = None, "", 0
+    for i, tmo in enumerate(VERIFY_LIST_TIMEOUTS):
+        ret["attempts"] = i + 1
+        try:
+            p = _rclone_run(["lsjson", "--recursive", "--files-only", "--log-level", "ERROR", target],
+                            timeout=tmo)
+        except Exception:
+            err = "云端列目录超时（第 %d 次，%d 秒）" % (i + 1, tmo)
+            continue
+        if p.returncode != 0:
+            err = "云端列目录失败：%s" % (_decode(p.stderr).strip()[:180] or ("exit %s" % p.returncode))
+            continue
+        try:
+            lst = json.loads(_decode(p.stdout) or "[]")
+        except Exception:
+            err = "云端列表无法解析"
+            continue
+        err = ""
+        break
+    if lst is None:
+        ret["error"] = err
         return ret
     if isinstance(lst, dict):
         lst = [lst]
+    # 单文件：云端把「单个对象」也列成一条，且 Path 就是它自己的文件名
+    base = _norm_key(str(path or "").strip("/").rsplit("/", 1)[-1])
+    if base and len(lst) == 1 and isinstance(lst[0], dict) \
+            and not lst[0].get("IsDir") \
+            and _norm_key(lst[0].get("Path") or lst[0].get("Name")) == base:
+        ret["files"][base] = int(lst[0].get("Size") or 0)
+        ret["targets"][base] = target
+        ret["scope"] = "file"
+        return ret
     for e in lst:
         if not isinstance(e, dict) or e.get("IsDir"):
             continue
@@ -6883,6 +6884,62 @@ def local_trash_purge(ids, all_items=False):
     return {"ok": ok, "total": len(keys), "results": results}
 
 
+def rename_map_for(remote, cloud_path, local_root):
+    """v3.97：取出「云端原名 → 落盘安全名」映射，供一致性校验用。
+
+    开了安全命名（默认）后，超过字节上限的文件名会被截断并加 `~hash` 后缀，
+    云端名和本地名因此不同。v3.96 之前的校验按名字直接配对，会把同一批文件
+    同时报成「本地缺失 10 + 本地多余 10」——2026-11-23 实测 159 个文件里就有 10 对。
+    """
+    out = {}
+    try:
+        root = _local_volume_root(local_root) or primary_root()
+        ent = (load_name_map({"console": root}) or {}).get("entries") or {}
+    except Exception:
+        return out
+    for k, v in ent.items():
+        r, _, src = str(k).partition(":")
+        if r != str(remote):
+            continue
+        prefix = (str(cloud_path).strip("/") + "/") if str(cloud_path or "").strip("/") else ""
+        if prefix and not src.startswith(prefix):
+            continue
+        rel = src[len(prefix):] if prefix else src
+        safe = str((v or {}).get("safe") or "")
+        if rel and safe and safe != rel:
+            out[_norm_key(rel)] = _norm_key(safe)
+    return out
+
+
+def pair_renames_by_size(items):
+    """v3.97：没有映射时按「字节数唯一」把 missing/extra 配成改名对。
+
+    只在某个大小上恰好 1 个缺失 + 1 个多余时配对，避免把真实缺失/多余吞掉；
+    配对后只保留云端那条（状态 renamed，带 localPath），本地那条标 _merged 由调用方丢弃，
+    这样 169 条不会变成「10 对变成 20 条」的噪声。
+    """
+    miss = [it for it in items if it["status"] == "missing"]
+    extra = [it for it in items if it["status"] == "extra"]
+    by_size_m, by_size_e = {}, {}
+    for it in miss:
+        by_size_m.setdefault(it.get("cloudSize"), []).append(it)
+    for it in extra:
+        by_size_e.setdefault(it.get("localSize"), []).append(it)
+    paired = 0
+    for size, mlist in by_size_m.items():
+        elist = by_size_e.get(size) or []
+        if size is None or len(mlist) != 1 or len(elist) != 1:
+            continue
+        m, e = mlist[0], elist[0]
+        m["status"] = "renamed"
+        m["localPath"] = e["path"]
+        m["localSize"] = size
+        m["note"] = "本地名为 %s（按字节数配对认定是同一文件，建议人工确认）" % e["path"][:70]
+        e["_merged"] = True
+        paired += 1
+    return paired
+
+
 def _cloud_file_target(cloud_target, cloud_scope, rel):
     if cloud_scope == "file":
         return cloud_target
@@ -6989,6 +7046,8 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
     if err:
         return {"error": err}
     warnings = []
+    if ci.get("attempts", 1) > 1:
+        warnings.append("云端列目录第 %d 次才成功（PikPak 偶发抖动，已自动重试）" % ci["attempts"])
     # 常见场景：本地只选了一个文件，云端填的是它所在的目录。
     # 按文件名在云端目录里定位同名对象，避免整目录 vs 单文件被报成「全部缺失 + 全部多余」。
     if lscope == "file" and cscope == "dir" and len(local) == 1:
@@ -7014,22 +7073,39 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
         warnings.append("单侧文件超过 %d 个，本次只比较前 %d 个" % (VERIFY_MAX_FILES, VERIFY_MAX_FILES))
 
     items = []
-    for k in sorted(set(cloud) | set(local)):
-        c, l = cloud.get(k), local.get(k)
+    rmap = rename_map_for(remote, cloud_path, ltarget)
+    expect = {}
+    for k, size in cloud.items():
+        expect[rmap.get(k, k)] = (k, size)
+    for k in sorted(set(expect) | set(local)):
+        c, l = expect.get(k), local.get(k)
+        orig = c[0] if c else None
         if c is not None and l is not None:
-            status = "match" if c == l["size"] else "size"
-            note = "" if status == "match" else "大小不同（可能未下完 / 文件被改动）"
+            note = ""
+            if orig and orig != k:
+                note = "落盘名已按安全命名截断（云端原名：%s）" % orig[:80]
+            status = "renamed" if (orig and orig != k) else (
+                "match" if c[1] == l["size"] else "size")
+            if status == "size":
+                note = "大小不同（可能未下完 / 文件被改动）"
+            items.append({"path": orig or k, "localPath": k if orig and orig != k else None,
+                          "status": status, "cloudSize": c[1], "localSize": l["size"],
+                          "note": note})
         elif c is not None:
-            status, note = "missing", "云端有、本地没有（尚未下载或已被清理）"
+            items.append({"path": orig, "status": "missing", "cloudSize": c[1],
+                          "localSize": None, "note": "云端有、本地没有（尚未下载或已被清理）"})
         else:
-            status, note = "extra", "本地有、云端没有（云端已删除 / 其他来源文件）"
-        items.append({"path": k, "status": status,
-                      "cloudSize": c if c is not None else None,
-                      "localSize": l["size"] if l is not None else None,
-                      "note": note})
+            items.append({"path": k, "status": "extra", "cloudSize": None,
+                          "localSize": l["size"], "note": "本地有、云端没有（云端已删除 / 其他来源文件）"})
+    # v3.97：映射只覆盖「本程序处理过」的文件，历史任务/更早版本落的盘对不上；
+    # 剩下的按字节数唯一配对兜底（实测这一步把最后 15 对也认了出来）。
+    renamed = pair_renames_by_size(items)
+    if renamed:
+        items = [it for it in items if not it.get("_merged")]
+        warnings.append("%d 对文件按字节数唯一配对认定为改名（建议人工确认）" % renamed)
 
     deep_checked, deep_bytes = 0, 0
-    candidates = [it for it in items if it["status"] == "match" and lscope == cscope]
+    candidates = [it for it in items if it["status"] in ("match", "renamed") and lscope == cscope]
     if mode in ("sample", "full") and candidates:
         cap = VERIFY_SAMPLE_MAX if mode == "sample" else VERIFY_FULL_FILES
         take = min(limit, cap)
@@ -7050,7 +7126,7 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
                 warnings.append("达到 %d 秒总时限，剩余文件未完成内容核对" % VERIFY_TIMEOUT)
                 break
             size = it["localSize"] or 0
-            fp = local[it["path"]]["abs"]
+            fp = local[it.get("localPath") or it["path"]]["abs"]
             target = ctargets.get(it["path"]) or _cloud_file_target(ctarget, cscope, it["path"])
             try:
                 if mode == "sample":
@@ -7097,10 +7173,13 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
     for it in items:
         counts[it["status"]] = counts.get(it["status"], 0) + 1
     summary = {k: counts.get(k, 0) for k in
-               ("match", "missing", "extra", "size", "content", "unknown")}
+               ("match", "renamed", "missing", "extra", "size", "content", "unknown")}
     summary["total"] = len(items)
     summary["deepChecked"] = deep_checked
     summary["deepBytes"] = deep_bytes
+    if counts.get("renamed"):
+        warnings.append("%d 个文件落盘名与云端不同（安全命名截断），已按映射/大小认定为同一文件"
+                        % counts["renamed"])
     clean = not any(counts.get(k) for k in ("missing", "extra", "size", "content", "unknown"))
     return {
         "ok": clean and bool(items),
@@ -7114,6 +7193,7 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
                   "bytes": sum(v["size"] for v in local.values()), "truncated": ltrunc},
         "summary": summary, "items": items[:VERIFY_MAX_FILES],
         "truncated": ctrunc or ltrunc, "warnings": warnings,
+        "attempts": ci.get("attempts", 0),
         "elapsed": round(time.time() - t0, 2),
         "hashSupported": False,   # PikPak 不提供对象哈希，内容校验靠读字节
     }
@@ -9800,3 +9880,4 @@ if __name__ == "__main__":
     except Exception:
         pass
     srv.serve_forever()
+

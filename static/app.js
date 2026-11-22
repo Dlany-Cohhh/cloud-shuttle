@@ -306,7 +306,7 @@ Vue.createApp({
       verifyError: "",
       verifyFilter: "diff",
       verifyJobId: "",
-      verifyLabels: { match: "一致", missing: "本地缺失", extra: "云端已无",
+      verifyLabels: { match: "一致", renamed: "改名一致", missing: "本地缺失", extra: "云端已无",
                       size: "大小不符", content: "内容不符", unknown: "无法判定" },
     };
   },
@@ -441,7 +441,7 @@ Vue.createApp({
     verifyItems() {
       const list = (this.verifyResult && this.verifyResult.items) || [];
       if (this.verifyFilter === "all") return list;
-      if (this.verifyFilter === "diff") return list.filter(i => i.status !== "match");
+      if (this.verifyFilter === "diff") return list.filter(i => !["match", "renamed"].includes(i.status));
       return list.filter(i => i.status === this.verifyFilter);
     },
     verifyModeHint() {
@@ -972,7 +972,7 @@ Vue.createApp({
     async api(action, body, timeoutMs) {
       // 源端（PikPak captcha / TLS 抖动）卡住时不能让请求无限挂着，否则按钮永远转圈、
       // 页面看起来像死了。默认 30s；已知的长操作按 action 放宽，调用方仍可显式覆盖。
-      const LONG = { verify: 120000, speedtest: 30000, dirs: 60000, cloudlink: 60000,
+      const LONG = { verify: 300000, speedtest: 30000, dirs: 60000, cloudlink: 60000,
                      cloudmv: 60000, cloudrm: 60000, start: 60000, urldl: 60000,
                      accttest: 60000, acctident: 60000, acctimporttext: 60000,
                      acctrepair: 60000, localfiles: 60000, cleanup: 60000, dirsize: 150000, localsize: 60000,
