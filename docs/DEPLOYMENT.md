@@ -278,6 +278,7 @@ docker restart download-console
 | 只识别到一个存储空间，大容量卷看不到 | 该卷的宿主目录没同时挂进两个容器（或根本没挂） | 见 4.0 / 4.3，两边补同一宿主目录的挂载后重建 |
 | 账号页「共 0 个」，接口返回 `rc config/dump 失败: 401 Unauthorized` | 控制台容器丢了 `RCLONE_RC_USER` / `RCLONE_RC_PASS`，空凭据访问 rclone RC | 见 4.3，按 inspect 备份补回 `-e` 再重建；`accounts_meta.json` / `rclone.conf` 不会被改坏 |
 | 任务报 `couldn't get captcha token ... connection reset by peer`，提示「重新登录」但登录后照旧 | 取 captcha token 的 HTTPS 请求被线路重置，属于网络抖动，不是凭证失效 | v3.84 起先自动重试（直连/代理交替 2 次）并明确提示「网络问题」；仍失败就稍等再点「继续」，或给该任务打开代理。旧版本会误判成风控，重新登录无数次也没用 |
+| 同上，但报错文本只到 `Post "htt` 就断了、看不到 `connection reset` | v3.84 之前的代码把错误按字符数从头部截断（`[:150]`、`[:120]`），网络原因正好被切掉，导致 v3.84 的判断逻辑看不到指纹 | 升到 v3.85：错误原文保留 600 字符做分类，界面统一用 `trim_err()` **从尾部**压缩展示。升级后旧任务的 `error` 文案不会自动重写，点一次「继续」即可产生新记录 |
 | 下载出来的文件属主不对 | rclone-backend 的运行 uid | compose 里加 `user: "${PUID}:${PGID}"` |
 | 改了前端没变化 | 浏览器缓存 | Ctrl+F5；改了 Python 还要重启容器 |
 | 「返回 NAS 主页」跳错地址 | 默认示例值是 `http://127.0.0.1:8080/` | 「设置 → NAS 主页地址」改成自己的导航页，保存后立即生效 |

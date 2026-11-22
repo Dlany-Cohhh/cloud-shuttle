@@ -3,6 +3,33 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.85 — 修好「截断把网络原因切没了」，v3.84 才真正生效（2026-11-22）
+
+v3.84 上线后用户点「继续」仍弹同一句 `预检源目录失败: ... couldn't get captcha token:
+... Post "htt`。抓 NAS 上的 `jobs.json` 发现**报错文本在 `Post "htt` 处就断了**，
+`connection reset by peer` 根本不在字符串里 —— v3.84 的判定没错，是判定前的原因已经被
+按字符数切掉了，`is_net_error()` 看不到任何网络指纹。
+
+两处头部截断叠加：
+
+- `cloud_list()` 捕获异常时 `str(e)[:150]`：rclone 的前缀
+  `error in ListJSON: couldn't list files: couldn't get captcha token: failed to
+  retrieve captcha token from api: Post "https://…` 本身就约 150 字符，正好把尾巴切掉。
+- 「继续」路径 `j["error"] = "预检源目录失败: %s" % pre_err[:120]`：再切一次，雪上加霜。
+
+修复：
+
+- `cloud_list()` 保留 600 字符原文（`rc_ok()` 同步从 300 放宽到 600），保证分类能看到真正的
+  原因；新增 `trim_err(err, keep)` **从尾部**压缩，界面只展示末尾 220～300 字符（前缀里
+  多是噪声，`read tcp …: connection reset by peer` 才是关键）。
+- 「继续」路径不再二次截断，直接用 `cloud_precheck()` 压好的文案。
+- `NET_ERROR_KEYS` 补中文指纹（`连接被重置` / `连接超时` / `网络抖动` / `网络连接被重置` 等）：
+  后端自己翻译的中文提示不含英文关键词，二次分类时会掉回 captcha 分支。
+- 账号标红那一处（`CRED_FATAL_KEYS` 判定）补 `not is_net_error(raw_err)`：以前即便任务没被
+  终态化，账号徽标仍会被 `captcha` 关键字染红成「需重新登录」。
+- `tests/test_error_classify.py` 增 4 项（`trim_err` 保尾、压尾后仍判 TRANSIENT、中文指纹、
+  复现 `[:150]` 丢指纹的旧 bug），全量 68 项通过。
+
 ## v3.84 — 网络抖动不再被误判为「需重新登录」（2026-11-22）
 
 线上现象：任务报 `预检源目录失败: couldn't get captcha token: failed to retrieve

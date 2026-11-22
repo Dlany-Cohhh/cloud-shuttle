@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.84"
+APP_VERSION = "v3.85"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -114,6 +114,10 @@ NET_ERROR_KEYS = (
     "tls handshake timeout", "unexpected eof", "eof occurred",
     "temporarily unavailable", "temporary failure in name resolution",
     "502 bad gateway", "503 service unavailable", "504 gateway timeout",
+    # v3.85：后端自己翻译过的中文文案也要能被认出来，否则「网络连接被重置」这段
+    # 提示本身不含英文指纹，二次分类时又会掉回 captcha 分支。
+    "连接被重置", "连接超时", "网络连接被重置", "网络抖动", "网络不可达",
+    "连接被拒绝", "远程主机强迫关闭", "目标主机不可达",
 )
 
 
@@ -121,6 +125,15 @@ def is_net_error(text):
     """是不是网络层故障（连接被重置 / 超时 / DNS / 网关错误），而不是凭证或业务错误。"""
     s = str(text or "").lower()
     return any(k in s for k in NET_ERROR_KEYS)
+
+
+def trim_err(err, keep=300):
+    """错误文案统一压尾：rclone 的报错前缀（error in ListJSON: couldn't list files:
+    couldn't get captcha token: ... Post "https://…）能占掉 150 字符以上，真正的原因
+    （read tcp …: connection reset by peer）永远在末尾。保留尾部既看得清原因，
+    也能让 is_net_error() 认出这是网络抖动。"""
+    s = mask_secret(err)
+    return s if len(s) <= keep else "…" + s[-keep:]
 
 
 RELINK_ERROR_KEYS = (
@@ -659,7 +672,9 @@ def rc_ok(method, _proxy=False, **kv):
     """rc 的包装：rclone 的 RC 出错时是 200 + {"error":...}，不会抛异常"""
     r = rc(method, _proxy=_proxy, **kv)
     if isinstance(r, dict) and r.get("error"):
-        raise RuntimeError(str(r.get("error"))[:300])
+        # v3.85：原来的 300 字符上限会把 rclone 的 captcha 报错尾巴（真正的
+        # "connection reset by peer"）切掉，网络抖动又变成凭证问题。保留完整原因。
+        raise RuntimeError(str(r.get("error"))[:600])
     return r
 
 
@@ -674,7 +689,12 @@ def cloud_list(name, sub="", retry=True, proxy=False):
                 return lst, ""
             time.sleep(1.5)          # 空结果先别急着判「源目录已空」
         except Exception as e:
-            err = str(e)[:150]
+            # v3.85：这里必须保留足够长的原文。rclone 的报错前缀
+            # 「error in ListJSON: couldn't list files: couldn't get captcha token:
+            #  failed to retrieve captcha token from api: Post "https://…」本身就有
+            # 150 字符左右，截到 150 会把末尾的 connection reset by peer 整段切掉，
+            # is_net_error() 于是看不到网络指纹，网络抖动又被判成「需重新登录」。
+            err = str(e)[:600]
             if not retry or i:
                 return [], err
             time.sleep(1.5)
@@ -735,9 +755,12 @@ def cloud_precheck(name, sub="", proxy=False):
                 return alt
             result = alt
         if result[1] and is_net_error(result[1]):
+            # v3.85：只把原文尾部留给界面（rclone 前缀太长，全量展示会撑爆任务卡），
+            # 但尾部正好是 "read tcp …: connection reset by peer" 这段关键原因。
             return result[0], ("网络连接被重置/超时（已自动重试 2 次，这不是凭证问题；"
-                               "稍等再点「继续」，或给该任务打开代理）：%s" % result[1]), result[2]
-    return result
+                              "稍等再点「继续」，或给该任务打开代理）：%s"
+                              % trim_err(result[1], 220)), result[2]
+    return result[0], trim_err(result[1], 300), result[2]
 
 
 def pikpak_token_full(rt):
@@ -4136,7 +4159,9 @@ def job_live(job):
                 fatal = _fatal_job_error(raw_err)
                 job["state"], job["error"] = fatal or ("error", str(raw_err)[:200])
                 # 凭证类终态要立刻把对应账号标成「需重新登录」，不用等下一轮保活才发现
-                if any(k in raw_err.lower() for k in CRED_FATAL_KEYS):
+                # v3.85：先排除网络抖动，否则「captcha token + connection reset」会把
+                # 好账号标红成「需重新登录」，用户照着点只会更糊涂。
+                if not is_net_error(raw_err) and any(k in raw_err.lower() for k in CRED_FATAL_KEYS):
                     try:
                         src = str(job.get("src") or "")
                         remote = src.split(":", 1)[0] if ":" in src else ""
@@ -7118,7 +7143,11 @@ def api(action, body):
                         pre, pre_err, _ = cloud_precheck(j["remote"], j.get("subpath", ""),
                                                         bool(j.get("proxy")))
                         if pre_err:
-                            j["error"] = "预检源目录失败: %s" % pre_err[:120]
+                            # v3.85：这里以前 [:120] 从头部硬切，正好把预检文案尾部的
+                            # 「connection reset by peer」切掉，任务卡于是又显示成
+                            # 「couldn't get captcha token…请重新登录」。pre_err 已在
+                            # cloud_precheck 里压过尾，直接用即可。
+                            j["error"] = "预检源目录失败: %s" % pre_err
                             continue
                         if not pre:
                             j["error"] = "源目录已空（%s:%s），无需继续" % (j["remote"], j.get("subpath", "/"))

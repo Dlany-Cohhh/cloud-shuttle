@@ -65,6 +65,29 @@ class NetVsCredTest(unittest.TestCase):
         kind, hint = m.classify_error("File name too long: 很长的名字.mp4 /data/x")
         self.assertEqual(kind, "FILE_FATAL")
 
+    def test_trim_err_keeps_tail_reason(self):
+        # v3.85 回归点：rclone 前缀本身就吃掉 150 字符，压尾必须留下 reset 的原因，
+        # 否则界面只看得到「couldn't get captcha token」，用户又会去重新登录。
+        s = m.trim_err(RESET_ERR, 220)
+        self.assertLessEqual(len(s), 221)
+        self.assertIn("connection reset by peer", s)
+        self.assertTrue(m.is_net_error(s))
+
+    def test_precheck_message_stays_transient_after_trim(self):
+        msg = "预检源目录失败: %s" % m.trim_err(RESET_ERR, 220)
+        self.assertFalse(m.need_relink(msg))
+        self.assertEqual(m.classify_error(msg)[0], "TRANSIENT")
+
+    def test_chinese_network_phrase_is_net_error(self):
+        # 后端自己翻译的中文文案不含英文指纹，必须靠中文关键词兜住
+        self.assertTrue(m.is_net_error("网络连接被重置/超时（已自动重试 2 次，这不是凭证问题）"))
+
+    def test_trimmed_150_prefix_is_the_old_bug(self):
+        # 旧实现 [:150] 的结果里已经没有 reset 指纹 —— 复现旧 bug，说明压尾的必要性
+        old = RESET_ERR[:150]
+        self.assertNotIn("connection reset", old)
+        self.assertFalse(m.is_net_error(old))
+
 
 if __name__ == "__main__":
     unittest.main()
