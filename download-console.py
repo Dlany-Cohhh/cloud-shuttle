@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.95"
+APP_VERSION = "v3.96"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -2029,7 +2029,7 @@ COPY_POLL_INTERVAL = 1.0       # 异步 copyfile 状态轮询间隔（秒）
 LIVE_SAMPLE_INTERVAL = 2.0     # 目录任务「在传字节 / 速度」采样间隔（秒）
 STALL_MIN_SPEED = 50 * 1024    # 低于该速度视为「龟速」（字节/秒）
 STALL_SECONDS = 90             # 连续龟速超过该秒数就取消，让位给后面的文件（v3.95：300→90）
-SLOW_TAIL_WORKERS = 1          # v3.95：第二轮「已让位过的文件」只占 1 个并发槽
+SLOW_TAIL_WORKERS = 1          # v3.95：第二轮「已让位过的文件」最多占几个槽（实际按连接预算算）
 SLOW_TAIL_MAX_SECONDS = 1800   # 尾池里单文件最多再试 30 分钟
 SLOW_TAIL_MAX_BYTES = 1048576  # 30 分钟连 1MB 都推不动，判定源端不可达（别无限期卡住任务）
 PARTIAL_ORPHAN_SECONDS = 24 * 3600   # 目标目录里超过 24h 没动的 *.partial 视为孤儿分片
@@ -2517,10 +2517,26 @@ def split_round2(todo):
     """v3.95：第二轮拆成「没让位过的」和「让位过的」两批。
 
     实测（2026-11-23）：4 个并发槽里 2 个被 0.01~0.02 MB/s 的文件长期占住，
-    合计吞吐被腰斩。让位过的文件单独走 1 个槽，其它槽宁可空着也不再被它们吃掉。
+    合计吞吐被腰斩。让位过的文件单独走尾池，先让没让位过的吃满并发。
     """
     return ([e for e in todo if not e.get("slow")],
             [e for e in todo if e.get("slow")])
+
+
+def tail_workers(s, workers):
+    """v3.96：尾池该开几个槽——按「账号连接预算」算，不是固定 1 个。
+
+    尾池开跑时快文件已经全下完了，只剩慢文件，此时固定 1 个槽等于把 16 连接预算
+    只用了 4 条。实测（2026-11-23 收尾段）：1 个槽只剩 0.28~0.37 MB/s，
+    而 5 个慢文件并发能到 1.5 MB/s 上下。
+    上限仍受 AUTOTUNE_MAX_CONNS 约束：槽数 × 每文件流数 ≤ 16，超了服务端会猛限速。
+    """
+    try:
+        mts = max(1, int((s or {}).get("multiThreadStreams") or 1))
+    except Exception:
+        mts = 4
+    budget = max(1, AUTOTUNE_MAX_CONNS // mts)
+    return max(1, min(int(workers or 1), budget))
 
 
 def slow_tail_hopeless(elapsed, grown, max_seconds=SLOW_TAIL_MAX_SECONDS,
@@ -2898,8 +2914,9 @@ def _safe_dir_worker(job_id, snapshot=None):
                         with ThreadPoolExecutor(max_workers=workers) as pool:
                             list(pool.map(run_one, fast))
                     if slow and not _safe_requested_stop(job_id):
-                        log_event(job_id, "slowtail", files=len(slow), workers=SLOW_TAIL_WORKERS)
-                        with ThreadPoolExecutor(max_workers=SLOW_TAIL_WORKERS) as pool:
+                        tail = tail_workers(s, workers)
+                        log_event(job_id, "slowtail", files=len(slow), workers=tail)
+                        with ThreadPoolExecutor(max_workers=tail) as pool:
                             list(pool.map(run_one, slow))
                     continue
                 with ThreadPoolExecutor(max_workers=workers) as pool:

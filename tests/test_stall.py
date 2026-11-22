@@ -77,8 +77,16 @@ class SplitRound2Test(unittest.TestCase):
         fast, slow = m.split_round2(todo)
         self.assertEqual(len(fast), 2)
 
-    def test_slow_workers_is_one(self):
-        self.assertEqual(m.SLOW_TAIL_WORKERS, 1)
+    def test_tail_workers_respect_conn_budget(self):
+        # v3.96：尾池按连接预算开槽，4x4 时可以用满 4 个
+        self.assertEqual(m.tail_workers({"multiThreadStreams": 4}, 4), 4)
+        self.assertEqual(m.tail_workers({"multiThreadStreams": 8}, 4), 2)
+        self.assertEqual(m.tail_workers({"multiThreadStreams": 16}, 4), 1)
+        # 不能超过任务本身的总并发
+        self.assertEqual(m.tail_workers({"multiThreadStreams": 4}, 1), 1)
+        # 坏数据兜底
+        self.assertEqual(m.tail_workers({}, 4), 4)
+        self.assertEqual(m.tail_workers({"multiThreadStreams": 0}, 4), 4)
 
     def test_does_not_mutate(self):
         todo = [{"src": "a", "slow": True}]
@@ -139,7 +147,7 @@ class Round2FlowTest(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(run_one, fast))
         peak_before = calls["peak"]
-        with ThreadPoolExecutor(max_workers=m.SLOW_TAIL_WORKERS) as pool:
+        with ThreadPoolExecutor(max_workers=m.tail_workers({"multiThreadStreams": 16}, 4)) as pool:
             list(pool.map(run_one, slow))
         self.assertEqual(calls["peak"], peak_before, "慢速尾池不应该超过前面已有的并发峰值")
 
