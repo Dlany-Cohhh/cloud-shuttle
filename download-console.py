@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.88"
+APP_VERSION = "v3.89"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -2197,6 +2197,17 @@ def _safe_dir_worker(job_id, snapshot=None):
         got = sum(e["size"] for e in entries if e["status"] in ("done", "skipped"))
         if not done and failed:
             return bail("error", "全部 %d 个文件都下载失败：%s" % (len(failed), failed[0]["error"][:200]))
+        # v3.89：还有 pending 就不能标 done。暂停/续传时若旧线程的外层 copyfile 还在飞，
+        # 工作线程会把整批文件「看到 stop 就原样保持 pending」，然后一路走到这里被标成
+        # done —— 界面显示完成、其实还剩几十 GB 没下（实测 45 个 / 58 GB 被吞）。
+        still = [e for e in entries if e["status"] == "pending"]
+        if still:
+            _xfer_patch(job_id, state="stopped", phase="", speed=0, eta=None, curfile="",
+                        bytes=got, total=total,
+                        error="已暂停：还有 %d 个文件未完成，点「继续」接着下（已完成/已跳过的不会重下）"
+                        % len(still))
+            flush_name_maps()
+            return
         notes = []
         if failed:
             notes.append("%d 个文件失败，其余 %d 个已完成；点「详情」查看原因并可仅重试失败项"
