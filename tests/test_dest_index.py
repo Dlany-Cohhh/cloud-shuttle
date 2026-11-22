@@ -78,10 +78,13 @@ class DestIndexTest(unittest.TestCase):
 
 class StallTest(unittest.TestCase):
     def setUp(self):
-        self.old = (m.rc, m.COPY_POLL_INTERVAL, m.STALL_SECONDS, m.STALL_MIN_SPEED)
+        self.old = (m.rc, m.COPY_POLL_INTERVAL, m.STALL_SECONDS, m.STALL_MIN_SPEED, m.stall_limits)
         m.COPY_POLL_INTERVAL = 0.01
         m.STALL_SECONDS = 0.05
         m.STALL_MIN_SPEED = 1024
+        # v3.95：stall_limits 会把秒数钳到 30~600，测试要的是「0.05 秒就判龟速」，
+        # 所以直接替换取阈值的函数，只验证让位分支本身。
+        m.stall_limits = lambda _s: (m.STALL_MIN_SPEED, m.STALL_SECONDS)
         self.job = {"id": 7, "src": "pk:dir", "dest": "/data/dir", "mode": "copy", "proxy": False}
         self.entry = {"src": "big.mp4", "dst": "big.mp4", "size": 1000}
         self.settings = dict(m.DEFAULTS, fileRetryMax=0)
@@ -89,7 +92,7 @@ class StallTest(unittest.TestCase):
             m.SAFE_JOBS[7] = {"stop": threading.Event()}
 
     def tearDown(self):
-        m.rc, m.COPY_POLL_INTERVAL, m.STALL_SECONDS, m.STALL_MIN_SPEED = self.old
+        m.rc, m.COPY_POLL_INTERVAL, m.STALL_SECONDS, m.STALL_MIN_SPEED, m.stall_limits = self.old
         with m.SAFE_JOBS_LOCK:
             m.SAFE_JOBS.pop(7, None)
 

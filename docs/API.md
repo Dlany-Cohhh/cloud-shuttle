@@ -135,6 +135,7 @@ grep -n 'action ==' download-console.py
 | `autotune` | `id` / `seconds` / `settle` | v3.94：对指定目录任务逐档试并发，结束后写回最快档并继续下载；异步，用 `autotuneinfo` 轮询 |
 | `autotuneinfo` | — | v3.94：`best`（最优档）、`history`（最近 5 次成绩）、`run`（进行中状态）、`maxConns`（连接上限 16） |
 | `tput` | `id` / `seconds` | v3.94：目标目录真实落盘吞吐（MB/s），口径与测速一致 |
+| `savesettings` | `stallSeconds` | v3.95 龟速让位：单文件连续低于 50 KB/s 满该秒数就让位（30–600，默认 90）；让位过的文件第二轮只占 1 个并发槽，尾池 30 分钟推不动 1 MB 判失败 |
 
 磁盘空间保护按任务的目标卷判断（`start` / `resume` 的报错会指明具体哪块空间不足）。
 

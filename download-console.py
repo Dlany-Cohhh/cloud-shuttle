@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.94"
+APP_VERSION = "v3.95"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -263,7 +263,11 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             # 用目标目录真实落盘增量（MB/s）判优劣，不信任 rclone core/stats 自报速度。
             "autoTune": True,            # 总开关
             "autoTuneSeconds": 45,       # 每档测速窗口（秒）
-            "autoTuneSettle": 30}        # 每档启动后「等落盘」的耐心（秒，真正的计分从首次增长开始）
+            "autoTuneSettle": 30,        # 每档启动后「等落盘」的耐心（秒，真正的计分从首次增长开始）
+            # ── v3.95 龟速让位（docs/AUTOTUNE-DESIGN.md 第 5 节）──
+            # 单个文件连续低于 50 KB/s 满 stallSeconds 秒就让位，把并发槽腾给还在动的文件；
+            # 抬到第二轮后只占 1 个槽，不再出现「2 个龟速文件吃掉一半并发」。
+            "stallSeconds": 90}          # 30~600 秒
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
 ORDER_BY_OPTIONS = ("", "size,descending", "size,ascending", "name,ascending",
@@ -1442,6 +1446,7 @@ def _norm_settings(raw):
     # v3.94 自动测速调优：窗口与稳定期钳到合理区间，避免误填 0 秒或 1 小时
     num("autoTuneSeconds", 15, 300)
     num("autoTuneSettle", 5, 120)
+    num("stallSeconds", 30, 600)
     d["autoTune"] = _truthy(d.get("autoTune", True))
     d["safeNaming"] = _truthy(d.get("safeNaming", True))
     d["proxy"] = bool(d.get("proxy"))
@@ -2023,7 +2028,10 @@ FILE_RC_TIMEOUT = 3600         # 单文件 copyfile 的硬超时（含异步轮�
 COPY_POLL_INTERVAL = 1.0       # 异步 copyfile 状态轮询间隔（秒）
 LIVE_SAMPLE_INTERVAL = 2.0     # 目录任务「在传字节 / 速度」采样间隔（秒）
 STALL_MIN_SPEED = 50 * 1024    # 低于该速度视为「龟速」（字节/秒）
-STALL_SECONDS = 300            # 连续龟速超过该秒数就取消，让位给后面的文件
+STALL_SECONDS = 90             # 连续龟速超过该秒数就取消，让位给后面的文件（v3.95：300→90）
+SLOW_TAIL_WORKERS = 1          # v3.95：第二轮「已让位过的文件」只占 1 个并发槽
+SLOW_TAIL_MAX_SECONDS = 1800   # 尾池里单文件最多再试 30 分钟
+SLOW_TAIL_MAX_BYTES = 1048576  # 30 分钟连 1MB 都推不动，判定源端不可达（别无限期卡住任务）
 PARTIAL_ORPHAN_SECONDS = 24 * 3600   # 目标目录里超过 24h 没动的 *.partial 视为孤儿分片
 
 
@@ -2493,6 +2501,34 @@ def _dest_index(job):
                        % mask_secret(last[:200]))
 
 
+def stall_limits(s):
+    """v3.95：从设置里取「龟速让位」阈值，返回 (最低速度 B/s, 连续秒数)。
+
+    stallSeconds 由 _norm_settings 钳到 30~600；这里再兜一次，避免绕过接口直接改文件。
+    """
+    try:
+        secs = int(float((s or {}).get("stallSeconds") or STALL_SECONDS))
+    except Exception:
+        secs = STALL_SECONDS
+    return STALL_MIN_SPEED, max(30, min(600, secs))
+
+
+def split_round2(todo):
+    """v3.95：第二轮拆成「没让位过的」和「让位过的」两批。
+
+    实测（2026-11-23）：4 个并发槽里 2 个被 0.01~0.02 MB/s 的文件长期占住，
+    合计吞吐被腰斩。让位过的文件单独走 1 个槽，其它槽宁可空着也不再被它们吃掉。
+    """
+    return ([e for e in todo if not e.get("slow")],
+            [e for e in todo if e.get("slow")])
+
+
+def slow_tail_hopeless(elapsed, grown, max_seconds=SLOW_TAIL_MAX_SECONDS,
+                       max_bytes=SLOW_TAIL_MAX_BYTES):
+    """v3.95：尾池里的文件是否该认输（继续跑下去只会让任务永远停在 running）。"""
+    return elapsed >= max_seconds and grown < max_bytes
+
+
 def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_speed_of=None):
     """单文件复制走 rclone 异步 job：暂停能真正中断，龟速能让位。
 
@@ -2504,8 +2540,10 @@ def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_
       - 注入 _job_config（含 multi-thread-streams），与旧式任务参数保持一致；
       - v3.91：speed_of 给出该文件当前速度，连续 STALL_SECONDS 低于 STALL_MIN_SPEED
         就取消并返回 stalled，让工作线程把它挪到第二轮，先下完跑得快的文件。
-    返回 ("done","") / ("pending","") / ("stalled","原因")；可重试错误继续抛异常。"""
+    返回 ("done","") / ("pending","") / ("stalled","原因") / ("hopeless","原因")；
+    可重试错误继续抛异常。"""
     rel, safe = entry["src"], entry["dst"]
+    min_speed, stall_secs = stall_limits(s)
     cfg = _job_config(s)
     # 单文件 copyfile 用不上 Transfers/Checkers，真正影响速度的是分块并发。
     # 旧版这里完全不注入，设置页的 multi-thread-streams 对目录任务等于摆设；
@@ -2521,6 +2559,8 @@ def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_
         return "done", ""          # 对端忽略 _async、已同步完成（兼容旧行为）
     deadline = time.time() + FILE_RC_TIMEOUT
     low_since = None
+    tail_start = time.time()
+    tail_grown = 0.0
     while True:
         if _safe_requested_stop(job["id"]):
             try:
@@ -2539,24 +2579,36 @@ def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_
             except Exception:
                 pass
             raise RuntimeError("rc operations/copyfile: 超过 %d 秒未完成" % FILE_RC_TIMEOUT)
-        if allow_defer and speed_of:
+        if speed_of:
             sp = speed_of(rel)
             if sp is not None:
-                if sp < STALL_MIN_SPEED:
+                if allow_defer and sp < min_speed:
                     peer = peer_speed_of() if peer_speed_of else None
-                    if peer is not None and peer < STALL_MIN_SPEED * 2:
+                    if peer is not None and peer < min_speed * 2:
                         low_since = None    # 本任务所有连接都慢：账号/网络整体限速，让位没意义
                     elif low_since is None:
                         low_since = time.time()
-                    elif time.time() - low_since >= STALL_SECONDS:
+                    elif time.time() - low_since >= stall_secs:
                         try:
                             rc("job/stop", jobid=jid, _timeout=10, _proxy=proxy)
                         except Exception:
                             pass
                         return ("stalled", "连续 %d 秒低于 %d KB/s，已让位给其它文件，稍后重试"
-                                % (STALL_SECONDS, STALL_MIN_SPEED // 1024))
-                else:
+                                % (stall_secs, min_speed // 1024))
+                elif allow_defer:
                     low_since = None
+                else:
+                    # v3.95：第二轮不再让位，但也不能无限期挂着——30 分钟推不动 1MB 就认输，
+                    # 否则 2 个龟速文件会让任务永远停在 running、进度永远差最后几 GB。
+                    tail_grown += max(0.0, sp) * COPY_POLL_INTERVAL
+                    if slow_tail_hopeless(time.time() - tail_start, tail_grown):
+                        try:
+                            rc("job/stop", jobid=jid, _timeout=10, _proxy=proxy)
+                        except Exception:
+                            pass
+                        return ("hopeless", "尾池 %d 分钟内只传入 %.1f MB，判定该文件源端不可达"
+                                % (SLOW_TAIL_MAX_SECONDS // 60, tail_grown / 1048576.0))
+
         time.sleep(COPY_POLL_INTERVAL)
 
 
@@ -2620,6 +2672,8 @@ def transfer_one(job, entry, s, existing, made_dirs, xlock=None, speed_of=None,
                 return "pending", ""       # 暂停时已 job/stop 中断，保留待续传状态
             if st_ == "stalled":
                 return "stalled", _
+            if st_ == "hopeless":
+                return "failed", _         # 不重试：重试只会再挂 30 分钟
             with xlock:
                 existing[safe] = size
             if job.get("mode") == "move":
@@ -2785,6 +2839,7 @@ def _safe_dir_worker(job_id, snapshot=None):
                                        peer_speed_of=peer_speed_of)
                 if st == "stalled":
                     e["status"], e["error"] = "deferred", err or ""
+                    e["slow"] = True               # v3.95：第二轮只给它 1 个槽
                     e["attempts"] = int(e.get("attempts") or 0) + 1
                     log_event(job_id, "stalled", file=e["dst"], size=e["size"],
                               why=err or "连续低速", attempts=e["attempts"])
@@ -2837,6 +2892,16 @@ def _safe_dir_worker(job_id, snapshot=None):
                     state["allowDefer"] = False
                     _xfer_patch(job_id, phase="copy", error="", speed=0, curfile="")
                     todo = [e for e in entries if e["status"] == "pending"]
+                    # v3.95：让位过的文件单独走「慢速尾池」（1 个槽），其余仍用全池。
+                    fast, slow = split_round2(todo)
+                    if fast:
+                        with ThreadPoolExecutor(max_workers=workers) as pool:
+                            list(pool.map(run_one, fast))
+                    if slow and not _safe_requested_stop(job_id):
+                        log_event(job_id, "slowtail", files=len(slow), workers=SLOW_TAIL_WORKERS)
+                        with ThreadPoolExecutor(max_workers=SLOW_TAIL_WORKERS) as pool:
+                            list(pool.map(run_one, slow))
+                    continue
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     list(pool.map(run_one, todo))
         finally:
@@ -8063,6 +8128,7 @@ def api(action, body):
             for k in ("maxConcurrent", "diskMinGB", "diskQuotaGB", "transfers", "checkers",
                       "multiThreadStreams", "multiThreadCutoffMB", "retries",
                       "autoTune", "autoTuneSeconds", "autoTuneSettle",
+                      "stallSeconds",
                       "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
                       "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
                       "transfersClearedAt", "nasHomeUrl", "proxyUrl", "netMode",

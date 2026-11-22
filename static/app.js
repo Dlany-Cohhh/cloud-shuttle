@@ -220,8 +220,8 @@ Vue.createApp({
               /* v3.83 长文件名安全命名 */
               safeNaming: true, safeNameMaxBytes: 180, safeNameHashLen: 12,
               safePathMaxBytes: 240, stuckWatchdogMin: 10, fileRetryMax: 3,
-              /* v3.94 自动测速调优 */
-              autoTune: true, autoTuneSeconds: 45, autoTuneSettle: 30 },
+              /* v3.94 自动测速调优 / v3.95 龟速让位 */
+              autoTune: true, autoTuneSeconds: 45, autoTuneSettle: 30, stallSeconds: 90 },
       saving: false,
       bwSel: "off",
       bwBps: null,
@@ -2899,6 +2899,8 @@ Vue.createApp({
         autoTune: s.autoTune ?? true,
         autoTuneSeconds: s.autoTuneSeconds ?? 45,
         autoTuneSettle: s.autoTuneSettle ?? 30,
+        /* v3.95 龟速让位 */
+        stallSeconds: s.stallSeconds ?? 90,
       };
     },
     async resetSettings() {

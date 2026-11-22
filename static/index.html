@@ -1399,6 +1399,10 @@
                       可能触发 PikPak 人机验证（风控）——账号异常时先「重新登录」过完验证再测，每个账号跑一次就够
                     </div>
                   </div>
+                  <label class="flex items-center gap-1 text-xs text-base-content/50" for="sStall" title="单个文件连续低于 50 KB/s 满这么多秒就让位，把并发槽腾给还在动的文件">龟速让位
+                    <input id="sStall" type="number" min="30" max="600" class="fld w-16" v-model.number="form.stallSeconds">
+                    秒
+                  </label>
                   <button class="btn btn-sm btn-ghost" :disabled="atBusy" @click="atBench()">{{atBusy ? '测速中…' : '立即测速'}}</button>
                   <input id="sAutoTune" type="checkbox" class="toggle toggle-primary" v-model="form.autoTune" aria-label="自动测速调优">
                 </div>
