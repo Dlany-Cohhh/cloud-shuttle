@@ -3,6 +3,31 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v3.84 — 网络抖动不再被误判为「需重新登录」（2026-11-22）
+
+线上现象：任务报 `预检源目录失败: couldn't get captcha token: failed to retrieve
+captcha token`，提示「PikPak 触发人工验证风控，请重新登录」；用户重新登录后点「继续」，
+依旧弹同一句。排查结论是这条报错和凭证无关 —— 完整原文是
+`Post "https://user.mypikpak.com/v1/shield/captcha/init": read tcp ...: read:
+connection reset by peer`，即取 captcha token 的 HTTPS 请求在 TCP 层被 RST。同一账号、
+同一配置、同一网络下 `rclone lsf` 稍后又能正常列目录，说明 token 有效。
+
+根因是**错误分类顺序**：`captcha` 是凭证类关键字，任何含该词的报错都被归为
+「凭证/风控」，把一次网络重置翻译成「请重新登录」，于是重新登录永远救不回来。
+
+- 新增 `NET_ERROR_KEYS` / `is_net_error()`：识别 `connection reset by peer`、`read
+  timed out`、`i/o timeout`、`tls handshake timeout`、`unexpected eof`、`no route to
+  host`、`502/503/504` 等网络层指纹。
+- `need_relink()`：命中网络错误先返回 `False`，不再提示重新登录（只有在网络正常、
+  服务端明确回 `invalid_grant` / `captcha_invalid` / `refreshed by other` 时才提示）。
+- `classify_error()`：网络错误在 `_fatal_job_error` 之前判为 `TRANSIENT`，提示
+  「网络抖动（连接被重置或超时），可重试」。
+- `_fatal_job_error()`：网络错误不再终态化（不判 `error`、不把账号标红），交给
+  rclone 低级重试与 `_stuck_watchdog` 兜底，避免「一次抖动 = 任务死掉」。
+- `cloud_precheck()`：预检遇到网络错误时直连/代理交替重试 2 次（0.8s/1.6s 退避）；
+  重试耗尽仍失败才报错，并在文案里写明「不是凭证问题，稍等再点继续或给任务开代理」。
+- 版本号 v3.83 → v3.84；新增 `tests/test_error_classify.py` 覆盖上述判定顺序。
+
 ## v3.83 — 长文件名安全命名 + 目录逐文件下载（2026-11-20）
 
 按 `docs/LONG-FILENAME-DOWNLOAD-DESIGN.md` 实施阶段 1～3，解决「超长文件名任务永远显示

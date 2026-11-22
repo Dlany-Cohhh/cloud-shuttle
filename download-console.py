@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.83"
+APP_VERSION = "v3.84"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -104,6 +104,25 @@ def mask_secret(text):
     return _SECRET_RE.sub(_m, str(text or ""))
 
 
+# v3.84：网络层故障指纹。这类错误重试有可能好，与账号凭证无关；判定顺序必须
+# 在「凭证失效 / 风控」之前，否则会被 captcha / unauthorized 等关键字误伤。
+NET_ERROR_KEYS = (
+    "connection reset by peer", "connection reset", "reset by peer",
+    "remotedisconnected", "connection aborted",
+    "connection refused", "broken pipe", "network is unreachable",
+    "no route to host", "read timed out", "i/o timeout", "dial tcp",
+    "tls handshake timeout", "unexpected eof", "eof occurred",
+    "temporarily unavailable", "temporary failure in name resolution",
+    "502 bad gateway", "503 service unavailable", "504 gateway timeout",
+)
+
+
+def is_net_error(text):
+    """是不是网络层故障（连接被重置 / 超时 / DNS / 网关错误），而不是凭证或业务错误。"""
+    s = str(text or "").lower()
+    return any(k in s for k in NET_ERROR_KEYS)
+
+
 RELINK_ERROR_KEYS = (
     "refreshed by other", "已被别处刷新", "invalid refresh token", "refresh_token 无效",
     "refresh_token 已失效", "invalid_grant", "invalid_token", "unauthorized",
@@ -113,8 +132,16 @@ RELINK_ERROR_KEYS = (
 
 
 def need_relink(text):
-    """这类错误重试多少次都救不回来，只能重新在浏览器登录拿新的 refresh_token。"""
+    """这类错误重试多少次都救不回来，只能重新在浏览器登录拿新的 refresh_token。
+
+    v3.84：先排除网络层故障。PikPak 的 captcha 接口（/v1/shield/captcha/init）被
+    线路重置时，rclone 的报错原文是「couldn't get captcha token: ... connection
+    reset by peer」—— 含 "captcha" 字样但和凭证毫无关系。以前这里会命中 captcha
+    关键字，把一次网络抖动翻译成「请重新登录」，用户登录多少次都救不回来。
+    """
     low = str(text or "").lower()
+    if is_net_error(low):
+        return False
     return any(k.lower() in low for k in RELINK_ERROR_KEYS)
 
 
@@ -695,6 +722,21 @@ def cloud_precheck(name, sub="", proxy=False):
         fallback = _once(False)
         if not fallback[1]:
             return fallback
+    # v3.84：PikPak 的 shield/captcha 接口偶发被线路 RST（实测 NAS 直连 43.160.170.231
+    # 时不定期 reset），一次抖动就把任务判「预检失败」，还会被翻译成「请重新登录」。
+    # 这里对网络层错误再做有限重试（直连/代理交替），重试耗尽才把带「网络问题」标记
+    # 的错误返回，让用户知道该重试而不是去重新登录。
+    if result[1] and is_net_error(result[1]):
+        for i in range(2):
+            time.sleep(0.8 * (i + 1))
+            use_proxy = (not proxy) if i == 0 else bool(proxy)   # 第一次换条路，第二次回到原路
+            alt = _once(use_proxy)
+            if not alt[1]:
+                return alt
+            result = alt
+        if result[1] and is_net_error(result[1]):
+            return result[0], ("网络连接被重置/超时（已自动重试 2 次，这不是凭证问题；"
+                               "稍等再点「继续」，或给该任务打开代理）：%s" % result[1]), result[2]
     return result
 
 
@@ -1782,6 +1824,11 @@ def classify_error(msg, context=""):
     if "invalid argument" in low and (any(t in (low + ctx) for t in ("name", "path", "file", "文件名"))
                                       or "/" in ctx or "\\" in ctx):
         return "FILE_FATAL", "文件名不被目标文件系统接受（原始：%s）" % mask_secret(raw[:160])
+    if is_net_error(raw):
+        # v3.84：必须在 _fatal_job_error 之前判定。下载接口报 captcha / unauthorized
+        # 之前先撞上的往往是 connection reset / i/o timeout，这类抖动重试就好，
+        # 不能归到账号类终态，否则任务会被判死、账号被标红「需重新登录」。
+        return "TRANSIENT", "网络抖动（连接被重置或超时），可重试（原始：%s）" % mask_secret(raw[:160])
     fatal = _fatal_job_error(raw)          # 既有业务错误（额度 / 凭证 / captcha…）
     if fatal:
         return "ACCOUNT_FATAL", fatal[1]
@@ -2194,6 +2241,10 @@ CRED_FATAL_KEYS = (
 def _fatal_job_error(msg):
     """返回 (state, 友好提示+原始错误摘要)；非不可恢复错误返回 None。"""
     raw = str(msg or "")
+    if is_net_error(raw):
+        # v3.84：连接被重置 / 超时是线路问题，交给 rclone 的低级重试与看门狗兜底。
+        # 以前这类报错文本里带 captcha token，会被判成「需重新登录」的终态。
+        return None
     low = raw.lower()
     for key, state, hint in FATAL_JOB_ERRORS:
         if key in low:

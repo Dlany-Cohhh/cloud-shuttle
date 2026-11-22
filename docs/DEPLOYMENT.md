@@ -103,6 +103,7 @@ services:
 - 「下载」与「URL 下载」弹窗会出现「目标存储空间」下拉（多卷时）；`start` / `urldl` 的 `volume` 参数见 `docs/API.md`。
 - 「本地文件」页顶层先列存储空间，点入后按绝对路径浏览；解压 / 改名 / 校验 / 清理跟随所在卷。
 - 磁盘空间保护按卷判断：哪个空间不足只暂停目标在该空间的任务。
+- 挂载的宿主目录是不是「真正的存储空间」要自己核实：`df -h /path/to/dir` 看它落在哪个文件系统。fnOS 这类系统里 `/vol2`、`/vol1` 可能只是系统盘上的普通目录，真正的大容量卷往往是 `/vol3`；把系统盘目录当下载卷，容量小且会拖累系统。
 
 **自定义配额**：「设置 → 磁盘空间保护 → 存储空间配额」（`diskQuotaGB`）给每个存储空间设容量上限（GB，`0` = 跟随实际容量）。配额按整卷已用计算（同一卷上其他程序的数据也计入），配额剩余不足即触发磁盘保护；它只约束显示与任务调度，写盘动作仍有物理剩余空间检查兜底，不会写爆磁盘。
 
@@ -162,6 +163,63 @@ services:
 
 `yt-dlp` 需要自己准备构建目录（镜像里要有 `yt-dlp` 与 `ffmpeg`），本项目仓库不包含它的 Dockerfile。
 
+### 4.3 手工 `docker run` 部署：重建容器必须搬「四件套」
+
+用 compose 时 `docker compose up -d` 会按文件重新生成容器，`volumes` / `environment` / `network_mode` / `restart` 都跟着文件走。但 NAS 上（fnOS、群晖这类没有本项目 compose 的机器）常常是 `docker run` 直接起的，这时重建容器**只搬挂载是错的**：容器一 `docker rm`，挂载、环境变量、网络模式、重启策略、启动命令全部丢失，`docker run` 里没写到的就退回默认值。
+
+四件套，缺一不可：
+
+| 项 | 丢失后的症状 |
+| --- | --- |
+| `-v` 挂载 | 数据看起来「消失」：`/app` 没挂 → 账号/任务/设置在容器里从零生成；下载目录没挂 → 本地文件页空白 |
+| `-e` 环境变量 | 控制台拿空凭据访问 rclone RC → 接口报 `rc config/dump 失败: 401 Unauthorized`，账号页「共 0 个」，而 `accounts_meta.json`、`rclone.conf` 好端端躺在宿主目录里 |
+| `--network host` | 连不上 5572 / 5573 / 5244，任务一提交就失败 |
+| `--restart unless-stopped` | NAS 重启后容器不自动起来 |
+
+`download-console` 必须带的环境变量：
+
+| 变量 | 作用 | 丢失症状 |
+| --- | --- | --- |
+| `RCLONE_RC_USER` / `RCLONE_RC_PASS` | 访问 rclone RC 的 basic auth，必须与 `rclone-backend` 的 `--rc-user` / `--rc-pass` 一致 | 账号页 0 个，`accounts` 接口 401，所有任务认证失败 |
+| `CONSOLE_PUBLIC_HOST` | 页面里生成的外部访问地址（`IP:端口`） | 分享链接 / 播放地址指向 127.0.0.1 |
+| `PROXY_URL` | 代理守护进程用哪个代理 | 代理下载退回直连或直接失败 |
+| `CONSOLE_DOWNLOAD_SUBDIR` | 下载根下的子目录名（默认 `Downloads`） | 新任务落到别的目录，旧文件「找不到」 |
+
+安全重建流程：
+
+```bash
+# 1. 先把当前容器的完整配置存下来，这是重建后逐项比对、出问题回滚的唯一依据
+docker inspect download-console > /tmp/cs-console-inspect.json
+docker inspect rclone-backend  > /tmp/cs-rclone-inspect.json
+
+# 2. 从备份里读出四件套，照着写新的 docker run（不要凭记忆手写）
+python3 - <<'EOF'
+import json
+for f in ("/tmp/cs-console-inspect.json", "/tmp/cs-rclone-inspect.json"):
+    d = json.load(open(f))[0]
+    print("==", d["Name"])
+    print("PATH/ARGS:", d["Path"], d["Args"])
+    print("ENV:", "\n".join(d["Config"]["Env"]))
+    print("BINDS:", "\n".join(d["HostConfig"]["Binds"]))
+    print("NET:", d["HostConfig"]["NetworkMode"], "RESTART:", d["HostConfig"]["RestartPolicy"]["Name"])
+EOF
+
+# 3. 重建后必须校验，不要只看 docker ps 显示 Up
+docker ps --format '{{.Names}}|{{.Status}}'
+curl -s -X POST http://127.0.0.1:5566/api -H 'Content-Type: application/json' -d '{"action":"accounts"}'
+curl -s -X POST http://127.0.0.1:5566/api -H 'Content-Type: application/json' -d '{"action":"jobs"}'
+```
+
+判定标准：
+
+- `accounts` 的 `count` 与 `rclone.conf` 里的 remote 数量一致，`error` 为空；
+- `jobs` 返回的 `state.storages` 条数 = 实际挂进容器的下载宿主目录数（见 4.0）；
+- 两个容器都对新增卷可读可写：`docker exec <容器> sh -c 'touch <卷>/.probe && rm <卷>/.probe'`。
+
+> 删容器本身不会毁数据：运行时数据都写在宿主目录的 bind 挂载里（见第 7 节）。真正会「看起来丢了」的，是重建后没把数据和凭据重新接回去。
+
+**实测案例（2026-11-20，fnOS）**：容器是 `docker run` 起的，只挂了 `/vol2/Data-storage`，而该目录其实在系统盘上（54.6 GB），真正的 927 GB 卷 `/vol3` 从未挂进容器，所以只识别出一个存储空间。给两个容器各加 `-v /vol3/downloads:/vol3/downloads` 后识别出两卷；但重建时漏了 `-e RCLONE_RC_USER/RCLONE_RC_PASS` 等 5 个变量，账号页立刻变成「共 0 个」——补回环境变量重建后，9 个账号与两卷全部恢复，磁盘上的文件全程未被改动。
+
 ## 5. Token 续期（重要）
 
 PikPak 的 `refresh_token` 是**单次轮换**的，长时间不下任务可能过期。建议 root crontab 每小时跑一次：
@@ -217,6 +275,9 @@ docker restart download-console
 | 所有任务一提交就失败、日志显示认证错误 | RC 凭据不一致或没设环境变量 | 核对第 3 节，两边用同一组 `RCLONE_RC_USER/PASS` |
 | 在线播放报 `MEDIA_ELEMENT_ERROR` | 非安全上下文 | 配第 6 节的自签证书，用 https 打开 |
 | 本地文件页为空 / 看不到刚下载的文件 | 两个容器挂载的不是同一个宿主机目录 | `DOWNLOAD_ROOT` 必须同时挂到 `/data` 与 `/vol2/download` |
+| 只识别到一个存储空间，大容量卷看不到 | 该卷的宿主目录没同时挂进两个容器（或根本没挂） | 见 4.0 / 4.3，两边补同一宿主目录的挂载后重建 |
+| 账号页「共 0 个」，接口返回 `rc config/dump 失败: 401 Unauthorized` | 控制台容器丢了 `RCLONE_RC_USER` / `RCLONE_RC_PASS`，空凭据访问 rclone RC | 见 4.3，按 inspect 备份补回 `-e` 再重建；`accounts_meta.json` / `rclone.conf` 不会被改坏 |
+| 任务报 `couldn't get captcha token ... connection reset by peer`，提示「重新登录」但登录后照旧 | 取 captcha token 的 HTTPS 请求被线路重置，属于网络抖动，不是凭证失效 | v3.84 起先自动重试（直连/代理交替 2 次）并明确提示「网络问题」；仍失败就稍等再点「继续」，或给该任务打开代理。旧版本会误判成风控，重新登录无数次也没用 |
 | 下载出来的文件属主不对 | rclone-backend 的运行 uid | compose 里加 `user: "${PUID}:${PGID}"` |
 | 改了前端没变化 | 浏览器缓存 | Ctrl+F5；改了 Python 还要重启容器 |
 | 「返回 NAS 主页」跳错地址 | 默认示例值是 `http://127.0.0.1:8080/` | 「设置 → NAS 主页地址」改成自己的导航页，保存后立即生效 |
