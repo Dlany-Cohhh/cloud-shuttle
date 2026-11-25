@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.14"
+APP_VERSION = "v4.15"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1579,10 +1579,20 @@ NOTIFY_LOCK = threading.Lock()
 NOTIFY_SCAN_SEC = 5           # 巡检间隔（秒）
 NOTIFY_SEND_GAP = 1.0         # 一批里多条消息之间的间隔，别被 PushPlus 限流
 NOTIFY_SEEN_MAX = 400         # 去重表保留条数
+# v4.15：同一任务、同一终态、同一错因的最短重发间隔。
+# v4.13 的去重键里带 bytes，本意是「点继续后再失败、字节变了就该再通知」；
+# 但任务进入 error 后，残留的在飞传输仍在推进字节，键每 5 秒变一次，
+# 于是一次故障被当成几十次新失败连发（实测 22:30 起每 6 秒一条，PushPlus 直接限流报
+# 「服务端验证错误」）。改为键里去掉 bytes，改用「同键 30 分钟内只发一次」。
+NOTIFY_REPEAT_SEC = 1800
+NOTIFY_MAX_PER_SCAN = 3       # 一轮巡检最多发几条，防雪崩
+NOTIFY_BACKOFF_BASE = 60      # 发送失败后的退避起点（秒）
+NOTIFY_BACKOFF_MAX = 300      # 退避上限
+NOTIFY_BACKOFF = {"until": 0.0, "fails": 0}   # 退避状态（内存即可，重启清零不算错）
 NOTIFY_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{16,64}$")
 # v4.11：容器/守护进程重启会把在传的任务标成「控制台重启过，下载已中断…」「守护进程重启过…」的 stopped，
 # 那不是任务故障，是运维动作 —— 照 fail 推的话，每次升级/重启都给你发一串「任务失败」。
-NOTIFY_RESTART_MARK = ("控制台重启过", "守护进程重启过")
+NOTIFY_RESTART_MARK = ("控制台重启过", "守护进程重启过", "已暂停")
 
 
 def pushplus_token_ok(t):
@@ -1592,7 +1602,8 @@ def pushplus_token_ok(t):
 
 def notify_event(job):
     """任务该不该发通知。success = 下完；fail = 失败，或「带错误信息的停止」（额度用尽 / 看门狗 / 重连用尽）。
-    用户自己点「停止」的 stopped 没有 error，不发；重启中断的 stopped 也不发（那是我们重启容器，不是任务出错）。"""
+    用户自己点「停止」的 stopped 没有 error，不发；重启中断 / 暂停收尾的 stopped 也不发
+    （「已暂停：还有 N 个文件未完成」是暂停的正常收尾，不是故障）。"""
     j = job or {}
     st = str(j.get("state") or "")
     err = str(j.get("error") or "").strip()
@@ -1608,11 +1619,11 @@ def notify_event(job):
 
 
 def notify_key(job):
-    """去重键：同一任务、同一终态、同一字节数只发一次。
-    点「继续」后再次失败时字节数会变，键就变了，会重新通知 —— 这是期望行为。"""
+    """去重键：同一任务、同一终态、同一错因。
+    v4.15：故意不含 bytes —— 任务进 error 后残留传输还在推进字节，带 bytes 会把一次
+    故障拆成几十条「新失败」；「点继续后再失败要再通知」改由 NOTIFY_REPEAT_SEC 冷却保证。"""
     j = job or {}
-    return "%s|%s|%s|%s" % (j.get("id"), j.get("state"),
-                            int(j.get("bytes") or 0), str(j.get("error") or "")[:60])
+    return "%s|%s|%s" % (j.get("id"), j.get("state"), str(j.get("error") or "")[:60])
 
 
 def _h(s, n=200):
@@ -1701,15 +1712,23 @@ def pushplus_send(token, title, content, timeout=10):
 
 def notify_scan(send=None, now=None):
     """巡检一次：把「刚进入终态」的任务发到微信。返回 {enabled, sent, skipped, errors, seeded}。
-    send 可注入（测试用）；now 可注入（测试用）。"""
+    send 可注入（测试用）；now 可注入（测试用）。
+
+    v4.15 三条护栏：同键 30 分钟冷却、一轮最多 3 条、发送失败指数退避 ——
+    否则 PushPlus 限流时会把「一次故障」变成几十条重复推送。"""
     s = load_settings()
     enabled = _truthy(s.get("pushplusOn"))
     token = str(s.get("pushplusToken") or "").strip()
-    out = {"enabled": enabled, "sent": 0, "skipped": 0, "errors": [], "seeded": False}
+    out = {"enabled": enabled, "sent": 0, "skipped": 0, "errors": [], "seeded": False,
+           "backoff": 0}
     if not enabled:
         return out
     if not pushplus_token_ok(token):
         out["errors"].append("PushPlus Token 未填写或格式不对（16~64 位字母数字）")
+        return out
+    ts_now = time.time() if now is None else float(now)
+    if ts_now < float(NOTIFY_BACKOFF.get("until") or 0):
+        out["backoff"] = int(float(NOTIFY_BACKOFF["until"]) - ts_now)
         return out
     with LOCK:
         jobs = load_jobs()
@@ -1718,31 +1737,52 @@ def notify_scan(send=None, now=None):
         first = not isinstance(raw, dict)
         seen = dict(raw) if isinstance(raw, dict) else {}
         out["seeded"] = first
-        ts = int(now if now is not None else time.time())
+        ts = int(ts_now)
         changed = first
         for j in jobs:
             kind = notify_event(j)
             if not kind:
                 continue
             k = notify_key(j)
-            if k in seen:
+            last = seen.get(k)
+            if last is not None and ts - int(last) < NOTIFY_REPEAT_SEC:
+                out["skipped"] += 1
                 continue
-            seen[k] = ts
-            changed = True
             if first:
                 # 首次启用：只登记当前终态，不把历史任务一股脑补发一遍
+                seen[k] = ts
+                changed = True
                 continue
+            if out["sent"] >= NOTIFY_MAX_PER_SCAN:
+                break
             try:
                 res = (send or pushplus_send)(token, notify_title(j, kind),
                                               notify_content(j, kind, time.strftime("%Y-%m-%d %H:%M")))
                 code = int((res or {}).get("code") or 0) if isinstance(res, dict) else -1
                 if code == 200:
                     out["sent"] += 1
+                    seen[k] = ts
+                    changed = True
+                    NOTIFY_BACKOFF["fails"] = 0
+                    NOTIFY_BACKOFF["until"] = 0.0
                 else:
                     msg = (res or {}).get("msg") if isinstance(res, dict) else str(res)
                     out["errors"].append("%s：%s" % (notify_title(j, kind)[:40], str(msg)[:80]))
+                    # 失败不登记键，退避后再试；否则这条通知就永久丢了
+                    fails = int(NOTIFY_BACKOFF.get("fails") or 0) + 1
+                    NOTIFY_BACKOFF["fails"] = fails
+                    wait = min(NOTIFY_BACKOFF_MAX, NOTIFY_BACKOFF_BASE * (2 ** (fails - 1)))
+                    NOTIFY_BACKOFF["until"] = ts_now + wait
+                    out["backoff"] = wait
+                    break
             except Exception as e:
                 out["errors"].append("发送异常：%s" % str(e)[:100])
+                fails = int(NOTIFY_BACKOFF.get("fails") or 0) + 1
+                NOTIFY_BACKOFF["fails"] = fails
+                wait = min(NOTIFY_BACKOFF_MAX, NOTIFY_BACKOFF_BASE * (2 ** (fails - 1)))
+                NOTIFY_BACKOFF["until"] = ts_now + wait
+                out["backoff"] = wait
+                break
             time.sleep(NOTIFY_SEND_GAP)
         if changed:
             if len(seen) > NOTIFY_SEEN_MAX:
@@ -2435,6 +2475,7 @@ def launch_job(job, s):
             kv["createEmptySrcDirs"] = "true" if s.get("createEmptySrcDirs", True) else "false"
     # 单文件与目录任务都按同一套基础参数注入（--multi-thread-streams 对单文件最有用）
     kv["_config"] = json.dumps(_job_config(s))
+    kv["_group"] = job_group_of(job["id"])     # v4.15：整任务一个组，停止/清理按组取消
     # v3.43 下载过滤：只作用于目录任务。单文件是用户明确点下的那一个，
     # 再被过滤掉只会让人以为「点了没反应」，所以这里直接不注入。
     fopt = build_filter_opt(job.get("filter") or {})
@@ -2531,6 +2572,109 @@ def _safe_stop_event(job_id):
 def _safe_requested_stop(job_id):
     ev = _safe_stop_event(job_id)
     return bool(ev and ev.is_set())
+
+
+# ── v4.15 任务级 job 分组：停止/出错/重启后把残留传输一起取消 ─────────────
+# 逐文件下载是「一个文件一个异步 job」，worker 只 job/stop 自己手上那一个。
+# 一旦 job/stop 失败被吞掉，工作线程会重试同一个文件 → 旧 job 还在传、新 job 又起，
+# 同一个文件被并行重下几份，连接数翻倍、每条都慢（实测同一个视频在 3 个 job 组里同时传），
+# 面板就会出现「任务已停止/出错，却还有流量」。
+# 现在给每个任务的所有异步 job 打上统一的 _group，停止时按组一次全停。
+JOB_GROUP_PREFIX = "cloudshuttle/"
+
+
+def job_group_of(task_id):
+    return "%s%s" % (JOB_GROUP_PREFIX, task_id)
+
+
+def stop_job_group(task_id, proxy=False):
+    """取消某任务名下所有 rclone 异步 job。优先 job/stopgroup，老版 rclone 退化为逐个 job/stop。"""
+    g = job_group_of(task_id)
+    ok = False
+    try:
+        rc("job/stopgroup", group=g, _timeout=10, _proxy=proxy)
+        return True
+    except Exception:
+        pass
+    try:
+        lst = (rc("job/list", _timeout=10, _proxy=proxy) or {}).get("jobs") or []
+        for jb in lst:
+            if str(jb.get("group") or "") == g:
+                try:
+                    rc("job/stop", jobid=jb.get("id"), _timeout=10, _proxy=proxy)
+                    ok = True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return ok
+
+
+def sweep_orphan_groups(quiet=True):
+    """把「没有任何在跑任务认领」的 cloudshuttle/* job 组停掉。
+
+    控制台重启、worker 异常退出、老版本没打组标签的残留，都会留下仍在传的 async job；
+    面板读的是 rclone 的累计字节，于是出现「进行中 0，却一直有速度」。返回被停掉的组数。
+    """
+    with LOCK:
+        jobs = load_jobs()
+    with SAFE_JOBS_LOCK:
+        alive = set(str(x) for x in SAFE_JOBS.keys())
+    keep = set(alive)
+    for j in jobs:
+        if str(j.get("state") or "") in ("running", "queued"):
+            keep.add(str(j.get("id")))
+    killed = 0
+    for use_proxy in (False, True):
+        groups = _active_job_groups(use_proxy)
+        for g in groups:
+            if g.startswith(JOB_GROUP_PREFIX):
+                if g[len(JOB_GROUP_PREFIX):] in keep:
+                    continue
+            elif keep:
+                # 还有任务在跑时，无标签组可能是该任务升级前的老 job，不能乱停
+                continue
+            try:
+                rc("job/stopgroup", group=g, _timeout=10, _proxy=use_proxy)
+                killed += 1
+                if not quiet:
+                    print("%s 清理无主传输组 %s" % (time.strftime("%F %T"), g), flush=True)
+            except Exception:
+                pass
+    return killed
+
+
+def _active_job_groups(proxy=False):
+    """当前真在传 / 未结束的 job 组。只看活的 —— core/group-list 会把历史组一直列着，
+    按它清理会每分钟「杀掉」同一个早已结束的组，日志全是噪音。"""
+    groups = set()
+    try:
+        cs = rc("core/stats", _timeout=15, _proxy=proxy) or {}
+        for t in (cs.get("transferring") or []):
+            if t.get("group"):
+                groups.add(str(t["group"]))
+    except Exception:
+        pass
+    try:
+        for jb in ((rc("job/list", _timeout=15, _proxy=proxy) or {}).get("jobs") or []):
+            if jb.get("group"):
+                groups.add(str(jb["group"]))
+    except Exception:
+        pass
+    return groups
+
+
+def orphan_guard_loop(interval=60):
+    """常驻：启动时先扫一遍，之后每分钟扫一遍孤儿 job 组。"""
+    time.sleep(3)
+    while True:
+        try:
+            n = sweep_orphan_groups()
+            if n:
+                log_event("system", "orphan-sweep", groups=n)
+        except Exception as e:
+            print("%s 孤儿传输巡检失败: %s" % (time.strftime("%F %T"), str(e)[:100]), flush=True)
+        time.sleep(max(10, int(interval)))
 
 
 def wait_worker_exit(job_id, timeout=10.0):
@@ -3073,6 +3217,7 @@ def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_
     cfg.setdefault("MultiThreadCutoff", max(1, int(s.get("multiThreadCutoffMB") or 1)) * 1048576)
     r = rc("operations/copyfile", srcFs=job["src"], srcRemote=rel,
            dstFs=job["dest"], dstRemote=safe, _async="true",
+           _group=job_group_of(job["id"]),      # v4.15：按任务分组，停止时能一次全停
            _config=json.dumps(cfg),
            _timeout=120, _proxy=proxy, _strict=True)
     jid = r.get("jobid")
@@ -3603,6 +3748,12 @@ def _safe_dir_worker(job_id, snapshot=None):
     def bail(state, msg):
         _xfer_patch(job_id, state=state, error=str(msg)[:400], phase="",
                     speed=0, eta=None, curfile="")
+        # v4.15：进入终态必须把本任务名下的异步 job 全停掉，否则残留 job 会继续吃带宽，
+        # 面板就出现「任务出错/停止，但还在跑流量」，同时 bytes 一直涨还会引爆重复通知。
+        try:
+            stop_job_group(job_id, bool(job.get("proxy")))
+        except Exception:
+            pass
         flush_name_maps()
 
     try:
@@ -3768,7 +3919,13 @@ def _safe_dir_worker(job_id, snapshot=None):
                 e["status"], e["error"] = "failed", ex.msg
                 ev = _safe_stop_event(job_id)
                 if ev:
-                    ev.set()      # 让其余文件尽快退出；在飞的 copyfile 等它自然返回
+                    ev.set()      # 让其余文件尽快退出
+                # v4.15：光置事件不够 —— 在飞的异步 job 要按组一起取消，否则它们继续传，
+                # 任务已经 error 了字节还在涨、流量还在走。
+                try:
+                    stop_job_group(job_id, bool(job.get("proxy")))
+                except Exception:
+                    pass
             except Exception as ex:
                 e["status"], e["error"] = "failed", mask_secret(str(ex)[:200])
             finally:
@@ -3814,6 +3971,11 @@ def _safe_dir_worker(job_id, snapshot=None):
             sampler.join(timeout=LIVE_SAMPLE_INTERVAL + 2)
             with plock:
                 state["live"] = {}          # 收尾后不再有「在传」分量，避免终态字节虚高
+            # v4.15：无论 done / stopped / error，收尾都把本任务剩下的 job 组清掉
+            try:
+                stop_job_group(job_id, bool(job.get("proxy")))
+            except Exception:
+                pass
         try:      # v3.93：rclone 建出来的 0000 权限修回来（只改 mode 为 0 的条目）
             nd, nf = fix_permissions(local_dest(str(job.get("dest") or "")))
             if nd or nf:
@@ -6185,10 +6347,15 @@ def stop_job_entry(j):
         j["curfile"] = ""
         return
     if j.get("naming") == "v2" and not j.get("single_file"):
-        # v3.83 目录任务：通知工作线程停止接收新文件，在飞的 copyfile 等它返回
+        # v3.83 目录任务：通知工作线程停止接收新文件
         ev = _safe_stop_event(j["id"])
         if ev:
             ev.set()
+        # v4.15：在飞的异步 job 按组一次取消（单个文件一个 job，逐个 stop 会漏）
+        try:
+            stop_job_group(j["id"], bool(j.get("proxy")))
+        except Exception:
+            pass
         j["state"] = "stopped"
         j["speed"] = 0
         j["eta"] = None
@@ -6200,6 +6367,10 @@ def stop_job_entry(j):
             rc("job/stop", jobid=j["jobid"], _proxy=bool(j.get("proxy")))
         except Exception:
             pass
+    try:      # v4.15：单文件任务也可能有并行的旧 job 残留，按组清一遍
+        stop_job_group(j["id"], bool(j.get("proxy")))
+    except Exception:
+        pass
     j["state"] = "stopped"
 
 # ── v3.57 存储空间自动识别 ────────────────────────────────────────────
@@ -6544,6 +6715,16 @@ def instant_speed(cur):
         ema = raw if not ema else ema * 0.6 + raw * 0.4
         STATE["spdEma"] = ema
         return round(ema, 1), delta
+
+
+def active_speed(stats):
+    """当前在传文件的实测速度合计（字节/秒）。
+
+    v4.15：总速度不再用「累计字节的两次差分」。两个守护进程（主 5572 / 代理 5573）的
+    累计字节各自随进程重启归零，一合并就会算出 250 MB/s 这种离谱值，然后 EMA 要好几秒
+    才降下来，曲线看着像在飞。rclone 给每个在传文件都报了实时 speed，直接加总最诚实。
+    """
+    return float(sum(float(t.get("speed") or 0) for t in (stats.get("transferring") or [])))
 
 
 def load_history():
@@ -9780,6 +9961,11 @@ def api(action, body):
                     ev = _safe_stop_event(tid)
                     if ev:
                         ev.set()
+                    # v4.15：记录都删了，还挂着异步 job 就永久变成孤儿流量
+                    try:
+                        stop_job_group(tid, bool(j.get("proxy")))
+                    except Exception:
+                        pass
         # v3.93：线程还在收尾就删记录，会让它继续往已删除的任务写进度/计划文件。
         # 先等在飞文件中断，再删；等不到就拒绝并提示用户先「停止」。
         waited, alive = wait_worker_exit(tid, timeout=float(body.get("wait") or 10))
@@ -9800,7 +9986,18 @@ def api(action, body):
             d = merged_stats()
         except Exception as e:
             return {"speed": 0, "bytes": 0, "transferring": [], "error": str(e)[:150]}
-        spd, _ = instant_speed(int(d.get("bytes", 0) or 0))
+        spd, _ = instant_speed(int(d.get("bytes", 0) or 0))   # 保留采样状态，历史页仍用它
+        # v4.15：没有任何在跑/排队的任务时速度必须是 0；有任务时用「在传文件实测速度合计」。
+        # 残留 / 重启的异步 job 会让累计字节继续涨，按累计差分算会显示还在下载，其实任务早停了。
+        try:
+            with LOCK:
+                busy = any(str(j.get("state") or "") in ("running", "queued") for j in load_jobs())
+        except Exception:
+            busy = True
+        if not busy:
+            spd = 0.0
+        else:
+            spd = round(active_speed(d), 1)
         return {"speed": spd, "bytes": d.get("bytes", 0),
                 "transferring": [{"name": t.get("name", ""), "bytes": t.get("bytes", 0),
                                   "total": t.get("totalBytes", 0), "speed": t.get("speed", 0)}
@@ -11553,6 +11750,8 @@ if __name__ == "__main__":
     threading.Thread(target=notify_loop, daemon=True).start()
     # v4.13：失败任务自动重试（默认关；设置里打开后，失败满 N 分钟自动点一次「继续」）
     threading.Thread(target=auto_retry_loop, daemon=True).start()
+    # v4.15：孤儿传输巡检（重启/异常退出留下的 rclone 异步 job，没有任务认领却还在吃带宽）
+    threading.Thread(target=orphan_guard_loop, daemon=True).start()
     print("PikPak 多账号下载器（云梭 CloudShuttle）%s (按任务选择 mihomo 代理 · 凭证保活 · 测速每路 %ss): "
           "http://0.0.0.0:%d  ·  static: %s"
           % (APP_VERSION, SPEEDTEST_SECONDS, CONSOLE_PORT, STATIC_DIR))

@@ -40,6 +40,11 @@ class NotifyEventTest(unittest.TestCase):
                     "守护进程重启过，任务已中断（点继续即可续传）"):
             self.assertIsNone(m.notify_event({"state": "stopped", "error": err}))
 
+    def test_pause_cleanup_is_silent(self):
+        """v4.15：暂停收尾会写「已暂停：还有 N 个文件未完成…」带 error 的 stopped，这不是失败。"""
+        err = "已暂停：还有 4 个文件未完成，点「继续」接着下（已完成/已跳过的不会重下）"
+        self.assertIsNone(m.notify_event({"state": "stopped", "error": err}))
+
     def test_running_and_queued_are_silent(self):
         for st in ("running", "queued", "paused", "stopping"):
             self.assertIsNone(m.notify_event({"state": st}))
@@ -55,11 +60,12 @@ class NotifyKeyTest(unittest.TestCase):
         b = dict(a)
         self.assertEqual(m.notify_key(a), m.notify_key(b))
 
-    def test_retry_changes_key_so_it_notifies_again(self):
-        """点「继续」后再次失败时字节数会变，键就变了 —— 用户期望再收到一条。"""
+    def test_key_ignores_bytes(self):
+        """v4.15：任务 error 后残留传输还在推字节，键里带 bytes 会把一次故障拆成几十条。
+        同任务同状态同错因 → 同一个键。"""
         a = {"id": 1, "state": "error", "bytes": 100, "error": "captcha"}
         b = {"id": 1, "state": "error", "bytes": 260, "error": "captcha"}
-        self.assertNotEqual(m.notify_key(a), m.notify_key(b))
+        self.assertEqual(m.notify_key(a), m.notify_key(b))
 
     def test_different_error_changes_key(self):
         a = {"id": 1, "state": "error", "bytes": 1, "error": "captcha"}
@@ -125,14 +131,17 @@ class NotifyContentTest(unittest.TestCase):
 class NotifyScanTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self._orig = (m.load_settings, m.load_jobs, m.NOTIFY_STATE_FILE, m.NOTIFY_SEND_GAP)
+        self._orig = (m.load_settings, m.load_jobs, m.NOTIFY_STATE_FILE, m.NOTIFY_SEND_GAP,
+                      m.NOTIFY_BACKOFF)
         m.NOTIFY_STATE_FILE = os.path.join(self.tmp, "notify-state.json")
         m.NOTIFY_SEND_GAP = 0        # 测试里不必真的间隔 1 秒
+        m.NOTIFY_BACKOFF.clear()
+        m.NOTIFY_BACKOFF.update({"until": 0.0, "fails": 0})
         self.sent = []
 
     def tearDown(self):
         (m.load_settings, m.load_jobs, m.NOTIFY_STATE_FILE,
-         m.NOTIFY_SEND_GAP) = self._orig
+         m.NOTIFY_SEND_GAP, m.NOTIFY_BACKOFF) = self._orig
 
     def _settings(self, on=True, token="721edd86af47452181dc72198291881b"):
         m.load_settings = lambda: {"pushplusOn": on, "pushplusToken": token}
@@ -186,6 +195,62 @@ class NotifyScanTest(unittest.TestCase):
         # 已经登记过，不会因为发送失败每分钟重试刷屏
         r2 = m.notify_scan(send=lambda *a: {"code": 200})
         self.assertEqual(r2["sent"], 0)
+
+    def test_bytes_growth_does_not_resend(self):
+        """v4.15 回归：error 后 bytes 一直在涨（残留传输推进），不能每 5 秒发一条。"""
+        self._settings()
+        self._jobs([{"id": 5, "state": "done", "bytes": 1}])
+        m.notify_scan(send=lambda *a: {"code": 200})          # 播种
+        n = 0
+        for i in range(10):
+            self._jobs([{"id": 9, "state": "error", "error": "captcha", "bytes": 322319502548 + i * 2100000}])
+            r = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200})
+            n += r["sent"]
+        self.assertEqual(n, 1)                                 # 只发一次
+        self.assertEqual(len(self.sent), 1)
+
+    def test_same_state_after_cooldown_notifies_again(self):
+        """同一故障 30 分钟内不重发；超过冷却期（比如隔天又失败）应该再通知。"""
+        self._settings()
+        self._jobs([{"id": 7, "state": "done"}])
+        m.notify_scan(send=lambda *a: {"code": 200})
+        t0 = 1000000
+        self._jobs([{"id": 7, "state": "error", "error": "captcha"}])
+        r1 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200}, now=t0)
+        r2 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200},
+                           now=t0 + m.NOTIFY_REPEAT_SEC - 10)
+        r3 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200},
+                           now=t0 + m.NOTIFY_REPEAT_SEC + 1)
+        self.assertEqual(r1["sent"], 1)
+        self.assertEqual(r2["sent"], 0)
+        self.assertEqual(r3["sent"], 1)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_failure_backoff_blocks_next_scan(self):
+        """PushPlus 限流（服务端验证错误）后退避，别继续 5 秒一条撞上去。"""
+        self._settings()
+        self._jobs([{"id": 1, "state": "done"}])
+        m.notify_scan(send=lambda *a: {"code": 200})
+        self._jobs([{"id": 11, "state": "error", "error": "boom"}])
+        r = m.notify_scan(send=lambda *a: {"code": 999, "msg": "服务端验证错误"}, now=5000)
+        self.assertEqual(r["sent"], 0)
+        self.assertGreater(r["backoff"], 0)
+        r2 = m.notify_scan(send=lambda *a: {"code": 200}, now=5001)
+        self.assertEqual(r2["sent"], 0)
+        self.assertGreater(r2["backoff"], 0)
+        r3 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200},
+                           now=5000 + m.NOTIFY_BACKOFF_BASE + 5)
+        self.assertEqual(r3["sent"], 1)                        # 退避结束后补发，不丢通知
+
+    def test_max_per_scan(self):
+        """一轮最多发 NOTIFY_MAX_PER_SCAN 条，避免一次事故刷屏。"""
+        self._settings()
+        self._jobs([{"id": 0, "state": "done"}])
+        m.notify_scan(send=lambda *a: {"code": 200})
+        jobs = [{"id": 100 + i, "state": "error", "error": "e%d" % i} for i in range(6)]
+        self._jobs(jobs)
+        r = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200})
+        self.assertEqual(r["sent"], m.NOTIFY_MAX_PER_SCAN)
 
 
 if __name__ == "__main__":

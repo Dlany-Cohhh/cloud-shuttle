@@ -833,7 +833,7 @@ Vue.createApp({
       for (const j of this.jobs) n[j.state] = (n[j.state] || 0) + 1;
       return [
         { label: "总速度",   value: this.fmtSpeed(this.stats.speed),  icon: "ti-activity",     brick: "bg-info/15 text-info" },
-        { label: "本次累计", value: this.fmt(this.stats.bytes),       icon: "ti-stack-2",      brick: "bg-secondary/15 text-secondary" },
+        { label: "累计传输", value: this.fmt(this.stats.bytes),       icon: "ti-stack-2",      brick: "bg-secondary/15 text-secondary" },
         { label: "进行中",   value: String(n.running || 0),           icon: "ti-player-play",  brick: "bg-warning/15 text-warning" },
         { label: "排队中",   value: String(n.queued || 0),           icon: "ti-list-numbers", brick: "bg-accent/15 text-accent" },
         { label: "已完成",   value: String(n.done || 0),             icon: "ti-circle-check", brick: "bg-success/15 text-success" },
