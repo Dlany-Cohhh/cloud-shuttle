@@ -1378,6 +1378,35 @@
                   <input id="sSafeNaming" type="checkbox" class="toggle toggle-primary" v-model="form.safeNaming" aria-label="长文件名安全命名">
                 </div>
 
+                <!-- v4.12 PushPlus 微信通知：原本塞在「高级参数」里，用户找不到；单独拎成一块，常显 -->
+                <div class="flex flex-col gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
+                  <div class="flex flex-wrap items-center gap-3">
+                    <i class="ti ti-brand-wechat text-lg leading-none text-success"></i>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                        微信通知
+                        <span class="badge-pill bg-success/15 text-success">PushPlus</span>
+                      </div>
+                      <div class="mt-0.5 text-xs leading-relaxed text-base-content/50">
+                        {{form.pushplusOn ? (form.pushplusToken ? '已开启：任务结束会推到你的微信' : '已开启，但还没填 token —— 现在不会有任何通知') : '已关闭：任务结束不推送（不影响下载）'}}
+                      </div>
+                    </div>
+                    <input id="sPushplus" type="checkbox" class="toggle toggle-primary" v-model="form.pushplusOn" aria-label="PushPlus 微信通知">
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <label class="w-44 shrink-0 text-sm text-base-content/70" for="sPushplusToken">PushPlus Token</label>
+                    <input id="sPushplusToken" class="fld min-w-48 flex-1" v-model.trim="form.pushplusToken" placeholder="32 位 token，如 721edd86…" aria-label="PushPlus Token">
+                    <button class="btn-sm" :disabled="pushplusTesting" @click="pushplusTest" title="不用先保存也能测一次">
+                      <i class="ti" :class="pushplusTesting ? 'ti-loader-2 animate-spin' : 'ti-bell-ringing'"></i>{{pushplusTesting ? '发送中…' : '发送测试通知'}}
+                    </button>
+                  </div>
+                  <div class="text-[11px] leading-relaxed text-base-content/40">
+                    填 <a href="https://www.pushplus.plus/" target="_blank" rel="noopener" class="link">pushplus.plus</a> 的 token 并打开开关，点「保存设置」后生效（token 只存在 NAS 的 settings.json，不上传别处）。
+                    任务<b>下载完成</b>、<b>失败</b>、<b>故障停止</b>（额度用尽 / 卡住看门狗 / 低速重连用尽等带错误信息的停止）各推一条；
+                    你自己点「停止」不推，重启容器导致的中断也不推。每 5 秒巡检，重启不补发历史。
+                  </div>
+                </div>
+
                 <!-- v3.37：基础 / 高级两块合并为一张卡，高级参数由开关控制显示与生效 -->
                 <div class="flex flex-wrap items-center gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
                   <i class="ti ti-adjustments text-lg leading-none text-info"></i>
@@ -1522,23 +1551,6 @@
                     <template v-else-if="remux">
                       转封装中：{{ remux.running || '空闲' }} · 队列 {{ remux.queued }} · 成功 {{ remux.ok }} · 跳过 {{ remux.skip }} · 失败 {{ remux.fail }}
                     </template>
-                  </span>
-                </div>
-                <!-- v4.10 PushPlus 微信通知：任务成功 / 失败 / 故障停止各推一条 -->
-                <div class="flex flex-wrap items-center gap-3">
-                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sPushplus">微信通知</label>
-                  <input id="sPushplus" type="checkbox" class="toggle toggle-primary" v-model="form.pushplusOn" aria-label="PushPlus 微信通知">
-                  <input class="fld w-72" v-model.trim="form.pushplusToken" placeholder="PushPlus Token（32 位）" aria-label="PushPlus Token">
-                  <button class="btn-sm" :disabled="pushplusTesting" @click="pushplusTest" title="不用保存也能先测一次">
-                    <i class="ti" :class="pushplusTesting ? 'ti-loader-2 animate-spin' : 'ti-bell-ringing'"></i>{{pushplusTesting ? '发送中…' : '发送测试通知'}}
-                  </button>
-                </div>
-                <div class="flex flex-wrap items-start gap-3">
-                  <span class="w-44 shrink-0"></span>
-                  <span class="text-xs text-base-content/50">
-                    填 <a href="https://www.pushplus.plus/" target="_blank" rel="noopener" class="link">pushplus.plus</a> 的 token 并打开开关即可。
-                    任务<b>下载完成</b>、<b>失败</b>、<b>故障停止</b>（额度用尽 / 卡住看门狗 / 低速重连用尽等带错误信息的停止）会各推一条微信；
-                    你自己点「停止」的那种不发。每 5 秒巡检一次，重启不会补发历史任务。
                   </span>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
