@@ -3056,6 +3056,10 @@ Vue.createApp({
         /* v4.10 PushPlus 微信通知 */
         pushplusOn: !!s.pushplusOn,
         pushplusToken: s.pushplusToken || "",
+        /* v4.13 失败任务自动重试 */
+        autoRetryOn: !!s.autoRetryOn,
+        autoRetryMin: s.autoRetryMin ?? 10,
+        autoRetryMax: s.autoRetryMax ?? 3,
       };
     },
     async resetSettings() {

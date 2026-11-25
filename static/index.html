@@ -1378,6 +1378,36 @@
                   <input id="sSafeNaming" type="checkbox" class="toggle toggle-primary" v-model="form.safeNaming" aria-label="长文件名安全命名">
                 </div>
 
+                <!-- v4.13 失败任务自动重试：和微信通知一样单列一块，默认可见 -->
+                <div class="flex flex-col gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
+                  <div class="flex flex-wrap items-center gap-3">
+                    <i class="ti ti-reload text-lg leading-none text-warning"></i>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center gap-2 text-sm font-medium text-base-content/80">
+                        失败自动重试
+                        <span class="badge-pill bg-warning/15 text-warning">v4.13</span>
+                      </div>
+                      <div class="mt-0.5 text-xs leading-relaxed text-base-content/50">
+                        {{form.autoRetryOn ? ('已开启：任务失败后等 ' + (form.autoRetryMin||10) + ' 分钟自动点「继续」，最多 ' + (form.autoRetryMax||0) + ' 次') : '已关闭：失败任务保持原样，等你手动处理'}}
+                      </div>
+                    </div>
+                    <input id="sAutoRetry" type="checkbox" class="toggle toggle-primary" v-model="form.autoRetryOn" aria-label="失败自动重试">
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <label class="w-44 shrink-0 text-sm text-base-content/70" for="sAutoRetryMin">等待 / 最多</label>
+                    <input id="sAutoRetryMin" type="number" min="1" max="1440" class="fld w-24" v-model.number="form.autoRetryMin">
+                    <span class="text-xs text-base-content/50">分钟后重试，最多</span>
+                    <input type="number" min="0" max="10" class="fld w-20" v-model.number="form.autoRetryMax" aria-label="最多自动重试次数">
+                    <span class="text-xs text-base-content/50">次</span>
+                    <span class="text-xs text-base-content/40">（0 = 只记录不重试）</span>
+                  </div>
+                  <div class="text-[11px] leading-relaxed text-base-content/40">
+                    只救「重试能救回来」的失败：网络瞬断、服务端 5xx、连接僵死、云端临时报错。
+                    <b>账号失效 / 人机验证 / 额度用尽 / 磁盘保护</b>这类会直接跳过 —— 重试只会白等，还可能把 PikPak 风控刷得更狠。
+                    每次重试都从断点续（跳过已完成文件，不会重下）；你手动点一次「继续」会把次数清零，任务成功一次也会重新给满额度。
+                  </div>
+                </div>
+
                 <!-- v4.12 PushPlus 微信通知：原本塞在「高级参数」里，用户找不到；单独拎成一块，常显 -->
                 <div class="flex flex-col gap-3 rounded-xl border border-base-content/10 bg-base-content/5 px-3 py-3">
                   <div class="flex flex-wrap items-center gap-3">

@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.12"
+APP_VERSION = "v4.13"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -289,7 +289,14 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             # 任务「下载成功 / 失败 / 故障停止（带错误信息的 stopped）」时推一条微信。
             # 巡检式实现（见 notify_scan），不依赖某条具体代码路径触发，重启不补发历史。
             "pushplusOn": False,         # 总开关（默认关，避免没填 token 时每 5 秒报一次错）
-            "pushplusToken": ""}         # PushPlus 的 32 位 token
+            "pushplusToken": "",         # PushPlus 的 32 位 token
+            # ── v4.13 失败任务自动重试 ──────────────────────────────────
+            # 任务进入 error 后等 autoRetryMin 分钟自动点一次「继续」，最多 autoRetryMax 次。
+            # 只救「能靠重试救回来」的失败（网络瞬断 / 服务端 5xx / 低速僵死），
+            # 账号失效、人机验证、额度用尽、磁盘保护这类重试只会白等，直接跳过（见 AUTO_RETRY_SKIP_RE）。
+            "autoRetryOn": False,        # 总开关（默认关：失败原因不明时自动重跑，可能把风控刷得更狠）
+            "autoRetryMin": 10,          # 失败后等多少分钟再重试（1~1440）
+            "autoRetryMax": 3}           # 同一任务最多自动重试几次（0~10，0 = 只等不重试）
 
 # v4.03：savesettings 允许写入的字段白名单。
 # 之前这个元组直接内联在接口里，新增设置项忘了加进来就会「前端能改、保存无效」——
@@ -306,6 +313,7 @@ SETTINGS_WRITABLE = (
     "autoReconnect", "reconnectSlowKBps", "reconnectWindowSec", "reconnectMax",
     "autoRemuxMp4", "remuxKeepSource", "remuxTimeoutSec",
     "pushplusOn", "pushplusToken",
+    "autoRetryOn", "autoRetryMin", "autoRetryMax",
 )
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
@@ -1495,6 +1503,10 @@ def _norm_settings(raw):
     d["pushplusOn"] = _truthy(d.get("pushplusOn", False))
     _pt = str(d.get("pushplusToken") or "").strip()
     d["pushplusToken"] = _pt if NOTIFY_TOKEN_RE.match(_pt) else ""
+    # v4.13 自动重试：等待时间 1~1440 分钟（1 天），次数 0~10（0 = 只记录不重试）
+    d["autoRetryOn"] = _truthy(d.get("autoRetryOn", False))
+    num("autoRetryMin", 1, 1440)
+    num("autoRetryMax", 0, 10)
     # v3.94 自动测速调优：窗口与稳定期钳到合理区间，避免误填 0 秒或 1 小时
     num("autoTuneSeconds", 15, 300)
     num("autoTuneSettle", 5, 120)
@@ -1752,6 +1764,140 @@ def notify_loop():
         except Exception as e:
             print("%s 通知巡检异常: %s" % (time.strftime("%F %T"), str(e)[:200]), flush=True)
         time.sleep(NOTIFY_SCAN_SEC)
+
+
+# ── v4.13 失败任务自动重试（等 N 分钟再点一次「继续」）─────────────────────
+# 为什么走本地 HTTP API 而不是直接调 launch_job：
+# 「继续」那套流程里有一堆必须复用的前置判断 —— 旧工作线程是否已退出、目标卷磁盘保护、
+# 云端源目录预检（预检要联网列目录，几秒到几十秒）、并发槽位、queued 还是 running。
+# 在这里复制一份等于把两套逻辑慢慢跑偏；直接 POST 给本机 /api 就一次都不漏。
+# 代价是必须放开锁再发请求（api 处理时自己拿 LOCK，持锁调用会死锁）。
+AUTO_RETRY_SCAN_SEC = 30          # 巡检间隔（秒）；与等待分钟数无关，30 秒粒度足够
+AUTO_RETRY_SKIP_RE = re.compile(
+    r"重新登录|登录失效|captcha|人机验证|额度|流量已达|存储空间保护|空间不足|磁盘")
+# 这些失败重试也没用，还会把 PikPak 风控刷得更狠 / 等一天磁盘也腾不出来 — 直接跳过。
+# 「控制台重启过」不在 error 里（那是 stopped），不在此列。
+AUTO_RETRY_WORKER_BUSY = "旧工作线程还没退出"   # 这不是失败，是还没退干净：不计次数，下轮再看
+
+
+def _api_post(payload, timeout=150):
+    """给本机控制台 API 发一个 POST（不带 Origin → 走「非浏览器客户端」通道）。"""
+    import urllib.request
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request("http://127.0.0.1:%d/api" % CONSOLE_PORT, data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 本机回环
+            return json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except Exception as e:
+        return {"error": "内部请求失败：%s" % str(e)[:120]}
+
+
+def auto_retry_scan(now=None, resume=None):
+    """巡检一次：把「失败已满 autoRetryMin 分钟、且还没试满 autoRetryMax 次」的任务重新拉起来。
+    resume(job_id) 可注入（测试用），默认实现回环调本机 /api；返回 (ok, msg)。"""
+    s = load_settings()
+    on = _truthy(s.get("autoRetryOn"))
+    wait = int(s.get("autoRetryMin") or 10) * 60
+    most = int(s.get("autoRetryMax") or 0)
+    out = {"on": on, "retried": 0, "skipped": 0, "cleared": 0, "errors": [], "waiting": []}
+    if not on or most <= 0:
+        return out
+    ts = int(now if now is not None else time.time())
+
+    # 第一段（持锁）：找出候选 + 给第一次看到的失败打时间戳。不发网络请求。
+    cands, dirty = [], False
+    with LOCK:
+        jobs = load_jobs()
+        for j in jobs:
+            st = j.get("state")
+            if st == "done" and (j.get("_arTries") or j.get("_arErrAt")):
+                # 成功一次就把次数清零，以后这批任务再失败又是完整的 N 次额度
+                j["_arTries"], j["_arErrAt"] = 0, None
+                out["cleared"] += 1
+                dirty = True
+                continue
+            if st != "error":
+                continue
+            err = str(j.get("error") or "").strip()
+            if err and AUTO_RETRY_SKIP_RE.search(err):
+                out["skipped"] += 1
+                continue
+            tries = int(j.get("_arTries") or 0)
+            if tries >= most:
+                out["skipped"] += 1
+                continue
+            at = int(j.get("_arErrAt") or 0)
+            if not at:
+                # 第一次看到这个失败：从现在开始计时（重启后也一样，不会立刻重跑）
+                j["_arErrAt"] = ts
+                dirty = True
+                out["waiting"].append(j.get("id"))
+                continue
+            left = at + wait - ts
+            if left > 0:
+                out["waiting"].append(j.get("id"))
+                continue
+            cands.append((j.get("id"), err[:120]))
+        if dirty:
+            save_jobs(jobs)
+
+    # 第二段（不持锁）：真的去点「继续」。api 内部会自己拿锁、自己做预检。
+    for jid, err in cands:
+        ok, msg = True, ""
+        try:
+            r = (resume or (lambda i: _api_post({"action": "resume", "id": i, "_auto": True})))(jid)
+            if isinstance(r, dict):                     # 默认实现返回 API 的 JSON
+                ok = not r.get("error")
+                msg = str(r.get("error") or "")
+            elif isinstance(r, tuple):                  # 注入实现返回 (ok, msg)
+                ok, msg = r
+        except Exception as e:
+            ok, msg = False, str(e)[:120]
+        if ok:
+            out["retried"] += 1
+            print("%s 自动重试任务 %s（上次失败：%s）" % (time.strftime("%F %T"), jid, err[:60]), flush=True)
+            with LOCK:
+                jobs = load_jobs()
+                for j in jobs:
+                    if j.get("id") == jid and j.get("state") != "done":
+                        j["_arTries"] = int(j.get("_arTries") or 0) + 1
+                        j["_arErrAt"] = None    # 下次失败会重新计时
+                save_jobs(jobs)
+        elif AUTO_RETRY_WORKER_BUSY in msg:
+            # 旧线程还没退干净：不计次数，30 秒后再来一次
+            with LOCK:
+                jobs = load_jobs()
+                for j in jobs:
+                    if j.get("id") == jid:
+                        j["_arErrAt"] = ts
+                save_jobs(jobs)
+            out["errors"].append("任务 %s 仍在收尾，稍后再试" % jid)
+        else:
+            # 点不动（磁盘保护 / 预检源空了）：算一次尝试，避免每 30 秒撞一次
+            out["errors"].append("任务 %s 重试失败：%s" % (jid, msg[:100]))
+            with LOCK:
+                jobs = load_jobs()
+                for j in jobs:
+                    if j.get("id") == jid:
+                        j["_arTries"] = int(j.get("_arTries") or 0) + 1
+                        j["_arErrAt"] = None
+                save_jobs(jobs)
+    return out
+
+
+def auto_retry_loop():
+    """常驻巡检线程。异常一律吞掉 —— 自动重试出问题也不能把下载拖死。"""
+    while True:
+        try:
+            r = auto_retry_scan()
+            if r.get("retried"):
+                print("%s 自动重试：已重新拉起 %d 个任务" % (time.strftime("%F %T"), r["retried"]), flush=True)
+            for e in (r.get("errors") or [])[:3]:
+                print("%s 自动重试告警: %s" % (time.strftime("%F %T"), e[:160]), flush=True)
+        except Exception as e:
+            print("%s 自动重试巡检异常: %s" % (time.strftime("%F %T"), str(e)[:200]), flush=True)
+        time.sleep(AUTO_RETRY_SCAN_SEC)
 
 
 def basename_of(path):
@@ -9532,6 +9678,9 @@ def api(action, body):
                     # 否则被自动重连过 5 次的任务再点继续也不会再自动重连了
                     j["_kickN"], j["_kickWin"] = 0, None
                     j["_kickAt"], j["_kickBytes"] = 0, None
+                    if not body.get("_auto"):
+                        # v4.13：人工点「继续」= 用户明确再试一次，把自动重试次数清零重新给额度
+                        j["_arTries"], j["_arErrAt"] = 0, None
                     if running < s["maxConcurrent"]:
                         if launch_job(j, s):
                             running += 1
@@ -11377,6 +11526,8 @@ if __name__ == "__main__":
     threading.Thread(target=cred_keepalive_loop, daemon=True).start()
     # v4.10：PushPlus 通知巡检（默认关；设置里填 token 并打开开关后生效）
     threading.Thread(target=notify_loop, daemon=True).start()
+    # v4.13：失败任务自动重试（默认关；设置里打开后，失败满 N 分钟自动点一次「继续」）
+    threading.Thread(target=auto_retry_loop, daemon=True).start()
     print("PikPak 多账号下载器（云梭 CloudShuttle）%s (按任务选择 mihomo 代理 · 凭证保活 · 测速每路 %ss): "
           "http://0.0.0.0:%d  ·  static: %s"
           % (APP_VERSION, SPEEDTEST_SECONDS, CONSOLE_PORT, STATIC_DIR))
