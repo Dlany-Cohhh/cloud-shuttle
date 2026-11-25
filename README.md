@@ -2,9 +2,9 @@
 
 > **PikPak 多账号下载器**，代号「云梭 CloudShuttle」：多个 PikPak 账号统一接入、批量下载到 NAS，一个页面管完账号凭证、下载任务、云盘目录与本地文件。
 
-![version](https://img.shields.io/badge/version-v3.98-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
+![version](https://img.shields.io/badge/version-v4.10-blue) [![release](https://img.shields.io/github/v/release/Dlany-Cohhh/cloud-shuttle)](https://github.com/Dlany-Cohhh/cloud-shuttle/releases) ![python](https://img.shields.io/badge/python-3.10%2B-green) ![vue](https://img.shields.io/badge/frontend-Vue%203-brightgreen) ![license](https://img.shields.io/badge/license-MIT-orange) ![build](https://img.shields.io/badge/build-%E6%97%A0%E9%9C%80%E6%9E%84%E5%BB%BA-lightgrey)
 
-**当前版本 v3.98** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
+**当前版本 v4.10** · Python 3.10+ 标准库 · Vue 3 全局构建（无 npm 构建步骤）· MIT
 
 仓库地址：**[github.com/Dlany-Cohhh/cloud-shuttle](https://github.com/Dlany-Cohhh/cloud-shuttle)**
 
@@ -125,9 +125,9 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 | 模块 | 能力 |
 | --- | --- |
 | 账号管理 | 多账号列表、导入 / 采集 Token、重新登录、编辑改名、单账号测试、**一键测试全部**（3 路并发 + 进度）、容量与凭证状态、清理残留配置段 |
-| 下载任务 | 分享链接解析、批量建任务、启停 / 断点续传 / 重试、实时速度与进度、并发数与定时启停、磁盘空间保护、高级 rclone 参数、代理逐任务切换、任务详情与错误诊断、**长文件名安全命名（v3.83）** |
+| 下载任务 | 分享链接解析、批量建任务、启停 / 断点续传 / 重试、实时速度与进度、并发数与定时启停、磁盘空间保护、高级 rclone 参数、代理逐任务切换、任务详情与错误诊断、**长文件名安全命名（v3.83）**、**分账号下载（v4.01）** |
 | 云盘浏览 | 目录浏览、在线播放、对比测速、一致性校验、批量重命名（模板 / 正则 / 序号，先预览再执行）、回收站、分享提取次数管理、查重与导出 |
-| 本地文件 | 浏览 / 播放 / 下载、M3U 与 CSV 导出、批量解压、**单项重命名**（文件夹 / 文件）、**批量重命名**（模板 / 正则 / 序号，整批预检 + 失败回滚）、一致性校验 |
+| 本地文件 | 浏览 / 播放 / 下载、M3U 与 CSV 导出、批量解压、**单项重命名**（文件夹 / 文件）、**批量重命名**（模板 / 正则 / 序号，整批预检 + 失败回滚）、**下载后自动转 MP4（v4.04）**、一致性校验 |
 | 统计 | 实时速度、24 小时曲线、14 天下载量、账号容量、已完成传输、rclone 健康指标 |
 | 下载扩展 | OpenList 聚合网盘、aria2 BT / 磁力、yt-dlp 视频站（均为可选服务） |
 | 设置 | 传输参数、限速、日志、代理开关、**自定义代理地址**、**存储空间配额**（v3.57）、NAS 主页地址等，全部持久化 |
@@ -137,7 +137,11 @@ rclone 进程内存与累计作业健康条；24 小时速度曲线（5 分钟�
 
 - **长文件名安全命名（v3.83）**：新任务源端永远用云端原始文件名，落盘名自动清洗 / 按 UTF-8 字节截断并加 `~哈希` 后缀（正常文件名原样保留），原名 ↔ 落盘名写进每卷的 `.cloudshuttle-name-map.json`。目录任务改为逐文件复制，单个文件失败不再拖住整批，支持「仅重试失败项」；文件名过长等确定性错误立即终态化，不再永远显示「下载中」。设置里可一键关闭回滚，旧任务行为不变。详见 [docs/LONG-FILENAME-DOWNLOAD-DESIGN.md](docs/LONG-FILENAME-DOWNLOAD-DESIGN.md)。
 
+- **下载后自动转 MP4（v4.04）**：PikPak 上不少资源是 HLS 切片拼出来的 **MPEG-TS 裸流**，连扩展名都没有，落盘后播放器认不出。下载完成后自动嗅探容器（0x47 同步头），是 TS 就用 `-c copy` 无损转封装成 MP4 —— 不重编码、画质不变，体积还小 8%。转前抽检全零区段（坏文件直接点名「需要重新下载」），转后比对时长（产物短于源 98% 就删半成品），全程不删源文件。设置页一键开关，另有「补转已有文件」扫描历史目录。
+
 - **逐任务选代理**：rclone-backend 内跑两个 rcd（5572 直连 / 5573 经 mihomo 代理），任务可单独指定走哪条链路，不必重建容器。
+
+- **分账号下载（v4.01）**：PikPak 按「账号」限流，单账号下整个目录很快就会撞到天花板。同一份资源转存到多个账号后，云盘页「分账号」可以按**字节均衡**把文件拆给各账号并行下载，每个账号一条独立任务、共用同一个落盘目录。只有所有账号看到的文件集合（路径 + 大小）完全一致才允许开始，避免「分给 A 的文件 B 没有」；分片清单互斥，不会两个账号抢写同一个文件。
 - **Token 保活**：PikPak 的 `refresh_token` 单次轮换，谁刷新谁必须立刻落盘；控制台配合每小时的续期脚本，并识别 rclone 回写产生的无 `type` 空壳段。
 - **批量改名是真实操作**：本地文件页改的是 NAS 上真实文件名，整批预检（越界路径、软链接、隐藏文件、`.part` 临时名、重名）后才两阶段改名，失败自动回滚；执行后弹窗保留、预览按新文件名刷新，可连续多轮操作。
 
@@ -348,7 +352,7 @@ curl -s http://localhost:5566/api -H 'Content-Type: application/json' \
 
 | 情况 | 说明 |
 | --- | --- |
-| 页面改了但没生效 | 静态资源（`static/app.js` / `index.html`）刷新浏览器即可，必要时 Ctrl+F5；Python 改动需重启容器，重启前确认没有 running 任务 |
+| 页面改了但没生效 | v4.00 起 HTML 不缓存、`app.js` / `app.css` 带内容指纹，普通刷新即可（旧版本升级上来的浏览器刷新一次）；Python 改动需重启容器，重启前确认没有 running 任务 |
 | `move · 下完删云端` | 下载完成后会删除云端源文件，不可恢复；默认且推荐的是 `copy · 保留云端` |
 | 本地「批量改名」 | 改的是 NAS 上真实文件名，旧播放 / 下载 / 外链地址会失效；执行后弹窗保留，预览按新名字刷新 |
 | 账号显示红字 / 旧名复活 | rclone 的 `captcha_token` 回写会留下无 `type` 的空壳配置段；v3.51 起列表自动忽略，并可在「更多」里一键清理 |

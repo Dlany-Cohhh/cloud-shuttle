@@ -408,10 +408,12 @@ body { margin: 0; height: 100%; font-family: var(--font-ui); font-variant-numeri
 .vf-pill { display: inline-flex; justify-content: center; border-radius: .375rem;
   padding: .125rem .4rem; font-size: .6875rem; font-weight: 600; white-space: nowrap; }
 .vf-match { background: color-mix(in oklab, var(--color-success) 16%, transparent); color: var(--color-success); }
+.vf-renamed { background: color-mix(in oklab, var(--color-success) 12%, transparent); color: var(--color-success); }
+.vf-renamed-size { background: color-mix(in oklab, var(--color-warning) 16%, transparent); color: var(--color-warning); }
 .vf-missing, .vf-content { background: color-mix(in oklab, var(--color-error) 16%, transparent); color: var(--color-error); }
 .vf-extra, .vf-size { background: color-mix(in oklab, var(--color-warning) 16%, transparent); color: var(--color-warning); }
 .vf-unknown { background: color-mix(in oklab, var(--color-base-content) 10%, transparent); color: var(--color-base-content); }
-.vf-text-match { color: var(--color-success); }
+.vf-text-match, .vf-text-renamed { color: var(--color-success); }
 .vf-text-missing, .vf-text-content { color: var(--color-error); }
 .vf-text-extra, .vf-text-size { color: var(--color-warning); }
 .vf-text-unknown { color: var(--color-base-content); }

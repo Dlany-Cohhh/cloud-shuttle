@@ -119,6 +119,15 @@ Vue.createApp({
         try { return Object.assign(base, JSON.parse(localStorage.getItem("pk.dlFilter") || "{}")); }
         catch (e) { return base; }
       })(),
+      /* v4.01 分账号下载：同一份资源转存到多个账号后，按文件拆开并行下载 */
+      splitOpen: false,
+      splitRemotes: [],
+      splitFolder: "",
+      splitProxy: false,
+      splitScanData: null,
+      splitBusy: false,
+      splitStarting: false,
+      splitErr: "",
       /* v3.43 导出 / 查重 */
       expOpen: false,
       scanBusy: "",
@@ -220,6 +229,10 @@ Vue.createApp({
               /* v3.83 长文件名安全命名 */
               safeNaming: true, safeNameMaxBytes: 180, safeNameHashLen: 12,
               safePathMaxBytes: 240, stuckWatchdogMin: 10, fileRetryMax: 3,
+              /* v4.03 低速自动重连 */
+              autoReconnect: true, reconnectSlowKBps: 384, reconnectWindowSec: 180, reconnectMax: 5,
+              /* v4.04 下载后自动转封装 */
+              autoRemuxMp4: true, remuxKeepSource: true, remuxTimeoutSec: 1800,
               /* v3.94 自动测速调优 / v3.95 龟速让位 */
               autoTune: true, autoTuneSeconds: 45, autoTuneSettle: 30, stallSeconds: 90 },
       saving: false,
@@ -228,6 +241,11 @@ Vue.createApp({
       /* v3.94 自动测速调优 */
       atInfo: null,
       atBusy: false,
+      /* v4.04 下载后自动转封装状态 */
+      remux: null,
+      remuxScanning: false,
+      /* v4.10 PushPlus 通知 */
+      pushplusTesting: false,
 
       /* 反馈 */
       toasts: [],
@@ -443,6 +461,7 @@ Vue.createApp({
       const list = (this.verifyResult && this.verifyResult.items) || [];
       if (this.verifyFilter === "all") return list;
       if (this.verifyFilter === "diff") return list.filter(i => !["match", "renamed"].includes(i.status));
+      if (this.verifyFilter === "renameSize") return list.filter(i => i.renameSource === "size");
       return list.filter(i => i.status === this.verifyFilter);
     },
     verifyModeHint() {
@@ -746,6 +765,44 @@ Vue.createApp({
     filteredJobs() {
       return this.filter === "all" ? this.jobsView : this.jobsView.filter(j => j.state === this.filter);
     },
+    /* v4.01 分账号下载：源必须是**一个目录**。勾了 1 个文件夹就用它，
+       什么都没勾就用当前目录；勾了多个（或勾了文件）时留空，由按钮给出提示。 */
+    splitSourcePath() {
+      const cur = this.curPath || "";
+      if (this.picked.length === 1) {
+        const it = (this.dirs || []).find(d => d.name === this.picked[0]);
+        if (it && it.isdir) return cur ? cur + "/" + it.name : it.name;
+        return "";
+      }
+      if (!this.picked.length) return cur;
+      return "";
+    },
+    splitSourceLabel() {
+      const p = this.splitSourcePath;
+      return p ? this.curRemote + ":" + p : "";
+    },
+    pikAccounts() {
+      return (this.accounts || []).filter(a => a && a.name && a.type === "pikpak");
+    },
+    splitAssignMap() {
+      const m = {};
+      for (const a of (this.splitScanData && this.splitScanData.assign) || []) m[a.remote] = a;
+      return m;
+    },
+    // v4.02：预检结论要分清「集合不一致」和「有账号根本没这个目录」—— 后者更常见，
+    // 而且用户要做的事完全不同（先去转存，而不是去调整账号）。
+    splitVerdict() {
+      const d = this.splitScanData;
+      if (!d) return "";
+      if (d.consistent) return "文件集合一致，可以分";
+      const all = (d.accounts || []).length;
+      const blind = d.missingDir || 0;
+      if (blind && blind === all) return "这些账号都看不到该目录";
+      if (blind) return `${blind} 个账号看不到该目录`;
+      const bad = d.mismatched || 0;
+      if (bad) return `${bad} 个账号的文件集合不一致`;
+      return "文件集合不一致，不能分";
+    },
     histSeries() { return this.histData.series.map(p => [p[0], p[1] / 1048576]); },
     histPeak() {
       const v = this.histSeries.map(p => p[1]);
@@ -845,6 +902,11 @@ Vue.createApp({
 
   methods: {
     /* ---------- 基础 ---------- */
+    /* v3.99：renamed 按证据强度显示——清单确认 vs 仅按字节数推断 */
+    verifyLabel(it) {
+      if (it && it.status === "renamed" && it.renameSource === "size") return "改名待确认";
+      return (it && this.verifyLabels[it.status]) || (it && it.status) || "";
+    },
     fmt(b) {
       if (b == null) return "--";
       return b > 1073741824 ? (b / 1073741824).toFixed(2) + " GB"
@@ -978,6 +1040,8 @@ Vue.createApp({
                      accttest: 60000, acctident: 60000, acctimporttext: 60000,
                      acctrepair: 60000, localfiles: 60000, cleanup: 60000, dirsize: 150000, localsize: 60000,
                      scanpath: 240000, quota: 120000,
+                     /* v4.01 分账号：预检要并行列多个账号的目录，最坏 180 秒 x 2 轮 */
+                     splitscan: 300000, splitstart: 420000,
                      renamebatch: 120000, localrenamebatch: 120000, acctpurge: 60000,
                      trashlist: 90000, trashop: 120000,
                      unzipinfo: 90000, unzip: 120000, localunzip: 60000,
@@ -1066,6 +1130,7 @@ Vue.createApp({
         const nm = (d.settings || {}).netMode;
         if (nm && nm !== this.form.netMode && !this.saving) this.form.netMode = nm;
         this.state = d.state || this.state;
+        if (d.remux) this.remux = d.remux;
         /* v3.58：后端升级检测。页面不刷新时 JS 永远是旧代码，新后端 + 旧前端
            混搭会出现"目录不存在"之类的怪状态——版本变了就提示用户刷新。 */
         const ver = String((this.state || {}).version || "");
@@ -1622,6 +1687,77 @@ Vue.createApp({
       this.toast("已提交 " + ok + " 个任务" + (err ? "，" + err + " 个失败" + detail : ""),
                  err && !ok ? "error" : "ok");
       this.refresh();
+    },
+    /* ---------- v4.01 分账号下载 ---------- */
+    openSplit() {
+      if (!this.splitSourcePath) {
+        this.toast(this.picked.length
+          ? "分账号下载的源必须是一个目录：请只勾选 1 个文件夹，或取消勾选后用当前目录"
+          : "请先进入要下载的云端目录（根目录也可以）", "error");
+        return;
+      }
+      this.splitOpen = true;
+      this.splitScanData = null;
+      this.splitErr = "";
+      this.splitFolder = this.dlFolder || "";
+      this.splitProxy = this.dlProxy();
+      /* 默认勾上凭证正常的账号 + 当前账号；dead/warn 的留给用户自己判断 */
+      this.splitRemotes = this.pikAccounts
+        .filter(a => (a.cred || {}).state === "ok" || a.name === this.curRemote)
+        .map(a => a.name);
+      if (!this.accounts.length) this.loadAccounts();
+    },
+    closeSplit() { this.splitOpen = false; this.splitBusy = false; this.splitStarting = false; },
+    splitToggle(name) {
+      const i = this.splitRemotes.indexOf(name);
+      if (i >= 0) this.splitRemotes.splice(i, 1); else this.splitRemotes.push(name);
+      this.splitScanData = null;      /* 账号变了，旧预检结果作废 */
+      this.splitErr = "";
+    },
+    async splitRunScan() {
+      if (this.splitRemotes.length < 2) { this.toast("至少要选 2 个账号", "error"); return; }
+      if (this.splitBusy) return;
+      this.splitBusy = true;
+      this.splitErr = "";
+      this.splitScanData = null;
+      try {
+        const d = await this.api("splitscan", {
+          path: this.splitSourcePath,
+          remotes: [...this.splitRemotes],
+          proxy: this.splitProxy,
+          filter: this.dlFilterPayload || undefined,
+        });
+        if (d.error) { this.splitErr = d.error; return; }
+        this.splitScanData = d;
+      } catch (e) { this.splitErr = "预检失败：" + e.message; }
+      finally { this.splitBusy = false; }
+    },
+    async splitStartNow() {
+      const sc = this.splitScanData;
+      if (!sc || !sc.consistent) { this.toast("请先预检，并通过文件集合一致性检查", "error"); return; }
+      if (this.splitStarting) return;
+      this.splitStarting = true;
+      this.splitErr = "";
+      try {
+        const d = await this.api("splitstart", {
+          path: this.splitSourcePath,
+          remotes: [...this.splitRemotes],
+          folder: this.splitFolder,
+          volume: this.dlVolume || undefined,
+          proxy: this.splitProxy,
+          filter: this.dlFilterPayload || undefined,
+        });
+        if (d.error) { this.splitErr = d.error; return; }
+        const n = (d.jobs || []).length;
+        const bad = (d.failed || []).length;
+        this.toast("已按 " + n + " 个账号分片下载 · " + this.fmt(d.bytes) +
+                   (bad ? "（" + bad + " 个分片启动失败）" : "") + " → " + d.dest,
+                   bad && bad === n ? "error" : "ok");
+        this.splitOpen = false;
+        await this.refresh();
+        this.go("tasks");
+      } catch (e) { this.splitErr = "启动失败：" + e.message; }
+      finally { this.splitStarting = false; }
     },
     /* ---------- v3.43 下载过滤（提交给 rclone 的 _filter） ---------- */
     sizeToBytes(s) {
@@ -2902,12 +3038,24 @@ Vue.createApp({
         safePathMaxBytes: s.safePathMaxBytes ?? 240,
         stuckWatchdogMin: s.stuckWatchdogMin ?? 10,
         fileRetryMax: s.fileRetryMax ?? 3,
+        /* v4.03 低速自动重连 */
+        autoReconnect: s.autoReconnect ?? true,
+        reconnectSlowKBps: s.reconnectSlowKBps ?? 384,
+        reconnectWindowSec: s.reconnectWindowSec ?? 180,
+        reconnectMax: s.reconnectMax ?? 5,
+        /* v4.04 下载后自动转封装（MPEG-TS → MP4） */
+        autoRemuxMp4: s.autoRemuxMp4 ?? true,
+        remuxKeepSource: s.remuxKeepSource ?? true,
+        remuxTimeoutSec: s.remuxTimeoutSec ?? 1800,
         /* v3.94 自动测速调优 */
         autoTune: s.autoTune ?? true,
         autoTuneSeconds: s.autoTuneSeconds ?? 45,
         autoTuneSettle: s.autoTuneSettle ?? 30,
         /* v3.95 龟速让位 */
         stallSeconds: s.stallSeconds ?? 90,
+        /* v4.10 PushPlus 微信通知 */
+        pushplusOn: !!s.pushplusOn,
+        pushplusToken: s.pushplusToken || "",
       };
     },
     async resetSettings() {
@@ -2977,8 +3125,40 @@ Vue.createApp({
       this.refresh();
     },
 
-    /* ---------- v3.42 我的分享管理 / 提取上限自动取消 ---------- */
-    myShareKey(r) { return r.remote + "|" + r.shareId; },
+    /* v4.10 PushPlus 测试通知：不依赖保存，直接拿输入框里的 token 试一次，
+       省得「改了 token → 保存 → 等任务跑完才知道填错」。 */
+    async pushplusTest() {
+      if (this.pushplusTesting) return;
+      const token = String(this.form.pushplusToken || "").trim();
+      if (!token) { this.toast("先填 PushPlus Token", "error"); return; }
+      this.pushplusTesting = true;
+      try {
+        const d = await this.api("pushplustest", { token }, 30000);
+        if (d.ok) this.toast("测试通知已发送，微信里应该马上能看到", "ok");
+        else this.toast(d.error || "发送失败", "error");
+      } catch (e) { this.toast("发送失败：" + e.message, "error"); }
+      this.pushplusTesting = false;
+    },
+
+    /* v4.04 手动补转历史文件：把一个目录下已下载的 MPEG-TS 转成 mp4。
+       自动转只在「下载完成的那一刻」生效，之前已经下完的老文件靠这个入口补。 */
+    async remuxScan() {
+      const root = (this.remux && this.remux.root) || "";
+      const raw = prompt("要补转哪个目录？\n（可填容器内绝对路径，或相对下载根的子目录；留空 = 整个下载根）", root ? root + "/Downloads" : "");
+      if (raw === null) return;
+      this.remuxScanning = true;
+      try {
+        const d = await this.api("remuxscan", { path: String(raw).trim() }, 60000);
+        if (d.error) { this.toast(d.error, "error"); return; }
+        if (!d.ffmpeg) { this.toast("容器内没有 ffmpeg，转封装不会执行（见下方说明）", "error"); return; }
+        if (!d.found) { this.toast("这个目录里没有找到需要转换的 TS 文件", "ok"); return; }
+        this.toast(`已排队 ${d.queued} 个（共发现 ${d.found} 个），后台串行转封装中`, "ok");
+      } catch (e) { this.toast("扫描失败：" + e.message, "error"); }
+      this.remuxScanning = false;
+      this.refresh();
+    },
+
+    /* ---------- v3.42 我的分享管理 / 提取上限自动取消 ---------- */    myShareKey(r) { return r.remote + "|" + r.shareId; },
     openMyShares() {
       this.myShareOpen = true;
       this.myShareErr = "";
@@ -3961,7 +4141,10 @@ Vue.createApp({
         else {
           this.verifyResult = d;
           this.verifyFilter = d.ok ? "all" : "diff";
-          this.toast(d.ok ? "校验通过：云端与本地一致" : "校验完成：发现差异");
+          const guessed = (d.summary && d.summary.renamedBySize) || 0;
+          this.toast(d.ok
+            ? (guessed ? "校验通过：含 " + guessed + " 对推断改名，建议确认" : "校验通过：云端与本地一致")
+            : "校验完成：发现差异");
         }
       } catch (e) {
         this.verifyError = "请求失败：" + (e && e.message ? e.message : e);
@@ -3972,11 +4155,12 @@ Vue.createApp({
     exportVerifyCsv() {
       const r = this.verifyResult;
       if (!r) return;
-      const rows = [["状态", "相对路径", "云端字节", "本地字节", "说明"]];
+      const rows = [["状态", "相对路径", "本地路径", "云端字节", "本地字节", "配对依据", "说明"]];
+      const basis = { "name-map": "安全命名清单", "size": "字节数推断（待确认）" };
       (r.items || []).forEach(i => rows.push([
-        this.verifyLabels[i.status] || i.status, i.path,
+        this.verifyLabel(i), i.path, i.localPath || "",
         i.cloudSize == null ? "" : i.cloudSize,
-        i.localSize == null ? "" : i.localSize, i.note || "",
+        i.localSize == null ? "" : i.localSize, basis[i.renameSource] || "", i.note || "",
       ]));
       const csv = "\uFEFF" + rows.map(a => a.map(x =>
         '"' + String(x == null ? "" : x).replace(/"/g, '""') + '"').join(",")).join("\r\n");

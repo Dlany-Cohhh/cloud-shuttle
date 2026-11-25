@@ -76,7 +76,7 @@ curl -s -X POST http://127.0.0.1:5566/api \
   -H 'Content-Type: application/json' -d '{"action":"version"}'
 ```
 
-浏览器打开 `http://<NAS 地址>:5566/`（Windows bridge 模式用 `-Port` 指定的端口），按 **Ctrl+F5** 强制刷新一次（静态资源有浏览器缓存）。
+浏览器打开 `http://<NAS 地址>:5566/`（Windows bridge 模式用 `-Port` 指定的端口）。v4.00 起 HTML 不再缓存，`app.js` / `app.css` 带内容指纹，普通刷新即可；首次从旧版本升级上来的浏览器可能还留着旧页面，刷新一次即可。
 
 RC 凭据必须两边一致：控制台容器的 `RCLONE_RC_USER/PASS` 环境变量 = `rclone-backend` 的 `--rc-user/--rc-pass`。不一致时所有任务会静默认证失败。
 
@@ -304,5 +304,5 @@ docker restart download-console
 | 任务报 `couldn't get captcha token ... connection reset by peer`，提示「重新登录」但登录后照旧 | 取 captcha token 的 HTTPS 请求被线路重置，属于网络抖动，不是凭证失效 | v3.84 起先自动重试（直连/代理交替 2 次）并明确提示「网络问题」；仍失败就稍等再点「继续」，或给该任务打开代理。旧版本会误判成风控，重新登录无数次也没用 |
 | 同上，但报错文本只到 `Post "htt` 就断了、看不到 `connection reset` | v3.84 之前的代码把错误按字符数从头部截断（`[:150]`、`[:120]`），网络原因正好被切掉，导致 v3.84 的判断逻辑看不到指纹 | 升到 v3.85：错误原文保留 600 字符做分类，界面统一用 `trim_err()` **从尾部**压缩展示。升级后旧任务的 `error` 文案不会自动重写，点一次「继续」即可产生新记录 |
 | 下载出来的文件属主不对 | rclone-backend 的运行 uid | compose 里加 `user: "${PUID}:${PGID}"` |
-| 改了前端没变化 | 浏览器缓存 | Ctrl+F5；改了 Python 还要重启容器 |
+| 改了前端没变化 | 浏览器缓存 | v4.00 起普通刷新即可（HTML 不缓存、app.js/app.css 带内容指纹）；若浏览器里还是升级前的旧页面，刷新一次。改了 Python 仍要重启容器 |
 | 「返回 NAS 主页」跳错地址 | 默认示例值是 `http://127.0.0.1:8080/` | 「设置 → NAS 主页地址」改成自己的导航页，保存后立即生效 |

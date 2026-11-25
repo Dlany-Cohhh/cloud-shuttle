@@ -28,7 +28,7 @@ curl -s -X POST http://<控制台地址>/api \
 | `tput` | v3.94：量一次目标目录真实吞吐（MB/s），不改动任务 |
 | `version` | 版本与运行状态 |
 
-## 全部 action（由源码自动提取，共 82 个）
+## 全部 action（由源码自动提取，共 87 个）
 
 - `about`
 - `accounts`
@@ -96,6 +96,8 @@ curl -s -X POST http://<控制台地址>/api \
 - `shareparse`
 - `sharesave`
 - `speedtest`
+- `splitscan`
+- `splitstart`
 - `start`
 - `stats`
 - `stop`
@@ -136,6 +138,14 @@ grep -n 'action ==' download-console.py
 | `autotuneinfo` | — | v3.94：`best`（最优档）、`history`（最近 5 次成绩）、`run`（进行中状态）、`maxConns`（连接上限 16） |
 | `tput` | `id` / `seconds` | v3.94：目标目录真实落盘吞吐（MB/s），口径与测速一致 |
 | `savesettings` | `stallSeconds` | v3.95 龟速让位：单文件连续低于 50 KB/s 满该秒数就让位（30–600，默认 90）；让位过的文件第二轮只占 1 个并发槽，尾池 30 分钟推不动 1 MB 判失败 |
+| `savesettings` | `pushplusOn` / `pushplusToken` | v4.10 PushPlus 微信通知：开关（默认关）+ 16~64 位字母数字 token（非法值会被清空，避免每 5 秒报一次错） |
+| `pushplustest` | `token`（可省，省略则用已保存的） | v4.10：发一条测试微信，返回 `{ok,msg}` 或 `{error}`；不依赖保存，改完 token 可先测 |
+| `notifystate` | — | v4.10：`{on, tokenSet, tokenTail(末 4 位), sentCount}`，用于页面显示状态，不返回 token 原文 |
+
+v4.10 的通知规则：巡检线程每 5 秒扫一次 `jobs.json`，任务进入终态且状态跃迁时发一条 ——
+`done` = 下载完成；`error` = 失败；**带 `error` 的 `stopped`**（额度用尽 / 卡住看门狗 / 低速重连用尽等故障停止）= 失败。
+用户自己点「停止」的 `stopped`（无 error）不发。去重键 = `任务id|状态|字节数|错误前 60 字`，落在容器数据目录的
+`notify-state.json`；首次启用只登记当前终态、不补发历史，重启也不会重复推送。
 
 磁盘空间保护按任务的目标卷判断（`start` / `resume` 的报错会指明具体哪块空间不足）。
 
@@ -212,4 +222,30 @@ grep -n 'action ==' download-console.py
 落盘映射写在每个下载卷根目录的 `.cloudshuttle-name-map.json`（v2，原子写）；
 每个目录任务的文件级执行计划在数据目录 `jobfiles/<任务id>.json`，删除任务记录时一并清理。
 设计细节见 [LONG-FILENAME-DOWNLOAD-DESIGN.md](LONG-FILENAME-DOWNLOAD-DESIGN.md)。
+
+### 分账号下载（v4.01+）
+
+同一份资源转存到多个账号之后，把目录里的文件按**字节均衡**拆给各账号并行下载，
+每个账号一条独立任务、共用同一个落盘目录。
+
+| 接口 | 入参 | 说明 |
+| --- | --- | --- |
+| `splitscan` | `path`、`remotes[]`、`filter`、`proxy` | 只读预检：逐账号列目录，返回 `accounts[]`（`state` / `listed` / `files` / `bytes` / `missing` / `extra` / `identical` / `error`）、`consistent`、`fileCount`、`bytes`、`commonCount`、`missingDir`、`mismatched`、`assign[]`、`warnings[]` |
+| `splitstart` | `path`、`remotes[]`、`folder`、`volume`、`filter`、`proxy`、`force` | 建 N 条分片任务；`consistent=false` 时直接拒绝 |
+
+- `accounts[].listed` 表示这次到底有没有列到这个目录（v4.02+）。`listed=false` 的账号
+  `missing` 等于整份资源的文件数，而不是 0 —— 「看不到目录」和「一个都不缺」是两件事。
+- `fileCount` / `bytes` 用**并集**口径（这份资源一共多大），`commonCount` 才是所有账号交集的大小；
+  不一致时前者能说清规模，后者恒为 0 级别，不适合当摘要。
+- `missingDir` / `mismatched` 分别是有账号看不到目录、能看到但集合不同的账号数，
+  界面据此把结论说成「N 个账号看不到该目录」还是「文件集合不一致」。
+
+- `splitscan.consistent` 只有在**所有账号的文件集合（路径 + 大小）完全一致**时才为 `true`，
+  否则 `splitstart` 会拒绝执行：文件集合不一致意味着「分给 A 的文件 B 没有」，任务必然失败。
+- 返回的每个 job 额外带 `split: {group, index, of, files, bytes}` 与 `fileList[]`（该账号分到的相对路径）。
+  `fileList` 是**互斥**的：`expand_source_files` 只认清单里的文件。
+- 过滤规则在拆分**之前**由后端用 Python 算一遍（`filter`），分片任务不再向 rclone 注入 `_filter`，
+  避免两套匹配语义（大小写敏感度不同）导致「分到的文件悄悄不下」。
+- 落点由后端统一计算一次，**不走 `dedupe_dest`**：分片必须落同一个目录，否则会被改成「目录-2」。
+- 分片任务不受 `maxConcurrent` 限制（同源分片排队就失去了并行意义），每条任务仍是独立账号、独立连接预算。
 

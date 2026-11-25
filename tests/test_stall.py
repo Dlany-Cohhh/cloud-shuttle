@@ -103,7 +103,19 @@ class SlowTailGiveUpTest(unittest.TestCase):
         self.assertFalse(m.slow_tail_hopeless(1800, 5 * 1048576))
 
     def test_not_hopeless_before_window(self):
-        self.assertFalse(m.slow_tail_hopeless(600, 0))
+        # v4.06 语义变更：零字节有单独的早退窗口（ZERO_TAIL_SECONDS=600），
+        # 所以「600 秒 + 零字节」现在就该认输；但只要有字节进来，仍按 30 分钟算。
+        self.assertTrue(m.slow_tail_hopeless(600, 0))
+        self.assertFalse(m.slow_tail_hopeless(600, 1024))
+        self.assertFalse(m.slow_tail_hopeless(599, 0))
+
+    def test_zero_bytes_gives_up_early(self):
+        """源对象根本没打开成功（PikPak 无直链）时不必等满 30 分钟。"""
+        self.assertTrue(m.slow_tail_hopeless(m.ZERO_TAIL_SECONDS, 0))
+        self.assertFalse(m.slow_tail_hopeless(m.ZERO_TAIL_SECONDS - 1, 0))
+        # 有字节但极慢：仍走 30 分钟那条线
+        self.assertFalse(m.slow_tail_hopeless(1200, 4096))
+        self.assertTrue(m.slow_tail_hopeless(1800, 4096))
 
     def test_boundary(self):
         self.assertTrue(m.slow_tail_hopeless(1800, 1048575))
@@ -112,6 +124,7 @@ class SlowTailGiveUpTest(unittest.TestCase):
     def test_constants(self):
         self.assertEqual(m.SLOW_TAIL_MAX_SECONDS, 1800)
         self.assertEqual(m.SLOW_TAIL_MAX_BYTES, 1048576)
+        self.assertEqual(m.ZERO_TAIL_SECONDS, 600)
 
 
 class Round2FlowTest(unittest.TestCase):

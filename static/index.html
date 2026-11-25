@@ -16,7 +16,7 @@
 </script>
 <link rel="stylesheet" href="/static/daisyui.css">
 <link rel="stylesheet" href="/static/tabler/tabler-icons.min.css">
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/app.css?v=__CACHE_VER__">
 <script src="/static/tailwind.js"></script>
 </head>
 <body>
@@ -681,9 +681,10 @@
                     <!-- v3.57 目标存储空间：多卷部署时可指定下载到哪个空间，默认第一个 -->
                     <select v-if="(state.storages || []).length > 1" class="fld w-44" v-model="dlVolume"
                             title="下载到哪个存储空间" aria-label="目标存储空间">
-                      <option value="">存储空间：{{(state.storages[0] || {}).name}}（默认）</option>
-                      <option v-for="st in state.storages" :key="st.rclone" :value="st.rclone">
-                        {{st.name}} · 剩余 {{st.freeGB}} GB</option>
+                      <option value="" :disabled="(state.storages[0] || {}).writable === false">存储空间：{{(state.storages[0] || {}).name}}（默认）</option>
+                      <option v-for="st in state.storages" :key="st.rclone" :value="st.rclone"
+                              :disabled="st.writable === false">
+                        {{st.name}} · 剩余 {{st.freeGB}} GB{{st.writable === false ? ' · 不可写，已停用' : ''}}</option>
                     </select>
                     <div class="relative min-w-52 flex-1 sm:flex-none">
                       <input class="fld w-full sm:w-52" v-model.trim="dlFolder" placeholder="保存目录（点击选择 / 输入）" @focus="openPicker('dl')" @click="openPicker('dl')">
@@ -701,6 +702,11 @@
                     </div>
                     <button class="btn-primary btn-press" :disabled="!picked.length" @click="batchStart">
                       <i class="ti ti-download"></i>下载选中（{{picked.length}}）
+                    </button>
+                    <!-- v4.01 分账号下载：同一份资源转存到多个账号后按文件拆开并行下载 -->
+                    <button class="btn-sm" title="同一份资源已转存到多个账号时，按文件拆开并行下载：每个账号各有独立配额，能叠加吞吐（落点仍在同一个目录）"
+                            @click="openSplit">
+                      <i class="ti ti-users-group"></i>分账号
                     </button>
                     <!-- v3.60 已选总大小：文件为列表真实大小，文件夹勾选后自动统计 -->
                     <span v-if="picked.length" class="text-xs tabular-nums text-base-content/60"
@@ -762,9 +768,10 @@
                 <!-- v3.57 目标存储空间（多卷部署时可选） -->
                 <select v-if="(state.storages || []).length > 1" class="fld w-44" v-model="urlVolume"
                         title="下载到哪个存储空间" aria-label="URL 下载目标存储空间">
-                  <option value="">存储空间：{{(state.storages[0] || {}).name}}（默认）</option>
-                  <option v-for="st in state.storages" :key="st.rclone" :value="st.rclone">
-                    {{st.name}} · 剩余 {{st.freeGB}} GB</option>
+                  <option value="" :disabled="(state.storages[0] || {}).writable === false">存储空间：{{(state.storages[0] || {}).name}}（默认）</option>
+                  <option v-for="st in state.storages" :key="st.rclone" :value="st.rclone"
+                          :disabled="st.writable === false">
+                    {{st.name}} · 剩余 {{st.freeGB}} GB{{st.writable === false ? ' · 不可写，已停用' : ''}}</option>
                 </select>
                 <div class="relative">
                   <input class="fld w-36" v-model.trim="urlForm.folder" placeholder="保存目录（默认 URL下载）" @focus="openPicker('url')" @click="openPicker('url')">
@@ -818,6 +825,9 @@
                     <span v-if="j.remote && j.remote!=='URL' && j.method!=='externalshare' && j.kind!=='unzip'" class="badge-pill" :class="j.proxy ? 'bg-info/15 text-info' : 'bg-base-content/8 text-base-content/50'">{{j.proxy ? '代理下载' : '直连下载'}}</span>
                     <span v-if="j.filterText" class="badge-pill bg-warning/15 text-warning" :title="'下载过滤：' + j.filterText">
                       <i class="ti ti-filter"></i>已过滤
+                    </span>
+                    <span v-if="j.split" class="badge-pill bg-primary/15 text-primary" :title="'分账号下载：第 ' + j.split.index + '/' + j.split.of + ' 片，本账号负责 ' + j.split.files + ' 个文件'">
+                      <i class="ti ti-users-group mr-0.5"></i>分账号 {{j.split.index}}/{{j.split.of}}
                     </span>
                     <span v-if="j.naming==='v2'" class="badge-pill bg-secondary/15 text-secondary" title="v3.83 安全命名：源端用云端原始文件名，落盘名自动清洗 / 截断 / 加哈希，原名可在详情里追溯">
                       <i class="ti ti-shield-check mr-0.5"></i>安全命名
@@ -1469,10 +1479,67 @@
                   <input id="sStuck" type="number" min="0" max="1440" class="fld w-24" v-model.number="form.stuckWatchdogMin">
                   <span class="text-xs text-base-content/50">默认 10；安全命名任务无速度、无在传文件且字节长期不涨时自动终止，0 = 关闭</span>
                 </div>
+                <!-- v4.03 低速自动重连：对付「不报错但只有几十 KB/s」的僵死连接 -->
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sReconnect">低速自动重连</label>
+                  <input id="sReconnect" type="checkbox" class="toggle toggle-primary" v-model="form.autoReconnect" aria-label="低速自动重连">
+                  <span class="text-xs text-base-content/50">低于</span>
+                  <input type="number" min="32" max="8192" class="fld w-24" v-model.number="form.reconnectSlowKBps" aria-label="低速阈值 KB/s">
+                  <span class="text-xs text-base-content/50">KB/s 持续</span>
+                  <input type="number" min="60" max="3600" class="fld w-24" v-model.number="form.reconnectWindowSec" aria-label="判定窗口秒">
+                  <span class="text-xs text-base-content/50">秒，最多重连</span>
+                  <input type="number" min="0" max="20" class="fld w-20" v-model.number="form.reconnectMax" aria-label="最多重连次数">
+                  <span class="text-xs text-base-content/50">次</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <span class="w-44 shrink-0"></span>
+                  <span class="text-xs text-base-content/50">PikPak 的连接会「慢速蠕动」：不报错、不超时，但只剩几十 KB/s。实测这种连接手动停一下再继续，立刻回到 8~23 MB/s。开启后按窗口均速判定，触发即自动停→重排（每次窗口翻倍，不会在真慢的线路上反复丢半截文件）</span>
+                </div>
                 <div class="flex flex-wrap items-center gap-3">
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sFileRetry">单文件重试次数</label>
                   <input id="sFileRetry" type="number" min="0" max="10" class="fld w-24" v-model.number="form.fileRetryMax">
                   <span class="text-xs text-base-content/50">默认 3，瞬时 / 未知错误按 2s / 8s / 30s 退避；文件名过长等确定性错误不重试</span>
+                </div>
+                <!-- v4.04 下载后自动转封装：PikPak 的 HLS 资源落盘是 MPEG-TS，常常连扩展名都没有 -->
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sRemux">自动转 MP4</label>
+                  <input id="sRemux" type="checkbox" class="toggle toggle-primary" v-model="form.autoRemuxMp4" aria-label="自动转 MP4">
+                  <label class="flex items-center gap-2 text-xs text-base-content/60">
+                    <input type="checkbox" class="checkbox checkbox-xs" v-model="form.remuxKeepSource" :disabled="!form.autoRemuxMp4" aria-label="保留 TS 源文件">保留 TS 源文件
+                  </label>
+                  <span class="text-xs text-base-content/50">超时</span>
+                  <input type="number" min="60" max="21600" class="fld w-24" v-model.number="form.remuxTimeoutSec" aria-label="转封装超时秒">
+                  <span class="text-xs text-base-content/50">秒</span>
+                  <button class="btn-sm ml-auto" :disabled="remuxScanning" @click="remuxScan()" title="把已经下完的旧文件补转成 mp4（不删源文件）">
+                    <i class="ti" :class="remuxScanning ? 'ti-loader-2 animate-spin' : 'ti-wand'"></i>{{remuxScanning ? '扫描中…' : '补转已有文件'}}
+                  </button>
+                </div>
+                <div class="flex flex-wrap items-start gap-3">
+                  <span class="w-44 shrink-0"></span>
+                  <span class="text-xs text-base-content/50">
+                    下载完成后自动识别容器：MPEG-TS → MP4 用 <code>-c copy</code> 无损转封装（不重编码，画质不变，体积还小 8%）。
+                    <template v-if="remux && !remux.ffmpeg"><b class="text-warning">当前容器内没有 ffmpeg，转封装不会执行。</b>{{ remux.why }}</template>
+                    <template v-else-if="remux">
+                      转封装中：{{ remux.running || '空闲' }} · 队列 {{ remux.queued }} · 成功 {{ remux.ok }} · 跳过 {{ remux.skip }} · 失败 {{ remux.fail }}
+                    </template>
+                  </span>
+                </div>
+                <!-- v4.10 PushPlus 微信通知：任务成功 / 失败 / 故障停止各推一条 -->
+                <div class="flex flex-wrap items-center gap-3">
+                  <label class="w-44 shrink-0 text-sm text-base-content/70" for="sPushplus">微信通知</label>
+                  <input id="sPushplus" type="checkbox" class="toggle toggle-primary" v-model="form.pushplusOn" aria-label="PushPlus 微信通知">
+                  <input class="fld w-72" v-model.trim="form.pushplusToken" placeholder="PushPlus Token（32 位）" aria-label="PushPlus Token">
+                  <button class="btn-sm" :disabled="pushplusTesting" @click="pushplusTest" title="不用保存也能先测一次">
+                    <i class="ti" :class="pushplusTesting ? 'ti-loader-2 animate-spin' : 'ti-bell-ringing'"></i>{{pushplusTesting ? '发送中…' : '发送测试通知'}}
+                  </button>
+                </div>
+                <div class="flex flex-wrap items-start gap-3">
+                  <span class="w-44 shrink-0"></span>
+                  <span class="text-xs text-base-content/50">
+                    填 <a href="https://www.pushplus.plus/" target="_blank" rel="noopener" class="link">pushplus.plus</a> 的 token 并打开开关即可。
+                    任务<b>下载完成</b>、<b>失败</b>、<b>故障停止</b>（额度用尽 / 卡住看门狗 / 低速重连用尽等带错误信息的停止）会各推一条微信；
+                    你自己点「停止」的那种不发。每 5 秒巡检一次，重启不会补发历史任务。
+                  </span>
                 </div>
                 <div class="flex flex-wrap items-center gap-3">
                   <label class="w-44 shrink-0 text-sm text-base-content/70" for="sLogLevel">日志级别 / 文件</label>
@@ -1899,6 +1966,115 @@
           <button class="btn-sm" @click="closeShareSave">取消</button>
           <button class="btn-sm primary" :disabled="shareBusy || !shareInfo || !sharePicked.length" @click="startShareSave">
             <i class="ti" :class="shareBusy ? 'ti-loader-2 animate-spin' : 'ti-link'"></i>{{shareBusy ? '提交中…' : '开始转存'}}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 分账号下载弹窗（v4.01：一个源目录 → 多个账号按文件分担）══ -->
+    <div v-if="splitOpen" class="fixed inset-0 z-[80] flex items-end justify-center p-3 sm:items-center">
+      <div class="absolute inset-0 bg-[oklch(0%_0_0_/_0.5)]" @click="closeSplit"></div>
+      <div class="pop-in relative flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-100 shadow-[0_25px_50px_-12px_color-mix(in_oklab,var(--color-base-content)_25%,transparent)]">
+        <div class="z-10 flex shrink-0 items-center gap-2.5 border-b border-base-content/10 bg-base-200 px-5 py-4">
+          <i class="ti ti-users-group text-lg leading-none text-primary"></i>
+          <span class="min-w-0 flex-1 truncate text-lg font-bold">分账号下载</span>
+          <button class="modal-x press-tactile ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-base-content/15 text-base-content/70" @click="closeSplit" aria-label="关闭">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <div class="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-3 text-sm">
+            <span class="text-base-content/50">源目录</span>
+            <div class="min-w-0 truncate font-medium tabular-nums" :title="splitSourceLabel">
+              {{ splitSourceLabel || '（请先勾选 1 个文件夹或回到当前目录）' }}
+            </div>
+            <span class="text-base-content/50">保存目录</span>
+            <div class="flex min-w-0 flex-col gap-1">
+              <input class="fld" v-model.trim="splitFolder"
+                     placeholder="留空 = Downloads/源目录名" />
+              <span class="text-[11px] leading-relaxed text-base-content/45">所有分片都落到这同一个目录；已存在的同名同大小文件会被跳过（续传），不会重复下载。</span>
+            </div>
+          </div>
+
+          <div class="flex flex-col gap-2">
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-semibold text-base-content/50">参与账号</span>
+              <span class="text-[11px] text-base-content/40">已选 {{splitRemotes.length}} 个 · 只列 PikPak 账号</span>
+            </div>
+            <div class="max-h-56 overflow-y-auto rounded-xl border border-base-content/10 bg-base-content/5 p-1.5">
+              <div v-if="!pikAccounts.length" class="px-2 py-3 text-center text-xs text-base-content/40">还没有 PikPak 账号，请先到「账号」页添加</div>
+              <label v-for="a in pikAccounts" :key="'sp-'+a.name"
+                     class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-base-content/8">
+                <input type="checkbox" class="checkbox checkbox-sm checkbox-primary"
+                       :checked="splitRemotes.includes(a.name)" @change="splitToggle(a.name)" />
+                <i class="ti ti-user"></i>
+                <span class="min-w-0 flex-1 truncate">{{a.name}}</span>
+                <span v-if="(a.cred||{}).state==='dead'" class="badge-pill bg-error/15 text-error">凭证失效</span>
+                <span v-else-if="(a.cred||{}).state==='warn'" class="badge-pill bg-warning/15 text-warning">待验证</span>
+                <span v-if="splitAssignMap[a.name]" class="text-[11px] tabular-nums text-base-content/50">
+                  {{splitAssignMap[a.name].files}} 个 · {{fmt(splitAssignMap[a.name].bytes)}}
+                </span>
+              </label>
+            </div>
+            <span class="text-[11px] leading-relaxed text-base-content/45">
+              前提：这份资源要先转存到每个参与账号（可在云盘页用「跨账号转移」原生转存，不消耗下载配额）。预检会逐个账号核对文件集合，不一致就不允许开始。
+            </span>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <button class="btn-sm" :disabled="splitBusy || splitRemotes.length < 2" @click="splitRunScan">
+              <i class="ti" :class="splitBusy ? 'ti-loader-2 animate-spin' : 'ti-list-check'"></i>{{splitBusy ? '预检中…' : '预检并分配'}}
+            </button>
+            <label class="flex items-center gap-2 text-xs text-base-content/60">
+              <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" v-model="splitProxy" />
+              接口走代理
+            </label>
+          </div>
+
+          <div v-if="splitScanData" class="flex flex-col gap-2">
+            <div class="flex flex-wrap items-center gap-2 text-xs">
+              <span class="badge-pill" :class="splitScanData.consistent ? 'bg-success/15 text-success' : 'bg-error/15 text-error'">
+                <i class="ti" :class="splitScanData.consistent ? 'ti-circle-check' : 'ti-alert-triangle'"></i>
+                {{splitVerdict}}
+              </span>
+              <span class="text-base-content/60">共 {{splitScanData.fileCount}} 个文件 · {{fmt(splitScanData.bytes)}}</span>
+              <span v-if="splitScanData.filterText" class="text-warning/90">已按过滤规则：{{splitScanData.filterText}}</span>
+            </div>
+            <div class="overflow-hidden rounded-xl border border-base-content/10">
+              <div v-for="a in splitScanData.accounts" :key="'sr-'+a.remote"
+                   class="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-base-content/8 px-3 py-2 text-xs last:border-b-0">
+                <span class="min-w-0 flex-1 truncate font-medium">{{a.remote}}</span>
+                <span v-if="a.state==='error'" class="text-error">{{a.error}}</span>
+                <template v-else-if="!a.listed">
+                  <span class="text-warning/90">看不到该目录{{a.missing ? '（缺 ' + a.missing + ' 个）' : ''}}</span>
+                </template>
+                <template v-else>
+                  <span class="tabular-nums text-base-content/60">{{a.files}} 个 · {{fmt(a.bytes)}}</span>
+                  <span v-if="!a.identical" class="text-error">缺 {{a.missing}} / 多 {{a.extra}}</span>
+                  <span v-else class="text-success">一致</span>
+                  <span v-if="splitAssignMap[a.remote]" class="tabular-nums text-primary">分到 {{splitAssignMap[a.remote].files}} 个</span>
+                </template>
+              </div>
+            </div>
+            <div v-for="(w,i) in (splitScanData.warnings || [])" :key="'sw-'+i"
+                 class="flex items-start gap-1.5 rounded-lg border border-warning/25 bg-warning/8 px-3 py-2 text-xs text-warning">
+              <i class="ti ti-alert-circle mt-0.5"></i><span>{{w}}</span>
+            </div>
+          </div>
+
+          <div v-if="splitErr" class="flex items-start gap-2 rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-xs text-error">
+            <i class="ti ti-alert-triangle mt-0.5"></i><div class="leading-relaxed">{{splitErr}}</div>
+          </div>
+
+          <div class="rounded-xl border border-base-content/10 bg-base-content/5 p-3 text-xs leading-relaxed text-base-content/70">
+            <div class="mb-1 flex items-center gap-1.5 font-semibold text-base-content/80"><i class="ti ti-bolt text-success"></i>为什么能更快</div>
+            PikPak 按「账号」限制连接与带宽，单账号下整个目录很快就撞到天花板。分账号下载按<b>字节均衡</b>把文件分给各账号（大文件先给当前最空的账号），每个账号各自跑一条任务、共用同一个落点目录，总吞吐可以叠加。
+          </div>
+        </div>
+        <div class="flex shrink-0 items-center justify-end gap-2 border-t border-base-content/10 bg-base-200 px-5 py-4">
+          <button class="btn-sm" @click="closeSplit">取消</button>
+          <button class="btn-sm primary" :disabled="splitStarting || !splitScanData || !splitScanData.consistent" @click="splitStartNow">
+            <i class="ti" :class="splitStarting ? 'ti-loader-2 animate-spin' : 'ti-users-group'"></i>{{splitStarting ? '正在建任务…' : '开始分账号下载'}}
           </button>
         </div>
       </div>
@@ -2350,18 +2526,23 @@ os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
                  :class="verifyResult.ok ? 'border-success/30 bg-success/10 text-success' : 'border-warning/30 bg-warning/10 text-warning'">
               <i class="ti" :class="verifyResult.ok ? 'ti-circle-check' : 'ti-alert-triangle'"></i>
               <span class="font-semibold">{{verifyResult.ok ? '完全一致：云端与本地文件一致' : '发现差异，详见下表'}}</span>
+              <span v-if="verifyResult.summary.renamedBySize" class="badge badge-warning badge-sm gap-1"><i class="ti ti-help-circle"></i>含 {{verifyResult.summary.renamedBySize}} 对推断改名</span>
               <span class="ml-auto text-xs tabular-nums text-base-content/60">云端 {{verifyResult.cloud.count}} 个 / {{fmt(verifyResult.cloud.bytes)}} · 本地 {{verifyResult.local.count}} 个 / {{fmt(verifyResult.local.bytes)}}</span>
             </div>
 
-            <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-              <div v-for="s in ['match','missing','extra','size','content','unknown']" :key="s" class="card-p flex flex-col gap-0.5 px-3 py-2.5">
+            <div class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
+              <div v-for="s in ['match','renamed','missing','extra','size','content','unknown']" :key="s" class="card-p flex flex-col gap-0.5 px-3 py-2.5">
                 <span class="text-[11px] text-base-content/50">{{verifyLabels[s]}}</span>
                 <span class="text-xl font-bold tabular-nums" :class="'vf-text-'+s">{{verifyResult.summary[s]}}</span>
+                <span v-if="s === 'renamed' && verifyResult.summary.renamedBySize" class="text-[10px] text-warning">{{verifyResult.summary.renamedBySize}} 待确认</span>
               </div>
             </div>
 
             <div v-if="verifyResult.warnings.length" class="flex flex-col gap-1 rounded-xl border border-warning/25 bg-warning/8 px-3.5 py-2.5 text-xs text-warning">
               <div v-for="(w,i) in verifyResult.warnings" :key="i"><i class="ti ti-alert-circle mr-1"></i>{{w}}</div>
+              <button v-if="verifyResult.summary.renamedBySize" class="mt-1 flex w-fit items-center gap-1 rounded-lg px-2 py-1 font-medium hover:bg-warning/10" @click="verifyFilter = 'renameSize'">
+                <i class="ti ti-list-details"></i>查看 {{verifyResult.summary.renamedBySize}} 对仅凭字节数推断的改名
+              </button>
             </div>
 
             <div class="flex flex-wrap items-center gap-2">
@@ -2370,6 +2551,7 @@ os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
                 <option value="diff">仅差异</option>
                 <option value="all">全部</option>
                 <option value="match">仅一致</option>
+                <option v-if="verifyResult.summary.renamedBySize" value="renameSize">待确认改名（{{verifyResult.summary.renamedBySize}}）</option>
                 <option value="missing">本地缺失</option>
                 <option value="extra">云端已无</option>
                 <option value="size">大小不符</option>
@@ -2385,7 +2567,7 @@ os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
                 <span>状态</span><span>相对路径</span><span class="text-right">云端</span><span class="text-right vf-local">本地</span><span class="vf-note">说明</span>
               </div>
               <div v-for="it in verifyItems.slice(0,300)" :key="it.path" class="vf-row">
-                <span class="vf-pill" :class="'vf-'+it.status">{{verifyLabels[it.status] || it.status}}</span>
+                <span class="vf-pill" :class="it.renameSource === 'size' ? 'vf-renamed-size' : 'vf-'+it.status">{{verifyLabel(it)}}</span>
                 <span class="min-w-0 truncate text-xs" :title="it.path">{{it.path}}</span>
                 <span class="text-right text-xs tabular-nums" :title="it.cloudSize">{{fmt(it.cloudSize)}}</span>
                 <span class="vf-local text-right text-xs tabular-nums" :title="it.localSize">{{fmt(it.localSize)}}</span>
@@ -3044,6 +3226,6 @@ os.EXAMPLE_TOKEN_ONLY_REPLACE_ME...（只有 token 也行）"></textarea>
 <script src="/static/echarts.min.js"></script>
 <script src="/static/vue.global.prod.js"></script>
 <script src="/static/bm-code.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=__CACHE_VER__"></script>
 </body>
 </html>

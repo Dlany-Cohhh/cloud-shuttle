@@ -28,6 +28,7 @@ class PairRenamesBySizeTest(unittest.TestCase):
                  self._it("long_clou~abc123.mp4", "extra", None, 4096)]
         self.assertEqual(m.pair_renames_by_size(items), 1)
         self.assertEqual(items[0]["status"], "renamed")
+        self.assertEqual(items[0]["renameSource"], "size")
         self.assertEqual(items[0]["localPath"], "long_clou~abc123.mp4")
         self.assertEqual(items[0]["localSize"], 4096)
         self.assertTrue(items[1].get("_merged"), "本地那条应被标记合并，避免重复展示")
@@ -113,6 +114,82 @@ class RenameMapForTest(unittest.TestCase):
     def test_broken_map_returns_empty(self):
         m.load_name_map = lambda _v: None
         self.assertEqual(m.rename_map_for("会员号", "x", "/vol2/download"), {})
+
+
+class VerifyRenameSourceTest(unittest.TestCase):
+    """v3.99：renamed 必须区分「清单确认」和「仅按字节数推断」。"""
+
+    def test_size_pair_source_is_recorded(self):
+        items = [{"path": "a.mp4", "status": "missing", "cloudSize": 10, "localSize": None, "note": ""},
+                 {"path": "b.mp4", "status": "extra", "cloudSize": None, "localSize": 10, "note": ""}]
+        m.pair_renames_by_size(items)
+        self.assertEqual(items[0]["renameSource"], "size")
+        self.assertIn("未列入安全命名清单", items[0]["note"])
+
+    def test_counts_split_by_evidence(self):
+        items = [
+            {"status": "renamed", "renameSource": "name-map"},
+            {"status": "renamed", "renameSource": "size"},
+            {"status": "renamed", "renameSource": "size"},
+            {"status": "match"},
+        ]
+        self.assertEqual(m.verify_rename_counts(items), {"byMap": 1, "bySize": 2})
+
+    def test_counts_treat_missing_source_as_map(self):
+        # 老结果/外部数据没有 renameSource 时按清单确认处理，不误报为待确认
+        items = [{"status": "renamed"}, {"status": "missing"}]
+        self.assertEqual(m.verify_rename_counts(items), {"byMap": 1, "bySize": 0})
+
+
+class VerifyCompareRenameSourceTest(unittest.TestCase):
+    """verify_compare 端到端：清单确认 + 字节数推断同时出现时的汇总。"""
+
+    def setUp(self):
+        self.old = (m.verify_cloud, m.verify_local, m.rename_map_for)
+        m.verify_cloud = lambda remote, path: {
+            "error": "", "attempts": 1, "truncated": False,
+            "scope": "dir", "target": "acc:dir",
+            "files": {"长名.mp4": 100, "普通.mp4": 200, "历史.mp4": 300},
+            "targets": {"长名.mp4": "acc:dir/长名.mp4", "普通.mp4": "acc:dir/普通.mp4",
+                        "历史.mp4": "acc:dir/历史.mp4"},
+        }
+        m.verify_local = lambda rel: (
+            {"长名~abc.mp4": {"size": 100, "abs": "/tmp/长名~abc.mp4"},
+             "历史~old.mp4": {"size": 300, "abs": "/tmp/历史~old.mp4"}},
+            "dir", "/tmp/dir", False, "")
+        m.rename_map_for = lambda remote, cloud_path, local_root: {"长名.mp4": "长名~abc.mp4"}
+
+    def tearDown(self):
+        m.verify_cloud, m.verify_local, m.rename_map_for = self.old
+
+    def test_summary_and_items_keep_both_sources(self):
+        r = m.verify_compare("acc", "dir", "dir", "quick", 6)
+        self.assertFalse(r["error"])
+        s = r["summary"]
+        self.assertEqual(s["renamed"], 2)
+        self.assertEqual(s["renamedByMap"], 1)
+        self.assertEqual(s["renamedBySize"], 1)
+        self.assertEqual(s["missing"], 1)
+        src = {it["path"]: it.get("renameSource") for it in r["items"]}
+        self.assertEqual(src["长名.mp4"], "name-map")
+        self.assertEqual(src["历史.mp4"], "size")
+        self.assertTrue(any("仅按字节数" in w for w in r["warnings"]))
+
+    def test_inferred_only_still_ok(self):
+        # 只有 size 推断时仍按 v3.97 口径视为一致（ok=True），但不掩盖待确认项
+        m.verify_cloud = lambda remote, path: {
+            "error": "", "attempts": 1, "truncated": False,
+            "scope": "dir", "target": "acc:dir",
+            "files": {"历史.mp4": 300},
+            "targets": {"历史.mp4": "acc:dir/历史.mp4"},
+        }
+        m.verify_local = lambda rel: (
+            {"历史~old.mp4": {"size": 300, "abs": "/tmp/历史~old.mp4"}},
+            "dir", "/tmp/dir", False, "")
+        r = m.verify_compare("acc", "dir", "dir", "quick", 6)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["summary"]["renamedBySize"], 1)
+        self.assertEqual(r["summary"]["renamedByMap"], 0)
 
 
 if __name__ == "__main__":

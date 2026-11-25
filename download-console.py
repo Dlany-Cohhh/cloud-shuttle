@@ -3,10 +3,10 @@
 """PikPak 多账号下载器（云梭 CloudShuttle）· 批量下载控制台 v3.0 —— metacubexd 设计系统重构（sunset 暗色主题 · Vue 3 · 弹性动效）
    前端在 ./static/（Vue3 + Tailwind v4 + DaisyUI v5 全部自托管，无外网 CDN 依赖）；
    API 与 v2.2 完全兼容，任务/设置数据路径不变"""
-import base64, hashlib, io, json, os, re, select, shutil, socket, ssl, stat as statmod, subprocess, sys, tarfile, threading, time
+import base64, hashlib, html, io, json, os, queue, re, select, shutil, socket, ssl, stat as statmod, subprocess, sys, tarfile, threading, time
 from datetime import datetime as _dt
 from concurrent.futures import ThreadPoolExecutor
-import unicodedata, urllib.error, urllib.parse, urllib.request, uuid, zipfile
+import fnmatch, unicodedata, urllib.error, urllib.parse, urllib.request, uuid, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ── 数据目录（v3.18 修复数据分叉）────────────────────────────────────────────
@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v3.98"
+APP_VERSION = "v4.10"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -257,6 +257,15 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             "safeNameHashLen": 12,       # 哈希后缀长度，输入 = 账号 + 完整源相对路径
             "safePathMaxBytes": 240,     # 相对路径总字节上限，给 Windows 根路径前缀留余量
             "stuckWatchdogMin": 10,      # v2 任务无进度自动终止阈值（分钟），0 = 关闭
+            # ── v4.03 低速自动重连 ──────────────────────────────────────
+            # PikPak 的连接会「慢速蠕动」：不报错、不超时、字节还在涨，但只有几十 KB/s，
+            # 于是 stuckWatchdog（要求速度为 0）永远不触发，任务挂着跑几十小时。
+            # 2026-11-23 实测：同账号同文件，僵死连接 58 KB/s，手动「停→继续」后
+            # 立刻 8.9~23.4 MB/s。判定用「窗口内平均速度」，触发后等价于点一次继续。
+            "autoReconnect": True,
+            "reconnectSlowKBps": 384,    # 窗口均速低于该值视为僵死（实测满速 8~23 MB/s）
+            "reconnectWindowSec": 180,   # 判定窗口（秒）；每次重连后窗口翻倍，最多 1 小时
+            "reconnectMax": 5,           # 单个任务最多自动重连几次，0 = 关闭
             "fileRetryMax": 3,           # 单文件瞬时/未知错误重试次数（退避 2s / 8s / 30s）
             # ── v3.94 自动测速调优（docs/AUTOTUNE-DESIGN.md）──
             # 开启后：任务启动时自动套用「实测最优档」；测速把「并发×流数」逐档试一遍，
@@ -267,7 +276,37 @@ DEFAULTS = {"maxConcurrent": 2, "autoStart": "", "autoPause": "", "diskMinGB": 2
             # ── v3.95 龟速让位（docs/AUTOTUNE-DESIGN.md 第 5 节）──
             # 单个文件连续低于 50 KB/s 满 stallSeconds 秒就让位，把并发槽腾给还在动的文件；
             # 抬到第二轮后只占 1 个槽，不再出现「2 个龟速文件吃掉一半并发」。
-            "stallSeconds": 90}          # 30~600 秒
+            "stallSeconds": 90,          # 30~600 秒
+            # ── v4.04 下载后自动转封装（MPEG-TS → MP4）──────────────────
+            # PikPak 上大量资源是 HLS/m3u8 转出来的 MPEG-TS 流，源端连扩展名都没有，
+            # 落盘后播放器认不出、用户以为「下载坏了」或「不能转 mp4」。
+            # 这类 TS 的视频是 H.264、音频是 AAC（MP4 原生组合），`-c copy` 无损转封装
+            # 即可，实测 1.90 GB / 34 秒，体积还小 8%（去掉了 TS 的 188 字节包开销）。
+            "autoRemuxMp4": True,        # 下载完成后自动探测容器并转封装
+            "remuxKeepSource": True,     # 保留原 TS 源文件（关掉 = 转成功后删源省一半空间）
+            "remuxTimeoutSec": 1800,     # 单文件转封装超时（秒），超时按失败处理并删半成品
+            # ── v4.10 PushPlus 微信通知 ──────────────────────────────────
+            # 任务「下载成功 / 失败 / 故障停止（带错误信息的 stopped）」时推一条微信。
+            # 巡检式实现（见 notify_scan），不依赖某条具体代码路径触发，重启不补发历史。
+            "pushplusOn": False,         # 总开关（默认关，避免没填 token 时每 5 秒报一次错）
+            "pushplusToken": ""}         # PushPlus 的 32 位 token
+
+# v4.03：savesettings 允许写入的字段白名单。
+# 之前这个元组直接内联在接口里，新增设置项忘了加进来就会「前端能改、保存无效」——
+# 低速自动重连第一版就漏了，所以提出来单独放，并由 tests/test_reconnect.py 守住。
+SETTINGS_WRITABLE = (
+    "maxConcurrent", "diskMinGB", "diskQuotaGB", "transfers", "checkers",
+    "multiThreadStreams", "multiThreadCutoffMB", "retries",
+    "autoTune", "autoTuneSeconds", "autoTuneSettle", "stallSeconds",
+    "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
+    "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
+    "transfersClearedAt", "nasHomeUrl", "proxyUrl", "netMode",
+    "safeNaming", "safeNameMaxBytes", "safeNameHashLen",
+    "safePathMaxBytes", "stuckWatchdogMin", "fileRetryMax",
+    "autoReconnect", "reconnectSlowKBps", "reconnectWindowSec", "reconnectMax",
+    "autoRemuxMp4", "remuxKeepSource", "remuxTimeoutSec",
+    "pushplusOn", "pushplusToken",
+)
 
 # 设置页可选值白名单：避免把任意字符串拼进 rclone 参数
 ORDER_BY_OPTIONS = ("", "size,descending", "size,ascending", "name,ascending",
@@ -1442,7 +1481,20 @@ def _norm_settings(raw):
     num("safeNameHashLen", 6, 24)
     num("safePathMaxBytes", 120, 1024)
     num("stuckWatchdogMin", 0, 1440)
+    # v4.03 低速自动重连：阈值/窗口/次数都钳住，避免 0 秒窗口把每次启动都当成僵死
+    num("reconnectSlowKBps", 32, 8192)
+    num("reconnectWindowSec", 60, 3600)
+    num("reconnectMax", 0, 20)
+    d["autoReconnect"] = _truthy(d.get("autoReconnect", True))
     num("fileRetryMax", 0, 10)
+    # v4.04 转封装：超时钳到 60 秒~6 小时，避免误填 0 让每个文件秒失败
+    num("remuxTimeoutSec", 60, 21600)
+    d["autoRemuxMp4"] = _truthy(d.get("autoRemuxMp4", True))
+    d["remuxKeepSource"] = _truthy(d.get("remuxKeepSource", True))
+    # v4.10 PushPlus 通知：token 只允许字母数字，避免把整段网址贴进来后每 5 秒报一次错
+    d["pushplusOn"] = _truthy(d.get("pushplusOn", False))
+    _pt = str(d.get("pushplusToken") or "").strip()
+    d["pushplusToken"] = _pt if NOTIFY_TOKEN_RE.match(_pt) else ""
     # v3.94 自动测速调优：窗口与稳定期钳到合理区间，避免误填 0 秒或 1 小时
     num("autoTuneSeconds", 15, 300)
     num("autoTuneSettle", 5, 120)
@@ -1501,6 +1553,188 @@ def load_settings():
 
 def save_settings(s):
     _write_json(SETTINGS_FILE, s)
+
+
+# ── v4.10 PushPlus 微信通知（下载成功 / 失败 / 故障停止）────────────────────
+# 为什么不在这几个状态切换点各插一句调用：任务进入终态的地方有六七处
+# （rclone job、v2 目录 worker、转封装、跨账号转移、解压、卡住看门狗、低速重连用尽），
+# 挨个插一遍，哪天新增一条路径忘了插就静默失效，而且测试也没法覆盖。
+# 这里改成「巡检 + 状态跃迁」：每 5 秒读一次 jobs.json，看有没有任务刚进入终态，
+# 跃迁一次就发一次，去重键落在 notify-state.json（重启不补发历史）。
+PUSHPLUS_API = os.environ.get("PUSHPLUS_API") or "https://www.pushplus.plus/send"
+NOTIFY_STATE_FILE = os.path.join(DATA_DIR, "notify-state.json")
+NOTIFY_LOCK = threading.Lock()
+NOTIFY_SCAN_SEC = 5           # 巡检间隔（秒）
+NOTIFY_SEND_GAP = 1.0         # 一批里多条消息之间的间隔，别被 PushPlus 限流
+NOTIFY_SEEN_MAX = 400         # 去重表保留条数
+NOTIFY_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{16,64}$")
+
+
+def pushplus_token_ok(t):
+    """PushPlus 的 token 是 32 位十六进制/字母数字；这里放 16~64 位，挡住误填网址。"""
+    return bool(NOTIFY_TOKEN_RE.match(str(t or "").strip()))
+
+
+def notify_event(job):
+    """任务该不该发通知。success = 下完；fail = 失败，或「带错误信息的停止」（额度用尽 / 看门狗 / 重连用尽）。
+    用户自己点「停止」的 stopped 没有 error，不发。"""
+    j = job or {}
+    st = str(j.get("state") or "")
+    if st == "done":
+        return "success"
+    if st == "error":
+        return "fail"
+    if st == "stopped" and str(j.get("error") or "").strip():
+        return "fail"
+    return None
+
+
+def notify_key(job):
+    """去重键：同一任务、同一终态、同一字节数只发一次。
+    点「继续」后再次失败时字节数会变，键就变了，会重新通知 —— 这是期望行为。"""
+    j = job or {}
+    return "%s|%s|%s|%s" % (j.get("id"), j.get("state"),
+                            int(j.get("bytes") or 0), str(j.get("error") or "")[:60])
+
+
+def _h(s, n=200):
+    """转义后截断，PushPlus 的 content 是 HTML，任务名里带 < & 会破版。"""
+    return html.escape(str(s or ""))[:n]
+
+
+def _human_bytes(n):
+    try:
+        n = float(n or 0)
+    except Exception:
+        n = 0
+    if n >= 1024 ** 3:
+        return "%.2f GB" % (n / 1073741824.0)
+    if n >= 1024 ** 2:
+        return "%.1f MB" % (n / 1048576.0)
+    if n >= 1024:
+        return "%.1f KB" % (n / 1024.0)
+    return "%d B" % int(n)
+
+
+def notify_title(job, kind):
+    j = job or {}
+    leaf = j.get("safe_leaf") or j.get("leaf") or j.get("name") or ""
+    if not leaf:
+        leaf = (str(j.get("subpath") or "").strip("/").rsplit("/", 1)[-1]
+                or str(j.get("dest") or "").rsplit(":", 1)[-1].strip("/").rsplit("/", 1)[-1])
+    tag = "下载完成" if kind == "success" else "任务失败"
+    return ("云梭｜%s：%s" % (tag, leaf))[:95]
+
+
+def notify_content(job, kind, when):
+    j = job or {}
+    name = j.get("safe_leaf") or j.get("leaf") or j.get("name") or "(未命名)"
+    src = "%s:%s" % (j.get("remote") or "", j.get("subpath") or "")
+    if j.get("src"):
+        src = str(j.get("src"))
+    done, total = int(j.get("filesDone") or 0), int(j.get("filesTotal") or 0)
+    failed = int(j.get("filesFailed") or 0)
+    rows = [("任务", name),
+            ("来源", src),
+            ("落盘", j.get("dest") or "-"),
+            ("文件", ("%d/%d 个" % (done, total)) if total else ("%d 个" % done)),
+            ("大小", "%s / %s" % (_human_bytes(j.get("bytes")), _human_bytes(j.get("total")))),
+            ("结束", when)]
+    if failed:
+        rows[3] = ("文件", "%d/%d 个（失败 %d）" % (done, total if total else done, failed))
+    if kind == "fail" and str(j.get("error") or "").strip():
+        rows.append(("错误", str(j.get("error"))[:300]))
+    body = "".join("<p><b>%s</b>：%s</p>" % (_h(k, 20), _h(v, 400)) for k, v in rows)
+    head = "<p style='font-size:15px'><b>%s</b></p>" % _h(notify_title(j, kind), 100)
+    tip = ("<p style='color:#888;font-size:12px'>云梭 CloudShuttle · 任务 %s</p>" % _h(j.get("id")))
+    return head + body + tip
+
+
+def pushplus_send(token, title, content, timeout=10):
+    """调 PushPlus 发一条微信消息。返回它自己的 JSON（code=200 才算成功）。"""
+    import urllib.request
+    payload = json.dumps({"token": str(token).strip(), "title": str(title)[:100],
+                          "content": str(content), "template": "html"}, ensure_ascii=False)
+    req = urllib.request.Request(PUSHPLUS_API, data=payload.encode("utf-8"),
+                                 headers={"Content-Type": "application/json; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:   # noqa: S310 常量地址，非用户输入
+            body = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        return {"code": -1, "msg": "请求失败：%s" % str(e)[:150]}
+    try:
+        d = json.loads(body)
+    except Exception:
+        return {"code": -1, "msg": "无法解析返回：%s" % body[:150]}
+    return d if isinstance(d, dict) else {"code": -1, "msg": "返回格式异常"}
+
+
+def notify_scan(send=None, now=None):
+    """巡检一次：把「刚进入终态」的任务发到微信。返回 {enabled, sent, skipped, errors, seeded}。
+    send 可注入（测试用）；now 可注入（测试用）。"""
+    s = load_settings()
+    enabled = _truthy(s.get("pushplusOn"))
+    token = str(s.get("pushplusToken") or "").strip()
+    out = {"enabled": enabled, "sent": 0, "skipped": 0, "errors": [], "seeded": False}
+    if not enabled:
+        return out
+    if not pushplus_token_ok(token):
+        out["errors"].append("PushPlus Token 未填写或格式不对（16~64 位字母数字）")
+        return out
+    with LOCK:
+        jobs = load_jobs()
+    with NOTIFY_LOCK:
+        raw = _read_json(NOTIFY_STATE_FILE, None)
+        first = not isinstance(raw, dict)
+        seen = dict(raw) if isinstance(raw, dict) else {}
+        out["seeded"] = first
+        ts = int(now if now is not None else time.time())
+        changed = first
+        for j in jobs:
+            kind = notify_event(j)
+            if not kind:
+                continue
+            k = notify_key(j)
+            if k in seen:
+                continue
+            seen[k] = ts
+            changed = True
+            if first:
+                # 首次启用：只登记当前终态，不把历史任务一股脑补发一遍
+                continue
+            try:
+                res = (send or pushplus_send)(token, notify_title(j, kind),
+                                              notify_content(j, kind, time.strftime("%Y-%m-%d %H:%M")))
+                code = int((res or {}).get("code") or 0) if isinstance(res, dict) else -1
+                if code == 200:
+                    out["sent"] += 1
+                else:
+                    msg = (res or {}).get("msg") if isinstance(res, dict) else str(res)
+                    out["errors"].append("%s：%s" % (notify_title(j, kind)[:40], str(msg)[:80]))
+            except Exception as e:
+                out["errors"].append("发送异常：%s" % str(e)[:100])
+            time.sleep(NOTIFY_SEND_GAP)
+        if changed:
+            if len(seen) > NOTIFY_SEEN_MAX:
+                keep = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:NOTIFY_SEEN_MAX]
+                seen = dict(keep)
+            _write_json(NOTIFY_STATE_FILE, seen, quiet=True)
+    return out
+
+
+def notify_loop():
+    """常驻巡检线程。任何异常都吞掉并记日志 —— 通知失败不能影响下载。"""
+    while True:
+        try:
+            r = notify_scan()
+            if r.get("errors"):
+                print("%s 通知失败: %s" % (time.strftime("%F %T"), "；".join(r["errors"])[:200]), flush=True)
+            elif r.get("sent"):
+                print("%s 已发送 %d 条任务通知" % (time.strftime("%F %T"), r["sent"]), flush=True)
+        except Exception as e:
+            print("%s 通知巡检异常: %s" % (time.strftime("%F %T"), str(e)[:200]), flush=True)
+        time.sleep(NOTIFY_SCAN_SEC)
+
 
 def basename_of(path):
     p = path.rstrip("/").split("/")[-1] if path.strip("/") else path.split(":")[0]
@@ -1902,8 +2136,21 @@ FILE_FATAL_KEYS = (
     "file name too long", "filename too long", "name too long", "path too long",
     "file name or extension is too long", "文件名或扩展名太长", "路径太长",
 )
+# v4.06：源端「只有壳、没有内容」的文件。
+# 2026-11-24 实测：PikPak 里某个 1.71 GB 的 mp4，列表里 size 正常、audit 也是 Normal，
+# 但 hash 结尾是 `TEMP`、medias 与 web_content_link 全空 —— 是转存时没落到实体的占位文件。
+# 表现：rclone 报 `failed to open source object: can't download: no link`，一个字节都传不出来。
+# 这种错误重试无意义（放再久也不会自己好），必须立刻判死，否则会跟看门狗互相拉扯。
+SOURCE_DEAD_KEYS = (
+    "no link", "can't download", "cannot download", "failed to open source object",
+    "no available link", "no download link",
+)
 DISK_FATAL_KEYS = (
     "no space left", "permission denied", "access denied", "read-only file system", "disk full",
+    # v4.07：EPERM。假卷 / 卷被卸载 / 文件系统只读保护都长这样 —— 能建 0 字节文件，
+    # 写数据时才回 `open ...: operation not permitted`，而且重试一万次都一样。
+    # 不归类到这里就会一直判 UNKNOWN → 无限重试，界面上永远是 0.0%。
+    "operation not permitted", "not permitted",
 )
 TRANSIENT_KEYS = (
     "timeout", "timed out", "tls handshake", "eof", "i/o timeout",
@@ -1921,6 +2168,13 @@ def classify_error(msg, context=""):
     """返回 (类别, 友好提示)。类别 ∈ FILE_FATAL / ACCOUNT_FATAL / DISK_FATAL / TRANSIENT / UNKNOWN。"""
     raw = str(msg or "")
     low = raw.lower()
+    # v4.06：先判「源端没直链」。这类报错里常带 download / timeout 之类的词，
+    # 放到后面会被 is_net_error 抢走，变成「网络抖动，可重试」—— 实际重试一万次也没用。
+    for k in SOURCE_DEAD_KEYS:
+        if k in low:
+            return "FILE_FATAL", ("源端没有可用直链（PikPak 侧文件未就绪或已损坏，"
+                                  "需重新转存该文件；同任务的其它文件不受影响）：%s"
+                                  % mask_secret(raw[:160]))
     for k in FILE_FATAL_KEYS:
         if k in low:
             return "FILE_FATAL", "文件名或路径超出文件系统限制（原始：%s）" % mask_secret(raw[:160])
@@ -1971,6 +2225,14 @@ def launch_job(job, s):
         # src_dir / dst_dir / leaf 由 start 在预检判定为文件后写进 job。
         # v3.83：源端永远用原始文件名，目标端用安全落盘名（无 safe_leaf 即旧任务，原样）。
         method = "operations/movefile" if move else "operations/copyfile"
+        # v4.08：单文件也可能落在 Downloads/<子目录>/ 下（v4.08 起不再写卷根），
+        # copyfile 的 dstFs 必须已存在，这里先幂等地建一次；失败不拦，让 copyfile
+        # 自己报出真正的原因（与逐文件下载里的做法一致）。
+        try:
+            rc("operations/mkdir", fs=job.get("dst_dir") or job["dest"],
+               _timeout=60, _proxy=proxy)
+        except Exception:
+            pass
         kv = dict(srcFs=job["src_dir"], srcRemote=job["leaf"],
                   dstFs=job["dst_dir"], dstRemote=job.get("safe_leaf") or job["leaf"], _async="true")
     else:
@@ -2032,6 +2294,13 @@ STALL_SECONDS = 90             # 连续龟速超过该秒数就取消，让位�
 SLOW_TAIL_WORKERS = 1          # v3.95：第二轮「已让位过的文件」最多占几个槽（实际按连接预算算）
 SLOW_TAIL_MAX_SECONDS = 1800   # 尾池里单文件最多再试 30 分钟
 SLOW_TAIL_MAX_BYTES = 1048576  # 30 分钟连 1MB 都推不动，判定源端不可达（别无限期卡住任务）
+# v4.06：一个字节都没进来，说明连源对象都没打开成功（典型是 PikPak 没有直链）。
+# 这种情况不该等满 30 分钟 —— 10 分钟零字节就够说明问题了。
+ZERO_TAIL_SECONDS = 600
+# v4.06：文件久传不动时，直接问一次 PikPak「这个文件到底有没有直链」。
+# 起因：rclone 自己会对取链请求做低层重试，错误在 180 秒内根本浮不上来；
+# 看门狗一停，rclone 又把它记成 `context canceled`，两边打架，任务在 97% 无限重启。
+ZERO_PROBE_SECONDS = 60
 PARTIAL_ORPHAN_SECONDS = 24 * 3600   # 目标目录里超过 24h 没动的 *.partial 视为孤儿分片
 
 
@@ -2455,14 +2724,30 @@ def _autotune_worker(job_id, seconds, settle, candidates):
 
 
 def expand_source_files(job):
-    """递归列出源目录全部文件（只读），目录任务的下载过滤规则在这里继续生效。"""
+    """递归列出源目录全部文件（只读），目录任务的下载过滤规则在这里继续生效。
+
+    v4.01：分账号任务带 fileList（本账号分到的相对路径），这里按清单精确裁一次 ——
+    分片必须互斥，多下来一个文件就是两个账号抢写同一个目标文件。"""
     kv = dict(fs=job["src"], remote="", recurse=True,
               _timeout=300, _proxy=bool(job.get("proxy")), _strict=True)
     fopt = build_filter_opt(job.get("filter") or {})
     if fopt:
         kv["_filter"] = json.dumps(fopt, ensure_ascii=False)
     r = rc("operations/list", **kv)
-    return [e for e in (r.get("list") or []) if isinstance(e, dict) and not e.get("IsDir")]
+    rows = [e for e in (r.get("list") or []) if isinstance(e, dict) and not e.get("IsDir")]
+    wanted = job.get("fileList")
+    if not wanted:
+        return rows
+    keep = {str(p).strip("/") for p in wanted if str(p).strip("/")}
+    picked = [e for e in rows if str(e.get("Path") or "").strip("/") in keep]
+    have = {str(e.get("Path") or "").strip("/") for e in picked}
+    lost = keep - have
+    if lost:
+        # 云端被改名/删除时不能让文件「悄悄消失」：留一条可 grep 的日志，数量也进任务错误
+        log_event(job.get("id"), "split-missing", count=len(lost),
+                  sample="|".join(sorted(lost)[:3]))
+    return picked
+
 
 
 MISSING_DIR_HINTS = ("directory not found", "object not found", "doesn't exist",
@@ -2539,9 +2824,40 @@ def tail_workers(s, workers):
     return max(1, min(int(workers or 1), budget))
 
 
+def _probe_source_dead(job, rel):
+    """v4.06：零字节久候后，直接问一次源端有没有直链，给个确定结论。
+
+    正常下载时这个函数不会被调用（只有累计字节为 0 才探）。返回空串表示没结论，
+    调用方继续按原逻辑跑；返回非空就是「这个文件确实拿不到」，直接判失败。
+
+    为什么不靠 rclone 的报错：它对 `GET /drive/v1/files/{id}` 有低层重试，
+    几分钟内不会把 `can't download: no link` 抛给上层；等看门狗把它停掉，
+    留下的反而是我们自己造成的 `context canceled`，排障时非常误导。
+    """
+    try:
+        if job.get("single_file"):
+            path = str(rel).strip("/")
+        else:
+            sub = str(job.get("subpath") or "").strip("/")
+            path = (sub + "/" + str(rel)).strip("/") if sub else str(rel).strip("/")
+        r = pk_play_info(job.get("remote"), path)
+        err = str((r or {}).get("error") or "")
+        if err and ("直链" in err or "找不到这个文件" in err):
+            return err[:200]
+        return ""
+    except Exception:
+        return ""
+
+
 def slow_tail_hopeless(elapsed, grown, max_seconds=SLOW_TAIL_MAX_SECONDS,
-                       max_bytes=SLOW_TAIL_MAX_BYTES):
-    """v3.95：尾池里的文件是否该认输（继续跑下去只会让任务永远停在 running）。"""
+                       max_bytes=SLOW_TAIL_MAX_BYTES, zero_seconds=ZERO_TAIL_SECONDS):
+    """v3.95：尾池里的文件是否该认输（继续跑下去只会让任务永远停在 running）。
+
+    v4.06 追加「零字节早退」：grown 还是 0 说明源对象根本没打开成功，
+    再怎么等也不会突然开始传，等到 10 分钟就认输，比原来干等 30 分钟有用得多。
+    """
+    if grown <= 0 and elapsed >= zero_seconds:
+        return True
     return elapsed >= max_seconds and grown < max_bytes
 
 
@@ -2577,6 +2893,8 @@ def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_
     low_since = None
     tail_start = time.time()
     tail_grown = 0.0
+    seen_grown = 0.0
+    probed = False
     while True:
         if _safe_requested_stop(job["id"]):
             try:
@@ -2598,6 +2916,7 @@ def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_
         if speed_of:
             sp = speed_of(rel)
             if sp is not None:
+                seen_grown += max(0.0, sp) * COPY_POLL_INTERVAL
                 if allow_defer and sp < min_speed:
                     peer = peer_speed_of() if peer_speed_of else None
                     if peer is not None and peer < min_speed * 2:
@@ -2624,6 +2943,19 @@ def _copy_one_async(job, entry, s, proxy, speed_of=None, allow_defer=True, peer_
                             pass
                         return ("hopeless", "尾池 %d 分钟内只传入 %.1f MB，判定该文件源端不可达"
                                 % (SLOW_TAIL_MAX_SECONDS // 60, tail_grown / 1048576.0))
+
+        # v4.06：一分钟一个字节都没进来 → 主动问一次源端，别让它一直悬着。
+        # 命中「无直链」就立刻判失败：这比等 rclone 的低层重试快得多，
+        # 也不会再触发「停了又起、起了又停」的循环。
+        if (not probed) and seen_grown <= 0 and (time.time() - tail_start) >= ZERO_PROBE_SECONDS:
+            probed = True
+            dead = _probe_source_dead(job, rel)
+            if dead:
+                try:
+                    rc("job/stop", jobid=jid, _timeout=10, _proxy=proxy)
+                except Exception:
+                    pass
+                return "hopeless", dead
 
         time.sleep(COPY_POLL_INTERVAL)
 
@@ -2712,6 +3044,364 @@ def transfer_one(job, entry, s, existing, made_dirs, xlock=None, speed_of=None,
             if i < attempts - 1:
                 time.sleep(SAFE_BACKOFF[min(i, len(SAFE_BACKOFF) - 1)])
     return "failed", "重试 %d 次仍失败：%s" % (attempts - 1, mask_secret(last[:200]))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# v4.04 下载后自动转封装（MPEG-TS → MP4）
+#
+# 起因：用户报「下载的文件不能转化为 mp4」。实测 PikPak 上有一批资源本身就是
+# HLS/m3u8 转出来的 MPEG-TS 流，源端连扩展名都不带 —— 名字映射清单里的 original
+# 就是证据：「…#绳缚日记1…极光白丝」（无扩展名）与「…#闪闪工作室…女俘虏.mp4」。
+# 落盘后播放器认不出类型，看着就像「下载坏了 / 转不了 mp4」。
+#
+# 这批 TS 的视频是 H.264、音频是 AAC，正好是 MP4 的原生组合 → `-c copy` 无损
+# 转封装即可，不重编码、画质零损失。2026-11-23 实测：1.90 GB 用时 34 秒，
+# 输出 1.75 GB（小 8%，去掉了 TS 每包 188 字节的封装开销），时长 3471.700000 秒
+# 与源完全一致。
+#
+# 三条硬规矩：
+#   1. 只处理「文件头确实是 TS」的，别的类型一律不碰；
+#   2. 先写 .part 再原子改名，中途断电不会留下「看起来已完成」的半截 mp4；
+#   3. 任何失败都保留源文件，绝不因为「转不动」把已经下好的东西弄丢。
+# ────────────────────────────────────────────────────────────────────────────
+REMUX_Q = queue.Queue()        # (job_id, 绝对路径)
+REMUX_DONE = set()             # 已入队/已处理的路径，防重复任务重复转
+REMUX_LOCK = threading.Lock()
+REMUX_STAT = {"ok": 0, "fail": 0, "skip": 0, "running": ""}
+REMUX_THREAD = None
+_FFMPEG = {"probed": False, "bin": None, "why": "", "at": 0.0}
+REMUX_SEEN_MAX = 5000          # 去重集合上限，超过就清空（任务记录本身也会老化）
+
+
+def remux_public():
+    """给前端的转封装状态（jobs 轮询里带，不额外接口）。"""
+    with REMUX_LOCK:
+        st = dict(REMUX_STAT)
+    st["queued"] = REMUX_Q.qsize()
+    st["ffmpeg"] = ffmpeg_bin() or ""
+    st["why"] = _FFMPEG.get("why") or ""
+    st["root"] = DOWNLOAD_ROOT
+    return st
+
+
+def _quiet_remove(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def ffmpeg_bin():
+    """返回可用的 ffmpeg 路径；没有就返回 None（调用方降级，不抛异常）。
+
+    容器是 python:3.12-alpine，ffmpeg 需要 apk 安装。探测结果要缓存（避免每个文件
+    都走一次 PATH 查找），但**失败不能永久缓存**——否则先起服务、后装 ffmpeg 时，
+    进程会一直记着「没有」，只能重启才生效。所以负结果只记 60 秒。
+    """
+    now = time.time()
+    if _FFMPEG["probed"] and (_FFMPEG["bin"] or now - _FFMPEG["at"] < 60):
+        return _FFMPEG["bin"]
+    _FFMPEG["probed"] = True
+    _FFMPEG["at"] = now
+    _FFMPEG["bin"] = None
+    for cand in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg",
+                 "/opt/ffmpeg/ffmpeg", "/app/bin/ffmpeg"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            _FFMPEG["bin"] = cand
+            break
+    if not _FFMPEG["bin"]:
+        _FFMPEG["bin"] = shutil.which("ffmpeg")
+    if not _FFMPEG["bin"]:
+        _FFMPEG["why"] = "容器内没有 ffmpeg（apk add ffmpeg 或重建镜像后可用）"
+    else:
+        _FFMPEG["why"] = ""
+    return _FFMPEG["bin"]
+
+
+def ffprobe_bin():
+    """ffprobe 一般和 ffmpeg 同目录（alpine 的 ffmpeg 包里都带）。"""
+    exe = ffmpeg_bin()
+    if exe:
+        cand = os.path.join(os.path.dirname(exe), "ffprobe")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return shutil.which("ffprobe")
+
+
+def media_duration(path, is_ts=None):
+    """读时长（秒）；拿不到就返回 0.0。"""
+    exe = ffprobe_bin()
+    if not exe or not path:
+        return 0.0
+    cmd = [exe, "-v", "error"]
+    if is_ts:
+        cmd += ["-f", "mpegts", "-probesize", "8M", "-analyzeduration", "8M"]
+    cmd += ["-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
+        return float((p.stdout or b"").decode("utf-8", "replace").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def zero_holes(path, samples=9, pack=188):
+    """抽样查找「全零区段」，返回命中的位置比例列表。
+
+    为什么要这一步：2026-11-23 那个「转不出 mp4」的文件，`ls -l` 尺寸完整、
+    `du` 也不是稀疏文件，但 0.75 GB → 3.2 GB 全是写进去的零字节。
+    ffmpeg 会在那里反复找同步字节（日志 `max resync size reached`），
+    转出一个小体积 mp4 就卡死 —— 用户看到的「转不了 mp4」，本质是文件本身是坏的。
+    所以转封装前先抽查，坏文件直接点名报错，不要产出「看起来能播、其实只有前 10 分钟」的东西。
+    """
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        return []
+    if size < pack * 8:
+        return []
+    out = []
+    win = pack * 200
+    with open(path, "rb") as f:
+        for i in range(1, samples + 1):
+            frac = i / (samples + 1.0)
+            off = max(0, int(size * frac) // pack * pack)
+            try:
+                f.seek(off)
+                b = f.read(win)
+            except Exception:
+                continue
+            if not b:
+                continue
+            if not any(b):                       # 整窗全零 = 空洞
+                out.append(round(frac, 3))
+    return out
+
+
+def sniff_media_container(path):
+    """只读文件头判断容器类型，返回 'ts' / 'mp4' / None。
+
+    TS 用两个 sync 字节确认：第 0 字节是 0x47，且第 188 字节（TS 包长）也是 0x47。
+    只读 400 字节，不用 ffprobe 扫全文件 —— 几 GB 的文件逐个 probe 会把控制台拖死。
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(400)
+    except Exception:
+        return None
+    if not head:
+        return None
+    if len(head) >= 200 and head[0] == 0x47 and head[188] == 0x47:
+        return "ts"
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return "mp4"
+    return None
+
+
+def remux_to_mp4(path, s=None, timeout=None):
+    """TS → MP4 无损转封装。返回 (ok, out_path, msg)。
+
+    只取 v:0 / a:0（TS 里常见一个 bin_data 私有流，MP4 装不下，带上会失败）。
+    """
+    s = s or DEFAULTS
+    exe = ffmpeg_bin()
+    if not exe:
+        return False, "", _FFMPEG.get("why") or "容器内没有 ffmpeg"
+    src = str(path)
+    if not os.path.isfile(src):
+        return False, "", "源文件不存在"
+    low = src.lower()
+    base = src[:-3] if low.endswith(".ts") else src
+    out = base + ".mp4"
+    if os.path.isfile(out) and os.path.getsize(out) > 0:
+        return True, out, "已存在"
+    part = out + ".part"
+    _quiet_remove(part)
+    kind = sniff_media_container(src)
+    if kind == "ts":
+        holes = zero_holes(src)
+        if holes:
+            # 坏文件不转：否则会得到一个「只有前半段」的 mp4，比没有更坑
+            return False, "", ("源文件中间有空洞（约 %d%% 处整段是 0 字节），转了也只有前半段能播；"
+                              "这个文件需要重新下载" % int(holes[0] * 100))
+    try:
+        tmo = int(timeout or s.get("remuxTimeoutSec") or 1800)
+    except Exception:
+        tmo = 1800
+    cmd = [exe, "-hide_banner", "-v", "error", "-nostdin", "-y",
+           "-i", src, "-map", "0:v:0", "-map", "0:a:0",
+           "-c", "copy", "-f", "mp4", part]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=tmo)
+    except subprocess.TimeoutExpired:
+        _quiet_remove(part)
+        return False, "", "转封装超时（%d 秒），源文件保留" % tmo
+    except Exception as e:
+        _quiet_remove(part)
+        return False, "", "无法启动 ffmpeg：%s" % mask_secret(str(e)[:160])
+    if p.returncode != 0:
+        tail = (p.stdout or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
+        _quiet_remove(part)
+        return False, "", "ffmpeg 退出码 %d：%s" % (p.returncode, (" / ".join(tail) or "无输出")[:200])
+    if not os.path.isfile(part) or os.path.getsize(part) <= 0:
+        _quiet_remove(part)
+        return False, "", "ffmpeg 没有产出文件"
+    # 第二道闸：时长对不上就是转漏了（源被截断 / 中途坏段），别把半个文件当成品
+    ds = media_duration(src, is_ts=(kind == "ts"))
+    do = media_duration(part)
+    if ds >= 30 and do >= 1 and do < ds * 0.98:
+        _quiet_remove(part)
+        return False, "", "转出不完整（%.0f 秒 / 源 %.0f 秒），源文件可能被截断" % (do, ds)
+    try:
+        os.replace(part, out)          # 原子改名：读到的要么是完整 mp4，要么不存在
+    except Exception as e:
+        _quiet_remove(part)
+        return False, "", "改名失败：%s" % mask_secret(str(e)[:160])
+    return True, out, ""
+
+
+def _remux_worker():
+    """串行消费转封装队列。单线程是有意的：转封装是磁盘密集操作，
+    和下载抢 IO 只会把两边都拖慢，串行反而最快也最稳。"""
+    while True:
+        item = REMUX_Q.get()
+        jid, src = (item if isinstance(item, tuple) else (None, item))
+        try:
+            with REMUX_LOCK:
+                REMUX_STAT["running"] = os.path.basename(src)[:80]
+            s = load_settings()
+            if not _truthy(s.get("autoRemuxMp4", True)):
+                continue
+            kind = sniff_media_container(src)
+            if kind != "ts":
+                with REMUX_LOCK:
+                    REMUX_STAT["skip"] += 1
+                continue
+            ok, out, msg = remux_to_mp4(src, s)
+            if ok:
+                with REMUX_LOCK:
+                    REMUX_STAT["ok"] += 1
+                log_event(jid, "remux", file=os.path.basename(src)[:80],
+                          out=os.path.basename(out)[:80], skip=(msg == "已存在"))
+                # 默认保留源文件：用户确认能播之前，绝不替人做删除决定
+                if not _truthy(s.get("remuxKeepSource", True)):
+                    _quiet_remove(src)
+            else:
+                with REMUX_LOCK:
+                    REMUX_STAT["fail"] += 1
+                log_event(jid, "remux_fail", file=os.path.basename(src)[:80], why=msg[:160])
+        except Exception:
+            pass
+        finally:
+            with REMUX_LOCK:
+                REMUX_STAT["running"] = ""
+            try:
+                REMUX_Q.task_done()
+            except Exception:
+                pass
+
+
+def _ensure_remux_worker():
+    global REMUX_THREAD
+    with REMUX_LOCK:
+        if REMUX_THREAD is None or not REMUX_THREAD.is_alive():
+            REMUX_THREAD = threading.Thread(target=_remux_worker, name="remux", daemon=True)
+            REMUX_THREAD.start()
+    return REMUX_THREAD
+
+
+def enqueue_remux(job_id, path):
+    """把落盘文件丢进转封装队列（幂等：同一路径只排一次）。"""
+    if not path:
+        return False
+    try:
+        key = os.path.abspath(str(path))
+    except Exception:
+        return False
+    with REMUX_LOCK:
+        if key in REMUX_DONE:
+            return False
+        if len(REMUX_DONE) > REMUX_SEEN_MAX:
+            REMUX_DONE.clear()
+        REMUX_DONE.add(key)
+    _ensure_remux_worker()
+    REMUX_Q.put((job_id, key))
+    return True
+
+
+def _schedule_remux_for_job(job, s=None):
+    """任务进入 done 时补排单文件任务的产物。
+
+    v2 目录任务在「每个文件下完」时就已经单独入队了，这里只补单文件任务；
+    旧式 sync/copy 任务拿不到准确落盘名（v3.82 及以前建的老任务），直接跳过。
+    """
+    s = s or load_settings()
+    if not _truthy(s.get("autoRemuxMp4", True)):
+        return False
+    if not job.get("single_file"):
+        return False
+    try:
+        root = local_dest(str(job.get("dst_dir") or ""))
+        name = job.get("safe_leaf") or job.get("leaf") or ""
+        if not root or not name:
+            return False
+        return enqueue_remux(job.get("id"), os.path.join(root, name))
+    except Exception:
+        return False
+
+
+def remux_candidates(root, maxdepth=3, limit=2000):
+    """列出 root 下「像 TS 但还不是 mp4」的文件。
+
+    判据分两级，先便宜后昂贵：
+      1. 名字层：没有扩展名，或扩展名是 .ts/.m2ts/.mts（PikPak 的 HLS 资源就这样）；
+      2. 内容层：读前 400 字节确认 0x47 同步头 —— 名字是 .mp4 但其实是 TS 的也有。
+    已经有同名 .mp4 的直接跳过，避免重复转。
+    """
+    out = []
+    if not root or not os.path.isdir(root):
+        return out
+    for cur, dirs, files in os.walk(root):
+        # 用 relpath 算层级：直接数 "/" 在 Windows 上永远是 0（测试跑在本机）
+        rel = os.path.relpath(cur, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth >= maxdepth:
+            dirs[:] = []
+        dirs[:] = [x for x in dirs if not x.startswith(".")]
+        for name in files:
+            if name.startswith(".") or name.endswith((".part", ".partial", ".mp4")):
+                continue
+            low = name.lower()
+            ext = os.path.splitext(low)[1]
+            if ext and ext not in (".ts", ".m2ts", ".mts"):
+                continue                      # .mkv/.avi 之类不归这里管
+            full = os.path.join(cur, name)
+            mp4 = full + ".mp4" if not low.endswith(".ts") else full[:-3] + ".mp4"
+            if os.path.exists(mp4):
+                continue
+            try:
+                if os.path.getsize(full) < 188 * 4:
+                    continue
+            except Exception:
+                continue
+            if sniff_media_container(full) != "ts":
+                continue
+            out.append(full)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def remux_scan(root, maxdepth=3):
+    """手动把某个目录下已下载的 TS 补转成 mp4（给历史文件用）。"""
+    files = remux_candidates(root, maxdepth=maxdepth)
+    n = 0
+    for f in files:
+        if enqueue_remux(None, f):
+            n += 1
+    return {"found": len(files), "queued": n,
+            "ffmpeg": bool(ffmpeg_bin()), "why": _FFMPEG.get("why") or ""}
 
 
 def _safe_dir_worker(job_id, snapshot=None):
@@ -2870,6 +3560,15 @@ def _safe_dir_worker(job_id, snapshot=None):
                     with plock:
                         state["bytes"] += e["size"]
                     log_event(job_id, st, file=e["dst"], size=e["size"])
+                    # v4.04：刚下完的文件立刻排队探测容器。是 MPEG-TS 就无损转成 mp4
+                    # （PikPak 有一批 HLS 转出的资源，源端连扩展名都没有）。
+                    if st == "done" and _truthy(s.get("autoRemuxMp4", True)):
+                        try:
+                            _root = local_dest(str(job.get("dest") or ""))
+                            if _root:
+                                enqueue_remux(job_id, os.path.join(_root, e["dst"]))
+                        except Exception:
+                            pass
                 elif st == "failed":
                     log_event(job_id, "failed", file=e["dst"], size=e["size"], why=e["error"][:120])
                 record_file_state(vol, job.get("remote"), e["srcFull"], safe=e["dst"],
@@ -4250,6 +4949,251 @@ def pikpak_remotes():
         return []
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# v4.01 分账号下载：一个源目录 → 多个账号并行分担
+#
+# 为什么值得做：PikPak 按「账号」静默限流（实测单账号超过 16 连接反而塌一个数量级），
+# 所以「一个账号下整个目录」的天花板就是单账号带宽 —— 这也是 2026-11-23 那次
+# 2.28 GB 只有 42 KB/s 时唯一有效的提速方向。同一份资源若已转存到多个账号，
+# 每个账号各有独立配额，把文件拆开并行下载才能真正叠加吞吐。
+#
+# 三条硬约束（改这段之前务必先读）：
+#   1) 拆出来的文件必须**互斥且覆盖全集**：同一个文件被两个账号同时写，只会互相截断；
+#   2) 所有分片任务必须落**同一个**目录：否则 dedupe_dest 会造出「目录-2」，
+#      等于把一份资源拆成好几个文件夹，校验和对账全乱；
+#   3) 只按「账号可见文件集合完全一致」才允许分：分给 A 的文件 B 没有，任务必然失败。
+# ────────────────────────────────────────────────────────────────────────────
+SPLIT_MAX_ACCOUNTS = 8
+SPLIT_MIN_FILES = 2
+
+
+def split_src(name, sub):
+    sub = str(sub or "").strip("/")
+    return "%s:%s" % (name, sub) if sub else "%s:" % name
+
+
+def split_list_files(name, sub, proxy=False):
+    """列某账号下某路径的全部文件（递归、只读）。失败抛异常，由调用方归属到具体账号。"""
+    r = rc("operations/list", fs=split_src(name, sub), remote="", recurse=True,
+           _timeout=180, _proxy=bool(proxy), _strict=True)
+    out = []
+    for e in (r.get("list") or []):
+        if not isinstance(e, dict) or e.get("IsDir"):
+            continue
+        p = str(e.get("Path") or "").strip("/")
+        if p:
+            out.append({"Path": p, "Size": int(e.get("Size") or 0)})
+    return out
+
+
+def _filter_size_bytes(v):
+    m = re.match(r"^(\d+(?:\.\d+)?)([bBkKmMgGtT]?)$", str(v or "").strip())
+    if not m:
+        return None
+    mul = {"": 1, "b": 1, "k": 1024, "m": 1048576, "g": 1073741824, "t": 1099511627776}
+    return int(float(m.group(1)) * mul[(m.group(2) or "").lower()])
+
+
+def split_apply_filter(files, flt):
+    """按下载过滤规则在本机先过一遍（分片任务因此不再向 rclone 注入 _filter）。
+
+    分账号是按文件精确分配的，分配之前就必须知道哪些文件真的会被下载 ——
+    否则界面报「这个账号分了 40 个」，实际只下 30 个，看起来就像漏了文件。
+    规则语义与 build_filter_opt 对齐：不含 `/` 的花样按文件名匹配，大小写不敏感。
+    """
+    if not flt:
+        return files
+    mn = _filter_size_bytes(flt.get("minSize"))
+    if flt.get("skipEmpty") and mn is None:
+        mn = 1                      # 与 build_filter_opt 的「0 字节按 1 字节下限」一致
+    mx = _filter_size_bytes(flt.get("maxSize"))
+    inc = [str(p).casefold() for p in (flt.get("incExt") or [])]
+    exc = [str(p).casefold() for p in (list(flt.get("excExt") or []) + list(flt.get("excKw") or []))]
+
+    def hit(pats, name, path):
+        low_n, low_p = name.casefold(), path.casefold()
+        return any(fnmatch.fnmatchcase(low_n, p) or fnmatch.fnmatchcase(low_p, p) for p in pats)
+
+    out = []
+    for f in files:
+        size = int(f.get("Size") or 0)
+        path = str(f.get("Path") or "")
+        name = path.rsplit("/", 1)[-1]
+        if mn is not None and size < mn:
+            continue
+        if mx is not None and size > mx:
+            continue
+        if inc and not hit(inc, name, path):
+            continue
+        if exc and hit(exc, name, path):
+            continue
+        out.append(f)
+    return out
+
+
+def split_assign(files, remotes):
+    """按字节做 LPT 贪心：大文件先分给当前累计最少的账号。
+
+    按字节均衡而不是按文件数均衡 —— 一个 10 GB 和一个 100 MB 算「各一个」时，
+    某个账号会早早跑完干等，另一个还差一大半，等于白拆。
+    排序里带上路径，保证同一批文件每次分配结果都一样（可复现，便于对账）。
+    """
+    buckets = {r: [] for r in remotes}
+    load = {r: 0 for r in remotes}
+    cnt = {r: 0 for r in remotes}
+    for f in sorted(files, key=lambda x: (-int(x.get("Size") or 0), str(x.get("Path") or ""))):
+        size = int(f.get("Size") or 0)
+        r = min(remotes, key=lambda x: (load[x], cnt[x], x))
+        buckets[r].append(str(f.get("Path") or ""))
+        load[r] += size
+        cnt[r] += 1
+    return buckets, {r: {"files": cnt[r], "bytes": load[r]} for r in remotes}
+
+
+def make_split_jobs(remotes, sub, assign, stats, dest, proxy=False, flt=None, s=None):
+    """把「账号 → 文件清单」变成 N 条分片任务。
+
+    抽成独立函数是为了能测三条不变式（任何一条破了都会安静地出错）：
+      · dest 必须**完全相同** —— 否则后面的分片会被 dedupe_dest 改成「目录-2」；
+      · fileList 两两**不相交** —— 否则两个账号同时写同一个目标文件；
+      · 并集等于全部文件 —— 漏一个就是永久缺文件，而且看不出是谁漏的。
+    """
+    s = s or DEFAULTS
+    gid = int(time.time() * 1000)
+    made = []
+    for i, r in enumerate(remotes):
+        paths = list(assign.get(r) or [])
+        nbytes = int((stats.get(r) or {}).get("bytes") or 0)
+        job = {"id": gid + i, "jobid": None, "remote": r, "subpath": sub,
+               "src": split_src(r, sub), "mode": "copy", "dest": dest,
+               "state": "queued", "started": time.strftime("%m-%d %H:%M"),
+               "bytes": 0, "total": nbytes, "speed": 0, "eta": None,
+               "error": "", "proxy": bool(proxy),
+               "createdVersion": APP_VERSION, "createdAt": int(time.time() * 1000),
+               # 分片清单：expand_source_files 只认这些文件，保证互斥
+               "fileList": paths,
+               "split": {"group": gid, "index": i + 1, "of": len(remotes),
+                         "files": len(paths), "bytes": nbytes}}
+        if s.get("safeNaming", True):
+            job["naming"] = "v2"
+        if flt:
+            # 过滤已经在本机算进 fileList 了，这里只留文案给界面显示：
+            # 再向 rclone 注入一次 _filter 只会引入第二套匹配语义
+            # （Python 侧大小写不敏感、rclone 侧默认敏感），
+            # 一旦两边判得不一样，被分到的文件会「悄悄不下」。
+            job["filterText"] = describe_filter(flt)
+        made.append(job)
+    return made
+
+
+def split_peer_running(job, running):
+    """同一分片组里已经有成员在跑时返回 True（用于突破 maxConcurrent）。
+
+    分片本来就是「一份资源拆开并行」，只放一片跑等于白拆。NAS 重启后按队列恢复时
+    最容易出现「只醒一片」：这里让同组后续分片跟着第一个醒来的成员一起恢复。
+    """
+    g = (job.get("split") or {}).get("group")
+    if not g:
+        return False
+    return any((x.get("split") or {}).get("group") == g and x.get("state") == "running"
+               for x in running)
+
+
+def split_scan(remotes, sub, flt=None, proxy=False, want_files=False):
+    """只读预检：每个账号能否看到这份资源、文件集合是否一致、拆完各分多少。
+
+    返回的 consistent=False 时**不允许**真的开始下载：文件集合不一致意味着
+    「分给 A 的文件 B 没有」，建出来的任务必然有一个要失败。
+    各账号并行列目录：串行时 4 个账号最坏要等 4 次 90 秒，前端早就超时了。
+    """
+    def one(r):
+        item = {"remote": r, "state": "ok", "files": 0, "bytes": 0,
+                "identical": False, "missing": 0, "extra": 0, "error": ""}
+        try:
+            files = split_apply_filter(split_list_files(r, sub, proxy), flt)
+            item["_set"] = {(str(f.get("Path")), int(f.get("Size") or 0)) for f in files}
+            item["files"] = len(files)
+            item["bytes"] = sum(int(f.get("Size") or 0) for f in files)
+            if not files:
+                item["state"] = "empty"
+                item["error"] = "这个账号下看不到文件（未转存 / 目录为空 / 路径不同）"
+        except Exception as e:
+            # 「目录不存在」不是故障，是这个账号还没转存：区分开，界面才不会吓人。
+            # rclone 对不存在的目录返回 `error in ListJSON: directory not found`（HTTP 200）。
+            if _is_missing_dir_error(str(e)):
+                item["state"] = "empty"
+                item["error"] = "这个账号下没有该目录（很可能还没转存）"
+            else:
+                item["state"] = "error"
+                item["error"] = mask_secret(str(e))[:180]
+        return item
+
+    if len(remotes) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(remotes))) as ex:
+            rows = list(ex.map(one, remotes))
+    else:
+        rows = [one(r) for r in remotes]
+
+    sets = {x["remote"]: x.get("_set") for x in rows if "_set" in x}
+    for x in rows:
+        # v4.02：记下「这次到底列到目录没有」。列不到和「列到但为空」在界面上必须是两句话：
+        # 前者是「这个账号没有这份资源」，后者是「目录在但一个文件都没有」。
+        x["listed"] = "_set" in x
+        x.pop("_set", None)
+    # 用「并集」而不是「交集」算缺口：用户要看的是「这个账号少了别人有的东西」，
+    # 交集口径下 missing 恒为 0，只剩「多」，报错方向是反的。
+    union = set.union(*sets.values()) if sets else set()
+    common = set.intersection(*sets.values()) if sets else set()
+    ok_all = bool(rows) and len(rows) >= SPLIT_MIN_FILES and len(sets) == len(rows)
+    for x in rows:
+        s = sets.get(x["remote"])
+        if s is None:
+            # v4.02：列不到目录的账号，缺口是「并集里所有文件」而不是 0 —— 旧逻辑在这里
+            # `continue`，界面显示成「0 个 · 0 KB 缺 0 / 多 0」，看上去像「一个都不缺」。
+            x["missing"] = len(union)
+            x["extra"] = 0
+            x["identical"] = False
+            continue
+        x["missing"] = len(union - s)
+        x["extra"] = len(s - union)
+        x["identical"] = (s == union)
+    blind = [x for x in rows if not x["listed"]]           # 根本看不到这个目录的账号
+    mismatched = [x for x in rows if x["listed"] and not x["identical"]]
+    same = ok_all and not blind and not mismatched and bool(union)
+
+    files = [{"Path": p, "Size": s} for p, s in sorted(common)]
+    stats = {}
+    if same:
+        _buckets, stats = split_assign(files, [x["remote"] for x in rows])
+    warnings = []
+    if not same:
+        # v4.02：旧逻辑只给「看到了但不一样」的账号发警告，于是「N 个账号没有该目录」
+        # 这种情况 warnings 是空的 —— 界面只有一句「不一致」，用户无从知道该去干什么。
+        if blind:
+            names = "、".join(x["remote"] for x in blind[:5])
+            if len(blind) > 5:
+                names += " 等 %d 个账号" % len(blind)
+            warnings.append("%s 看不到「%s」这个目录（还没转存过来）：分给它们的文件会直接失败"
+                            % (names, sub or "根目录"))
+        for x in mismatched:
+            warnings.append("%s：缺 %d 个、多 %d 个（与其它账号的文件集合不一致）"
+                            % (x["remote"], x["missing"], x["extra"]))
+    out = {"path": str(sub or "").strip("/"), "accounts": rows,
+           "consistent": same,
+           # fileCount/bytes 用并集：不一致时也要能说清「这份资源一共多大」，
+           # 交集口径下会少报（别人多出来的文件被算没）。
+           "fileCount": len(union), "bytes": sum(s for _p, s in union),
+           "commonCount": len(common),
+           "missingDir": len(blind), "mismatched": len(mismatched),
+           "assign": [{"remote": r, "files": stats[r]["files"], "bytes": stats[r]["bytes"]}
+                      for r in stats],
+           "warnings": warnings}
+    if want_files and same:
+        out["files"] = files       # 只给 splitstart 复用，避免再列一次目录（最坏多等 90 秒）
+    return out
+
+
+
 def pk_share_list(name, max_pages=4, limit=100, force=False):
     """列某个账号「我的分享」，带 60 秒缓存（自动取消巡检每 5 分钟才跑一次）。"""
     now = time.time()
@@ -4957,6 +5901,8 @@ def job_live(job):
                 pass
             if st.get("success"):
                 job["state"] = "done"
+                # v4.04：单文件任务下完后补排转封装（v2 目录任务已在下完每个文件时单独入队）
+                _schedule_remux_for_job(job)
                 if not job.get("total"):
                     # v3.43：带过滤的任务 0 字节多半是「全被过滤掉了」，提示要说清是规则造成的
                     if job.get("filterText"):
@@ -5008,6 +5954,7 @@ def job_live(job):
                     job["state"] = "done"
                     job["error"] = ""
                     job["_miss"] = 0
+                    _schedule_remux_for_job(job)     # v4.04：同上面的完成分支
                     return
             except Exception:
                 pass
@@ -5087,6 +6034,21 @@ DOWNLOAD_SUBDIR = ((os.environ.get("CONSOLE_DOWNLOAD_SUBDIR") or "").strip().str
 LEGACY_VOLUME = {"rclone": RCLONE_DATA_ROOT, "console": DOWNLOAD_ROOT, "host": ""}
 
 
+def single_file_dst_dir(vroot, folder, parent, dest):
+    """v4.08：单文件任务的目标目录（即 rclone copyfile 的 dstFs）。
+
+    指定了 folder 时 dest 本身就是目标目录；没指定时落到
+    「Downloads/<源文件所在文件夹名>/」，与目录任务保持同一层级，
+    单文件下载自然落在同目录其它文件旁边，不会散在卷根。
+    旧版这里直接返回卷根，文件真被写进 /data/xxx.partial，
+    而卡片上显示的是 /data/Downloads/xxx —— 显示与落点差一层目录。
+    """
+    if folder:
+        return dest
+    pname = basename_of(parent) if parent else ""
+    return vroot + "/" + DOWNLOAD_SUBDIR + ("/" + pname if pname else "")
+
+
 def _self_container_candidates():
     """控制台自身容器名的候选，按优先级：显式配置 → $HOSTNAME（Docker 默认把容器
     短 ID 设成 hostname，`docker inspect` 同样认）→ 历史默认名。改过
@@ -5111,9 +6073,83 @@ def _inspect_mounts(container):
             out.append((src, dst))
     return out
 
+
+# ── v4.07 卷可写性实探 ───────────────────────────────────────────────
+# 2026-11-24 现场：NAS 换盘后宿主留下「假卷」目录（/vol2/Data-storage 落在 55 GB 系统盘上，
+# 不是任何真实卷），而两个容器的 bind 还指着它。它最坑的地方是「半可写」——
+# `touch`、`open(O_CREAT)` 都能成功建出 0 字节文件，`write()` 才回 EPERM，
+# 连 `cat` 都读不出来。旧版把它认成主卷（rclone=/data），新任务 100% 落进去、
+# 每秒重试一次、界面永远 0.0%，红字只有一句 operation not permitted。
+# 所以判定「可写」不能看权限位、也不能看能否建文件，必须真写一次数据再删。
+WRITABLE_TTL = 120.0
+_WRITABLE_CACHE = {}          # 控制台路径 -> (是否可写, 探测时刻)
+_WRITABLE_LOCK = threading.RLock()
+
+
+def volume_writable(root, ttl=None):
+    """真写一次再删：建文件 → 写 4 字节 → fsync → 删除，全过才算可写。
+    结果按 ttl（默认 WRITABLE_TTL 秒）缓存，自愈式：卷修好后最多两分钟重新可用。"""
+    p = str(root or "").strip()
+    if not p:
+        return False
+    ttl = WRITABLE_TTL if ttl is None else float(ttl)
+    now = time.time()
+    with _WRITABLE_LOCK:
+        hit = _WRITABLE_CACHE.get(p)
+        if hit and (now - hit[1]) < ttl:
+            return hit[0]
+    probe = os.path.join(p, ".cloudshuttle-wtest.%d" % os.getpid())
+    ok = False
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, b"wtest")
+            os.fsync(fd)
+            ok = True
+        finally:
+            os.close(fd)
+    except OSError:
+        ok = False
+    try:
+        os.unlink(probe)
+    except OSError:
+        pass
+    with _WRITABLE_LOCK:
+        _WRITABLE_CACHE[p] = (ok, now)
+    return ok
+
+
+def _volume_capacity(p):
+    """卷的总容量（字节），只用于排序。
+    用「总容量」而不是「剩余空间」：容量是稳定值，不会随着下完一部片子就翻转，
+    界面上的「存储空间 N」编号也就不会跳来跳去。识别不到就返回 0（排最后）。"""
+    try:
+        return shutil.disk_usage(p.get("console") or "/").total
+    except Exception:
+        return 0
+
+
+def rank_pairs(pairs):
+    """可写的卷排前面；同为可写时**容量大的优先**。
+    排序影响「主卷」：新建任务不指定卷时取第一个，所以不可写的卷绝不能排第一，
+    小盘也不能顶掉大盘 —— 把 50 GB 的系统副盘当默认下载盘，几十个任务就能写满。
+
+    v4.09：可写性每轮都重探一次（volume_writable 自带 120 秒 TTL，代价只是一次
+    4 字节写入）。v4.07 只在首次识别时探一次并缓存进 dict，注释说的「卷修好两分钟内
+    自动恢复」其实不成立 —— 必须重启控制台才会重新判定。"""
+    for p in pairs:
+        p["writable"] = volume_writable(p.get("console"))
+        p["capacity"] = _volume_capacity(p)
+    pairs.sort(key=lambda p: (not p.get("writable"),
+                              -int(p.get("capacity") or 0),
+                              str(p.get("rclone") or "")))
+    return pairs
+
+
 def storage_pairs():
     """识别可用下载卷：宿主 Source 相同的 (控制台挂载点, rclone挂载点) 配对。
-    rclone=/data 的主卷排最前（历史 dest 约定）；识别失败回退内置单卷。"""
+    rclone=/data 的主卷排最前（历史 dest 约定）；识别失败回退内置单卷。
+    v4.07：可写性实探后再排序，不可写的卷沉到最后。"""
     try:
         rmap = {}
         for src, dst in _inspect_mounts(RCLONE_CONTAINER):
@@ -5133,17 +6169,22 @@ def storage_pairs():
                 seen.add(rdst)
                 pairs.append({"rclone": rdst.rstrip("/"), "console": cdst.rstrip("/") or "/", "host": src})
         if pairs:
-            pairs.sort(key=lambda p: (p["rclone"] != RCLONE_DATA_ROOT, p["rclone"]))
-            return pairs
+            return rank_pairs(pairs)
     except Exception:
         pass
-    return [dict(LEGACY_VOLUME)]
+    fb = dict(LEGACY_VOLUME)
+    fb["writable"] = volume_writable(fb.get("console"))
+    return [fb]
 
 def refresh_storages(s=None):
     """重算每个存储空间的容量（真实值 + 可选配额折算），写入 STATE["storages"]。
-    挂载关系在容器生命周期内不变，只识别一次；容量每轮 scheduler 刷新。"""
+    挂载关系在容器生命周期内不变，只识别一次；容量与可写性每轮 scheduler 刷新。"""
     if not STATE.get("volumePairs"):
         STATE["volumePairs"] = storage_pairs()
+    else:
+        # v4.07：每轮重排一次（探针带 120 秒缓存，开销就是一次 4 字节写入）。
+        # 卷从坏到好、或从好到坏，两分钟内就能反映到「主卷是谁」上，不用重启控制台。
+        rank_pairs(STATE["volumePairs"])
     s = s or load_settings()
     quota = float(s.get("diskQuotaGB") or 0)
     disk_min = float(s.get("diskMinGB") or 0)
@@ -5162,6 +6203,7 @@ def refresh_storages(s=None):
             free = max(0.0, min(free, quota - used))
         stors.append({"name": "存储空间 %d" % i,
                       "rclone": p["rclone"], "console": p["console"], "host": p.get("host", ""),
+                      "writable": bool(p.get("writable", True)),
                       "totalGB": round(total, 1), "freeGB": round(free, 1),
                       "usedPct": round(min(100.0, (total - free) / total * 100.0), 1) if total > 0 else 0.0,
                       "low": free < disk_min})
@@ -5386,6 +6428,115 @@ def _stuck_watchdog(j, s):
                   "点「继续」可跳过已完成文件重试" % int(minutes))
 
 
+# ── v4.03 低速自动重连 ──────────────────────────────────────────────────
+# 和上面的「卡住看门狗」不是一回事：那个要求速度为 0 且字节完全不动。
+# PikPak 更常见的是第三种状态 —— 连接还在、字节还在涨，但只有几十 KB/s，
+# 既不报错也不触发任何超时，于是任务挂在那儿跑几十小时。
+# 2026-11-23 现场实测（会员号：存储1-new）：
+#   僵死连接 58~74 KB/s → 手动「停→继续」→ 立刻 8.9 MB/s / 23.4 MB/s。
+# 对照实验：同一时刻同账号 8 路并发只多拿到 82 KB/s（6 路 0 字节），
+#   pik-3 单流 448 KB/s；磁盘 116 MB/s、国内 17.8 MB/s、TCP 重传 0.00%。
+#   所以既不是磁盘也不是带宽，更不是「账号额度」，就是那条连接自己废了。
+# 判定用「窗口内平均速度」而不是瞬时速度：瞬时值抖动极大（实测同文件
+# 10 秒内从 204 KB/s 掉到 16 KB/s），拿它做判据会误杀。
+def _auto_reconnect_worker(job_id):
+    """把一次「停 → 重新排队」完整走完，等价于用户手点一次「继续」。
+
+    必须等旧 worker 线程真退出再置 queued，否则新旧线程会同时写同一个文件
+    （v3.93 已经在「继续」接口里踩过这个坑）。"""
+    try:
+        with LOCK:
+            jobs = load_jobs()
+            j = next((x for x in jobs if x.get("id") == job_id), None)
+            if not j or j["state"] != "running":
+                return
+            stop_job_entry(j)
+            save_jobs(jobs)
+        wait_worker_exit(job_id, timeout=15)
+        with LOCK:
+            jobs = load_jobs()
+            j = next((x for x in jobs if x.get("id") == job_id), None)
+            if j and j["state"] == "stopped":
+                j["state"] = "queued"
+                j["error"] = ""
+                # 重连后进度会从文件头重来（rclone 会删掉半截 .partial），
+                # 基准清零，避免下一窗口把「负数增量」当成更慢又连着踢一次。
+                j["_kickAt"], j["_kickBytes"] = 0, None
+                save_jobs(jobs)
+    except Exception as e:
+        print("%s 自动重连异常: %s" % (time.strftime("%F %T"), str(e)[:120]))
+
+
+def _reconnect_watchdog(j, s):
+    """v4.03：窗口内平均速度低于阈值 → 判定连接僵死，自动重连一次。
+
+    返回值表示「job 字典被改过」：调度器只在返回 True 时才写盘。这条以前踩过坑 ——
+    基线只记在内存里、每轮又从 jobs.json 读回 0，于是 `not base_t` 永远成立、
+    看门狗永远停在「记基线」这一步，一次都不会触发（2026-11-23 真机测试抓到）。
+    触发后窗口翻倍，在真的只有几百 KB/s 的线路上不会反复丢掉半截文件：
+    180s → 360s → 720s …→ 3600s。"""
+    if j.get("state") != "running" or j.get("kind") in ("xfer", "unzip"):
+        return False
+    if not _truthy(s.get("autoReconnect", True)):
+        return False
+    maxk = int(s.get("reconnectMax") or 0)
+    if maxk <= 0:
+        return False
+    now = time.time()
+    cur = int(j.get("bytes") or 0)
+    base_t = j.get("_kickAt")
+    base_b = j.get("_kickBytes")
+    if not base_t or base_b is None:
+        j["_kickAt"], j["_kickBytes"] = now, cur
+        return True
+    win = float(j.get("_kickWin") or s.get("reconnectWindowSec") or 180)
+    elapsed = now - float(base_t)
+    if elapsed < win:
+        return False
+    rate = (cur - int(base_b)) / max(elapsed, 1.0)
+    if cur < int(base_b):
+        # 字节计数器回退 = 任务自己重启过（rclone 删掉半截 .partial 后重算），
+        # 不是「变慢」。拿它当判据会误踢：真机第一次实测就被这个踢了一脚。
+        j["_kickAt"], j["_kickBytes"] = now, cur
+        return True
+    thr = float(s.get("reconnectSlowKBps") or 384) * 1024.0
+    if rate >= thr:
+        j["_kickAt"], j["_kickBytes"] = now, cur     # 还跑得动，重新计窗口
+        return True
+    # v4.06：同一个文件连续两轮「一个字节都没进来」→ 停止重连。
+    # 现场（2026-11-24）：PikPak 里一个 TEMP 占位文件没有可用直链，看门狗每 180 秒
+    # 就把任务停掉重排队，而单文件自己的重试（约 2 分钟）永远走不到「失败」，
+    # 任务于是卡在 97.4% 无限重启。停止踢之后，文件级尾池会在零字节满 10 分钟时认输、
+    # 把它记成失败，任务才能收尾（48/49 完成 + 1 个失败，而不是永远 0 KB/s）。
+    cf = str(j.get("curfile") or "")
+    prev_cf = str(j.get("_kickFile") or "")
+    prev_b = int(j.get("_kickFileBytes") or 0)
+    same = (int(j.get("_kickSame") or 0) + 1) if (cf and cf == prev_cf and cur <= prev_b) else 0
+    j["_kickFile"], j["_kickFileBytes"], j["_kickSame"] = cf, cur, same
+    j["_kickAt"], j["_kickBytes"] = now, cur
+    if same >= 2:
+        if same == 2:          # 只在第一次放弃时打一行，之后每轮不再刷屏
+            try:
+                log_event(j.get("id"), "kick_giveup", file=cf[:80], strikes=same,
+                          why="同一文件连续两轮零字节，交给文件级重试判失败")
+            except Exception:
+                pass
+        return True
+    n = int(j.get("_kickN") or 0)
+    if n >= maxk:
+        return False
+    j["_kickN"] = n + 1
+    j["_kickWin"] = min(win * 2, 3600.0)
+    j["_kickAt"], j["_kickBytes"] = now, cur
+    try:
+        log_event(j.get("id"), "reconnect", rate=int(max(rate, 0) / 1024),
+                  kick="%d/%d" % (n + 1, maxk), win=int(win))
+    except Exception:
+        pass
+    threading.Thread(target=_auto_reconnect_worker, args=(j["id"],), daemon=True).start()
+    return True
+
+
 def poll_jobs_live():
     """后端兜底轮询任务终态：不再依赖浏览器一直开着。
     与 jobs action 同样在 LOCK 内执行，保证 jobs.json 读写串行。"""
@@ -5428,10 +6579,19 @@ def scheduler():
                         stop_job_entry(j)
                         j["error"] = "磁盘空间保护触发，已自动暂停"
                         changed = True
+                    elif _reconnect_watchdog(j, s):
+                        # v4.03：连接僵死（几十 KB/s 的「慢速蠕动」）自动重连，
+                        # 真停真起由后台线程完成，这里只需要标脏
+                        changed = True
                 for j in jobs:
-                    if len(running) >= s["maxConcurrent"]:
-                        break
-                    if j["state"] == "queued" and not vol_low(j) and launch_job(j, s):
+                    if j["state"] != "queued" or vol_low(j):
+                        continue
+                    # v4.01：分片组内已经有一片在跑时，剩下的不再受 maxConcurrent 限制。
+                    # 分片本意就是「一份资源拆开并行」，只醒一片等于白拆 ——
+                    # NAS 重启后按队列恢复时最容易出现这种「只醒一片」。
+                    if len(running) >= s["maxConcurrent"] and not split_peer_running(j, running):
+                        continue
+                    if launch_job(j, s):
                         running.append(j)
                         changed = True
                 if s["autoStart"] and s["autoPause"]:
@@ -6936,6 +8096,35 @@ def rename_map_for(remote, cloud_path, local_root):
     return out
 
 
+def rename_alias_map(cloud_path, local_root):
+    """v4.01：把**所有账号**在同一前缀下的「原名 → 落盘名」都收进来。
+
+    安全命名的哈希输入包含账号名，所以同一个云端文件由 A 账号落盘、却拿 B 账号去校验时，
+    B 的映射表里压根没有那条记录 —— 分账号下载后这种「同目录混着多个账号的落盘结果」
+    会让一批文件同时被报成缺失 + 多余。这里按相对路径聚合成别名表，校验时只要
+    「某个别名在本地存在」就认定是同一个文件，不会再退化成按字节数猜。"""
+    out = {}
+    try:
+        root = _local_volume_root(local_root) or primary_root()
+        ent = (load_name_map({"console": root}) or {}).get("entries") or {}
+    except Exception:
+        return out
+    prefix = (str(cloud_path or "").strip("/") + "/") if str(cloud_path or "").strip("/") else ""
+    for k, v in ent.items():
+        _r, _, src = str(k).partition(":")
+        src = str(src)
+        if prefix and not src.startswith(prefix):
+            continue
+        rel = src[len(prefix):] if prefix else src
+        safe = str((v or {}).get("safe") or "")
+        if rel and safe and safe != rel:
+            lst = out.setdefault(_norm_key(rel), [])
+            key = _norm_key(safe)
+            if key not in lst:
+                lst.append(key)
+    return out
+
+
 def pair_renames_by_size(items):
     """v3.97：没有映射时按「字节数唯一」把 missing/extra 配成改名对。
 
@@ -6957,12 +8146,30 @@ def pair_renames_by_size(items):
             continue
         m, e = mlist[0], elist[0]
         m["status"] = "renamed"
+        m["renameSource"] = "size"
         m["localPath"] = e["path"]
         m["localSize"] = size
-        m["note"] = "本地名为 %s（按字节数配对认定是同一文件，建议人工确认）" % e["path"][:70]
+        m["note"] = "本地名为 %s（仅按字节数唯一配对，未列入安全命名清单；建议抽样校验或人工确认）" % e["path"][:70]
         e["_merged"] = True
         paired += 1
     return paired
+
+
+def verify_rename_counts(items):
+    """v3.99：把 renamed 按证据强度拆开，便于界面提示人工确认。
+
+    name-map = 安全命名清单里查到的原名↔落盘名（可信）；
+    size     = 清单没覆盖时按「同大小且唯一」推断（仅人工可确认）。
+    """
+    by_map = by_size = 0
+    for it in items:
+        if it.get("status") != "renamed":
+            continue
+        if it.get("renameSource") == "size":
+            by_size += 1
+        else:
+            by_map += 1
+    return {"byMap": by_map, "bySize": by_size}
 
 
 def _cloud_file_target(cloud_target, cloud_scope, rel):
@@ -7102,6 +8309,18 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
     expect = {}
     for k, size in cloud.items():
         expect[rmap.get(k, k)] = (k, size)
+    # v4.01：分账号下载会把多个账号的落盘名混进同一个目录。先算出「哪些云端文件
+    # 能靠别账号的映射在本地找到」，免得它们同时被报成缺失 + 多余（v3.97 的假差异温床）。
+    aliases = rename_alias_map(cloud_path, ltarget)
+    alias_hits, alias_taken = {}, set()
+    for k in cloud:
+        if k in local:
+            continue
+        for a in aliases.get(k, []):
+            if a in local and a not in alias_taken:
+                alias_hits[k] = a
+                alias_taken.add(a)
+                break
     for k in sorted(set(expect) | set(local)):
         c, l = expect.get(k), local.get(k)
         orig = c[0] if c else None
@@ -7113,13 +8332,25 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
                 "match" if c[1] == l["size"] else "size")
             if status == "size":
                 note = "大小不同（可能未下完 / 文件被改动）"
-            items.append({"path": orig or k, "localPath": k if orig and orig != k else None,
-                          "status": status, "cloudSize": c[1], "localSize": l["size"],
-                          "note": note})
+            item = {"path": orig or k, "localPath": k if orig and orig != k else None,
+                    "status": status, "cloudSize": c[1], "localSize": l["size"],
+                    "note": note}
+            if status == "renamed":
+                item["renameSource"] = "name-map"
+            items.append(item)
         elif c is not None:
+            alt = alias_hits.get(k)
+            if alt:
+                items.append({"path": orig, "localPath": alt, "status": "renamed",
+                              "cloudSize": c[1], "localSize": local[alt]["size"],
+                              "renameSource": "name-map",
+                              "note": "落盘名由其它账号写入（分账号下载），已按安全命名清单认定同一文件"})
+                continue
             items.append({"path": orig, "status": "missing", "cloudSize": c[1],
                           "localSize": None, "note": "云端有、本地没有（尚未下载或已被清理）"})
         else:
+            if k in alias_taken:      # 已被某个云端文件按别名认领，不再重复算「多余」
+                continue
             items.append({"path": k, "status": "extra", "cloudSize": None,
                           "localSize": l["size"], "note": "本地有、云端没有（云端已删除 / 其他来源文件）"})
     # v3.97：映射只覆盖「本程序处理过」的文件，历史任务/更早版本落的盘对不上；
@@ -7127,7 +8358,8 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
     renamed = pair_renames_by_size(items)
     if renamed:
         items = [it for it in items if not it.get("_merged")]
-        warnings.append("%d 对文件按字节数唯一配对认定为改名（建议人工确认）" % renamed)
+        warnings.append("%d 对文件仅按字节数唯一配对认定为改名（未列入安全命名清单，建议抽样校验或人工确认）"
+                        % renamed)
 
     deep_checked, deep_bytes = 0, 0
     candidates = [it for it in items if it["status"] in ("match", "renamed") and lscope == cscope]
@@ -7202,9 +8434,12 @@ def verify_compare(remote, cloud_path, local_path, mode, limit):
     summary["total"] = len(items)
     summary["deepChecked"] = deep_checked
     summary["deepBytes"] = deep_bytes
+    rcounts = verify_rename_counts(items)
+    summary["renamedByMap"] = rcounts["byMap"]
+    summary["renamedBySize"] = rcounts["bySize"]
     if counts.get("renamed"):
-        warnings.append("%d 个文件落盘名与云端不同（安全命名截断），已按映射/大小认定为同一文件"
-                        % counts["renamed"])
+        warnings.append("%d 个文件落盘名与云端不同：安全命名清单确认 %d 个，按字节数推断 %d 个（推断项需人工确认）"
+                        % (counts["renamed"], rcounts["byMap"], rcounts["bySize"]))
     clean = not any(counts.get(k) for k in ("missing", "extra", "size", "content", "unknown"))
     return {
         "ok": clean and bool(items),
@@ -7727,6 +8962,15 @@ def api(action, body):
             else:
                 vol = vols[0]
             vroot = vol["rclone"]
+            # v4.07：不可写的卷一律不给建任务。现场那个假卷「能建 0 字节文件、写数据 EPERM」，
+            # 旧版放行后表现就是 0.0% 无限重试；这里提前拦住，错误信息直接指向根本原因。
+            if not vol.get("writable", True):
+                return {"error": "「%s」（%s）当前不可写：能创建文件、但写数据被系统拒绝"
+                                 "（operation not permitted）。这通常不是磁盘满或账号问题，"
+                                 "而是宿主上这个目录已经失效（换盘 / 卷被卸载后留下的空壳），"
+                                 "容器还 bind 在上面。请改选其它存储空间；"
+                                 "或在 NAS 上把该容器的挂载路径改到真实卷后重建容器。"
+                                 % (vol.get("name") or vroot, vroot)}
             vf = volume_effective_free(vol, s)
             disk_min = float(s["diskMinGB"] or 0)
             if vf is not None and vf < disk_min:
@@ -7770,6 +9014,12 @@ def api(action, body):
             proxy = bool(body.get("proxy", s["downloadProxy"]))
             # v3.43 下载过滤：规范化后随任务一起落盘，续传 / 重启都能沿用同一套规则
             flt = norm_download_filter(body.get("filter"))
+            # v4.05：预检走在 launch_job 之前，而 5573 只在 launch_job 里按需拉起。
+            # rclone-backend 重启后 5573 就没了，此时任何「走代理」的新任务都会在预检
+            # 阶段报「connection refused」，看起来像网络故障。所以这里也先确保 5573 在。
+            if proxy and not ensure_proxy_rc():
+                return {"error": "代理守护进程（%d）启动失败，请检查代理客户端与 %s 容器"
+                                 % (PROXY_RC_PORT, RCLONE_CONTAINER)}
             # 预检源：sub 可能是目录也可能是单个文件（cloud_precheck 内部区分）
             pre_list, pre_err, is_file = cloud_precheck(body["remote"], sub, proxy)
             if pre_err:
@@ -7795,14 +9045,24 @@ def api(action, body):
                 job["single_file"] = True
                 job["leaf"] = leaf
                 job["src_dir"] = "%s:%s" % (body["remote"], parent)
-                # 指定保存目录时 dest 本身就是目标目录；否则目标目录是该卷的根
-                job["dst_dir"] = dest if folder else vroot
                 if job.get("naming") == "v2":
                     # 源端仍用 leaf（原名），只有落盘名换成安全名
                     job["safe_leaf"] = safe_basename(
                         leaf, body["remote"], sub,
                         max_bytes=int(s.get("safeNameMaxBytes") or 180),
                         hash_len=int(s.get("safeNameHashLen") or 12))
+                # v4.08：单文件任务的「显示落点」必须等于「真实落点」。
+                # 旧版未指定 folder 时 dst_dir 直接取卷根，rclone 实际写的是
+                # /data/xxx.mp4.partial，而卡片上显示 /data/Downloads/xxx.mp4 ——
+                # 差一层目录。出现 operation not permitted 这类落盘错误时，
+                # 报错路径和界面路径对不上，排障会被带偏（现场已踩过一次）。
+                if folder:
+                    dst_dir = dest                      # 指定保存目录：dest 就是该目录
+                else:
+                    dst_dir = single_file_dst_dir(vroot, folder, parent, dest)
+                job["dst_dir"] = dst_dir
+                dest = dst_dir + "/" + (job.get("safe_leaf") or leaf)
+                job["dest"] = dest
             launched_ok = True
             if running < s["maxConcurrent"]:
                 launched_ok = launch_job(job, s)
@@ -7813,6 +9073,133 @@ def api(action, body):
             if warn:
                 return {"job": job, "warn": warn}
             return {"job": job}
+
+    # ── v4.01 分账号下载：只读预检 ──────────────────────────────────────────
+    # 把「这 N 个账号能不能一起下、各自分多少」先算清楚再动手，避免建完任务才发现
+    # 某个账号根本没转存这份资源（历史遗留问题里最常见的一条）。
+    if action == "splitscan":
+        remotes = [str(x).strip() for x in (body.get("remotes") or []) if str(x).strip()]
+        remotes = list(dict.fromkeys(remotes))
+        sub = str(body.get("path") or "").strip("/")
+        if len(remotes) < 2:
+            return {"error": "至少要选 2 个账号才有意义（单账号请用普通下载）"}
+        if len(remotes) > SPLIT_MAX_ACCOUNTS:
+            return {"error": "一次最多 %d 个账号" % SPLIT_MAX_ACCOUNTS}
+        avail = set(pikpak_remotes())
+        bad = [r for r in remotes if r not in avail]
+        if bad:
+            return {"error": "这些账号不是可用的 PikPak 账号：%s" % "、".join(bad)}
+        s = load_settings()
+        proxy = bool(body.get("proxy", s["downloadProxy"]))
+        flt = norm_download_filter(body.get("filter"))
+        out = split_scan(remotes, sub, flt, proxy)
+        out["filterText"] = describe_filter(flt)
+        return out
+
+    # ── v4.01 分账号下载：按文件拆分建任务 ──────────────────────────────────
+    if action == "splitstart":
+        remotes = [str(x).strip() for x in (body.get("remotes") or []) if str(x).strip()]
+        remotes = list(dict.fromkeys(remotes))
+        sub = str(body.get("path") or "").strip("/")
+        if len(remotes) < 2:
+            return {"error": "至少要选 2 个账号才能分账号下载"}
+        if len(remotes) > SPLIT_MAX_ACCOUNTS:
+            return {"error": "一次最多 %d 个账号" % SPLIT_MAX_ACCOUNTS}
+        avail = set(pikpak_remotes())
+        bad = [r for r in remotes if r not in avail]
+        if bad:
+            return {"error": "这些账号不是可用的 PikPak 账号：%s" % "、".join(bad)}
+        s = load_settings()
+        proxy = bool(body.get("proxy", s["downloadProxy"]))
+        flt = norm_download_filter(body.get("filter"))
+        scan = split_scan(remotes, sub, flt, proxy, want_files=True)
+        if not scan["fileCount"]:
+            detail = "；".join("%s：%s" % (x["remote"], x["error"] or "没有文件")
+                              for x in scan["accounts"] if x["state"] != "ok")
+            return {"error": "源目录在这些账号里都没有可下载的文件" + ("（" + detail + "）" if detail else ""),
+                    "scan": scan}
+        if not scan["consistent"]:
+            return {"error": "这些账号看到的文件集合不一致，不能直接分：" +
+                             "；".join(scan["warnings"] or ["有账号看不到该目录"]),
+                    "scan": scan}
+        files = scan.get("files") or split_apply_filter(split_list_files(remotes[0], sub, proxy), flt)
+        scan.pop("files", None)
+
+        if len(files) < SPLIT_MIN_FILES:
+            return {"error": "只有 %d 个文件，分给 %d 个账号没有收益（建议直接普通下载）"
+                             % (len(files), len(remotes)), "scan": scan}
+        assign, stats = split_assign(files, remotes)
+        if not all(assign.get(r) for r in remotes):
+            return {"error": "文件数（%d）少于账号数（%d），无法保证每个账号都有活干；"
+                             "请减少账号或改用普通下载" % (len(files), len(remotes))}
+
+        folder = str(body.get("folder") or "").strip("/")
+        if folder:
+            parts = folder.split("/")
+            if len(parts) > 4 or not all(
+                    p and re.match(r'^[\w\u4e00-\u9fff][\w\u4e00-\u9fff -]{0,60}$', p)
+                    for p in parts):
+                return {"error": "保存目录名不合法（最多 4 层，每层中英文/数字/空格/连字符）"}
+        vol_req = str(body.get("volume") or "").strip().rstrip("/")
+        vols = STATE.get("volumePairs") or [LEGACY_VOLUME]
+        if vol_req:
+            vol = next((p for p in vols if p["rclone"] == vol_req), None)
+            if not vol:
+                return {"error": "未知存储空间：%s" % vol_req}
+        else:
+            vol = vols[0]
+        vroot = vol["rclone"]
+        vf = volume_effective_free(vol, s)
+        disk_min = float(s["diskMinGB"] or 0)
+        if vf is not None and vf < disk_min:
+            return {"error": "「%s」空间保护中（剩余 %.1f GB），请清理该卷或到设置里调低阈值"
+                             % (vol.get("name") or vroot, vf)}
+
+        name = basename_of(sub) if sub else remotes[0]
+        # 分片任务一律落同一个目录：dedupe_dest 在这里是**反效果** —— 它会把第二个
+        # 任务改到「目录-2」，等于把一份资源拆进两个文件夹，校验和对账全乱。
+        dest = vroot + "/" + (folder if folder else (DOWNLOAD_SUBDIR + "/" + name))
+        warn = []
+        try:
+            dest_abs = local_dest(dest)
+            if dest_abs and os.path.isdir(dest_abs) and os.listdir(dest_abs):
+                warn.append("目标目录 %s 已有文件：同名同大小的会被跳过（等同续传），"
+                            "不会重复下载" % dest)
+        except Exception:
+            pass
+
+        with LOCK:
+            jobs = load_jobs()
+            for r in remotes:
+                src = split_src(r, sub)
+                live = next((j for j in jobs if j.get("src") == src
+                             and j.get("state") in ("running", "queued")), None)
+                if live and not bool(body.get("force")):
+                    return {"error": "账号 %s 已有同源任务在跑（#%s，落点 %s）。"
+                                     "先停掉它再分账号，或带 force=true 强制并行。"
+                                     % (r, live.get("id"), live.get("dest")),
+                            "duplicate": True, "existing": live.get("id")}
+            made = make_split_jobs(remotes, sub, assign, stats, dest,
+                                   proxy=proxy, flt=flt, s=s)
+            failed = []
+            for job in made:
+                # 分账号是「同一份资源的分片」，共用一个源目录，不受 maxConcurrent 限制：
+                # 排队等前一片跑完就完全失去了并行的意义。每片仍是独立账号、独立连接预算。
+                if not launch_job(job, s):
+                    failed.append({"remote": job["remote"],
+                                   "error": job.get("error") or "启动失败"})
+            jobs.extend(made)
+            save_jobs(jobs)
+        ok = [j for j in made if j.get("state") != "error"]
+        if not ok:
+            return {"error": "全部分片都启动失败：" +
+                             "；".join("%s %s" % (x["remote"], x["error"]) for x in failed),
+                    "jobs": made}
+        return {"jobs": made, "dest": dest, "fileCount": len(files),
+                "bytes": sum(int(f.get("Size") or 0) for f in files),
+                "assign": [{"remote": r, "files": stats[r]["files"],
+                            "bytes": stats[r]["bytes"]} for r in remotes],
+                "failed": failed, "warnings": warn}
 
     if action == "scanpath":
         return cloud_scan(body["remote"], body.get("path", ""), body.get("depth", 6))
@@ -8019,7 +9406,7 @@ def api(action, body):
         now = time.time()
         snap = JOBS_SNAP.get("payload")
         if snap is not None and now - JOBS_SNAP["ts"] < JOBS_LIVE_TTL:
-            return snap
+            return dict(snap, remux=remux_public())
         with LOCK:
             jobs = load_jobs()
             # v3.93：列表里补版本/创建时间，同名任务才分得清「哪版建的」
@@ -8054,11 +9441,13 @@ def api(action, body):
                     if isinstance(tgt, dict):
                         _merge_live_job(tgt, j)
                 save_jobs(cur)
-        payload = {"jobs": jobs, "settings": load_settings(),
+        payload = {"jobs": [{k: v for k, v in j.items() if k != "fileList"} for j in jobs],
+                   "settings": load_settings(),
                    "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
                              "diskTotal": STATE.get("diskTotal"), "storages": storages(),
                              "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
-                   "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
+                   "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
+                   "remux": remux_public()}
         JOBS_SNAP.update({"ts": time.time(), "payload": payload})
         return payload
 
@@ -8121,6 +9510,10 @@ def api(action, body):
                         if not pre:
                             j["error"] = "源目录已空（%s:%s），无需继续" % (j["remote"], j.get("subpath", "/"))
                             continue
+                    # v4.03：人工点「继续」= 用户明确想再试一次，把自动重连的次数与窗口清零，
+                    # 否则被自动重连过 5 次的任务再点继续也不会再自动重连了
+                    j["_kickN"], j["_kickWin"] = 0, None
+                    j["_kickAt"], j["_kickBytes"] = 0, None
                     if running < s["maxConcurrent"]:
                         if launch_job(j, s):
                             running += 1
@@ -8227,7 +9620,27 @@ def api(action, body):
                         "diskTotal": STATE.get("diskTotal"), "storages": storages(),
                         "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
                 "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
-                "netMode": net_mode(), "proxyScope": proxy_scope()}
+                "netMode": net_mode(), "proxyScope": proxy_scope(),
+                "remux": remux_public()}
+
+    if action == "remuxscan":
+        raw = str(body.get("path") or "").strip()
+        root = raw if raw.startswith("/") else os.path.join(DOWNLOAD_ROOT, raw) if raw else DOWNLOAD_ROOT
+        root = os.path.normpath(root)
+        roots = [DOWNLOAD_ROOT.rstrip("/")] + [p["console"].rstrip("/")
+                                               for p in (STATE.get("volumePairs") or [])]
+        # 只允许扫下载根/已挂载卷之内的目录：这个接口会批量起 ffmpeg，别给它任意路径
+        if not any(root == r or root.startswith(r + "/") for r in roots if r):
+            return {"error": "只能扫描下载目录内的路径"}
+        if not os.path.isdir(root):
+            return {"error": "目录不存在：%s" % root}
+        try:
+            n = int(body.get("depth") or 3)
+        except Exception:
+            n = 3
+        res = remux_scan(root, maxdepth=max(1, min(n, 6)))
+        res["root"] = root
+        return res
 
     if action == "autotune":
         if AUTOTUNE_RUN.get("running"):
@@ -8269,15 +9682,7 @@ def api(action, body):
         with LOCK:
             old = load_settings()
             s = dict(old)
-            for k in ("maxConcurrent", "diskMinGB", "diskQuotaGB", "transfers", "checkers",
-                      "multiThreadStreams", "multiThreadCutoffMB", "retries",
-                      "autoTune", "autoTuneSeconds", "autoTuneSettle",
-                      "stallSeconds",
-                      "autoStart", "autoPause", "orderBy", "bwLimitOn", "bwLimit",
-                      "timeout", "idleTimeout", "createEmptySrcDirs", "logLevel", "logFile",
-                      "transfersClearedAt", "nasHomeUrl", "proxyUrl", "netMode",
-                      "safeNaming", "safeNameMaxBytes", "safeNameHashLen",
-                      "safePathMaxBytes", "stuckWatchdogMin", "fileRetryMax"):
+            for k in SETTINGS_WRITABLE:
                 if k in body:
                     s[k] = body[k]
             # v3.77：两个旧开关不再由前端单独控制，统一跟随全局模式
@@ -8356,11 +9761,36 @@ def api(action, body):
             save_settings(s)
         return {"ok": True, "removed": removed}
 
+    # ── v4.10 PushPlus 微信通知 ───────────────────────────────────────────
+    if action == "pushplustest":
+        # 前端「发送测试通知」按钮：校验 token 有没有填对、NAS 能不能连通 pushplus。
+        # 允许直接传 token（还没保存设置时也能先测），否则取已保存的那份。
+        s = load_settings()
+        token = str(body.get("token") or s.get("pushplusToken") or "").strip()
+        if not pushplus_token_ok(token):
+            return {"error": "PushPlus Token 未填写或格式不对（16~64 位字母数字）"}
+        res = pushplus_send(token, "云梭｜测试通知",
+                            "<p>这是一条测试消息：收到说明 PushPlus 链路正常。</p>"
+                            "<p style='color:#888;font-size:12px'>之后任务下载成功 / 失败会各推一条。</p>")
+        code = int(res.get("code") or 0) if isinstance(res, dict) else -1
+        if code != 200:
+            return {"error": "PushPlus 返回：%s" % str((res or {}).get("msg") or res)[:150]}
+        return {"ok": True, "msg": (res or {}).get("msg") or "已发送"}
+
+    if action == "notifystate":
+        # 给前端看「当前能不能发、发过几条」，不暴露 token 原文
+        s = load_settings()
+        token = str(s.get("pushplusToken") or "")
+        seen = _read_json(NOTIFY_STATE_FILE, {})
+        return {"on": bool(_truthy(s.get("pushplusOn"))),
+                "tokenSet": pushplus_token_ok(token),
+                "tokenTail": token[-4:] if token else "",
+                "sentCount": len(seen) if isinstance(seen, dict) else 0}
+
     if action == "quota":
         remotes = [str(r) for r in (body.get("remotes") or [])]
         force = bool(body.get("force"))
         now = time.time()
-
         def _quota_one(r):
             try:
                 code, d = pk_api(r, "GET", "/vip/v1/quantity/list?type=transfer&limit=200")
@@ -9107,6 +10537,10 @@ def api(action, body):
         else:
             uvol = vols[0]
         uroot = uvol["rclone"]
+        # v4.07：与 action=start 同一道闸，不可写的卷不接单
+        if not uvol.get("writable", True):
+            return {"error": "「%s」（%s）当前不可写（写数据被系统拒绝），请改选其它存储空间"
+                             % (uvol.get("name") or uroot, uroot)}
         try:
             r = rc("operations/copyurl", fs=uroot + "/" + sub, remote="",
                    url=url, autoFilename="true", _async="true")
@@ -9530,6 +10964,45 @@ STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; ch
                 ".woff2": "font/woff2", ".woff": "font/woff", ".png": "image/png",
                 ".ico": "image/x-icon", ".map": "application/json"}
 
+_STATIC_VER_CACHE = {"key": None, "value": ""}
+
+
+def static_asset_version():
+    """v4.00：app.js / app.css 的内容指纹，注入 HTML 的 `?v=` 参数。
+
+    指纹键用 mtime_ns + size：改一行就变；结果缓存起来避免每次开页面都 stat。
+    资源 URL 跟着内容变，浏览器就不会再拿旧 JS 配新后端，也不需要 Ctrl+F5。
+    """
+    parts = []
+    for name in ("app.js", "app.css"):
+        try:
+            st = os.stat(os.path.join(STATIC_DIR, name))
+            parts.append("%s:%d:%d" % (name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            parts.append(name + ":missing")
+    key = "|".join(parts)
+    if _STATIC_VER_CACHE["key"] == key:
+        return _STATIC_VER_CACHE["value"]
+    value = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    _STATIC_VER_CACHE["key"], _STATIC_VER_CACHE["value"] = key, value
+    return value
+
+
+def render_static_html(data):
+    """把 HTML 里的资源占位符换成当前指纹；没有占位符就原样返回。"""
+    if b"__CACHE_VER__" not in data:
+        return data
+    return data.replace(b"__CACHE_VER__", static_asset_version().encode("ascii"))
+
+
+def static_cache_control(ext):
+    """HTML 不进缓存；业务 js/css 每次协商；其余资源按天缓存。"""
+    if ext == ".html":
+        return "no-store, max-age=0"
+    if ext in (".js", ".css"):
+        return "no-cache"
+    return "max-age=86400"
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -9601,12 +11074,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain; charset=utf-8", b"not found")
             return
         ext = os.path.splitext(full)[1].lower()
+        is_html = ext == ".html"
         try:
             stt = os.stat(full)
             mtime, size = int(stt.st_mtime), stt.st_size
             etag = '"%x-%x"' % (mtime, size)
-            # 协商缓存：no-cache 仍然每次询问，但命中就 304，省掉几百 KB 的 app.js 重传
-            if (self.headers.get("If-None-Match") or "").strip() == etag:
+            # 协商缓存：no-cache 仍然每次询问，命中就 304；HTML 不参与，必须每次给最新
+            if not is_html and (self.headers.get("If-None-Match") or "").strip() == etag:
                 self.send_response(304)
                 self.send_header("ETag", etag)
                 self.send_header("Cache-Control", "no-cache")
@@ -9614,13 +11088,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with open(full, "rb") as f:
                 data = f.read()
+            if is_html:
+                data = render_static_html(data)
             self.send_response(200)
             self.send_header("Content-Type", STATIC_TYPES.get(ext, "application/octet-stream"))
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("ETag", etag)
-            self.send_header("Last-Modified", self.date_time_string(mtime))
-            self.send_header("Cache-Control",
-                             "no-cache" if ext in (".html", ".js", ".css") else "max-age=86400")
+            if not is_html:
+                self.send_header("ETag", etag)
+                self.send_header("Last-Modified", self.date_time_string(mtime))
+            self.send_header("Cache-Control", static_cache_control(ext))
+            if is_html:
+                self.send_header("Pragma", "no-cache")
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(data)
@@ -9879,6 +11357,8 @@ if __name__ == "__main__":
         print("%s 存储空间识别失败: %s" % (time.strftime("%F %T"), e))
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=cred_keepalive_loop, daemon=True).start()
+    # v4.10：PushPlus 通知巡检（默认关；设置里填 token 并打开开关后生效）
+    threading.Thread(target=notify_loop, daemon=True).start()
     print("PikPak 多账号下载器（云梭 CloudShuttle）%s (按任务选择 mihomo 代理 · 凭证保活 · 测速每路 %ss): "
           "http://0.0.0.0:%d  ·  static: %s"
           % (APP_VERSION, SPEEDTEST_SECONDS, CONSOLE_PORT, STATIC_DIR))

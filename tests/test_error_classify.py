@@ -100,5 +100,72 @@ class NetVsCredTest(unittest.TestCase):
         self.assertIn("重新登录", hint)
 
 
+class SourceNoLinkTest(unittest.TestCase):
+    """v4.06：源端「只有壳没有内容」必须立刻判死，不能当网络抖动重试。
+
+    现场（2026-11-24）：PikPak 上一个 1.71 GB 的 mp4，列表 size 正常、audit 也 Normal，
+    但 hash 以 TEMP 结尾、medias / web_content_link 全空。rclone 原文：
+        failed to open source object: can't download: no link
+    一个字节都传不出来。旧分类里这条落到 UNKNOWN，配合看门狗就成了无限重启。
+    """
+
+    REAL = ("rc operations/copyfile: failed to open source object: "
+            "can't download: no link")
+
+    def test_no_link_is_file_fatal_not_transient(self):
+        kind, hint = m.classify_error(self.REAL)
+        self.assertEqual(kind, "FILE_FATAL")
+        self.assertIn("直链", hint)
+        self.assertNotIn("可重试", hint)
+
+    def test_variants(self):
+        for msg in ("can't download: no link",
+                    "failed to open source object: no available link",
+                    "cannot download: no link"):
+            self.assertEqual(m.classify_error(msg)[0], "FILE_FATAL", msg)
+
+    def test_not_confused_with_network_reset(self):
+        # 带 reset 但核心是 no link 的，仍应判文件级（否则会一直重试）
+        mixed = "failed to open source object: can't download: no link (read: connection reset)"
+        self.assertEqual(m.classify_error(mixed)[0], "FILE_FATAL")
+
+    def test_plain_network_error_unchanged(self):
+        self.assertEqual(m.classify_error(RESET_ERR)[0], "TRANSIENT")
+
+
+class ProbeSourceDeadTest(unittest.TestCase):
+    """v4.06：零字节久候时主动探源，把「悬着」变成「确定失败」。"""
+
+    def test_builds_cloud_path_from_subpath(self):
+        from unittest import mock
+        with mock.patch.object(m, "pk_play_info", return_value={}) as p:
+            self.assertEqual(m._probe_source_dead(
+                {"remote": "会员号", "subpath": "Pack From Shared/Chrisgag"}, "32.mp4"), "")
+        p.assert_called_once_with("会员号", "Pack From Shared/Chrisgag/32.mp4")
+
+    def test_single_file_job_uses_bare_name(self):
+        from unittest import mock
+        with mock.patch.object(m, "pk_play_info", return_value={}) as p:
+            m._probe_source_dead({"remote": "会员号", "single_file": True}, "a.mp4")
+        p.assert_called_once_with("会员号", "a.mp4")
+
+    def test_no_link_means_dead(self):
+        from unittest import mock
+        msg = "这个文件暂时没有可播放的直链（可能仍在转码、已损坏或不在可播状态）"
+        with mock.patch.object(m, "pk_play_info", return_value={"error": msg}):
+            self.assertIn("直链", m._probe_source_dead({"remote": "R", "subpath": "a"}, "b.mp4"))
+
+    def test_other_errors_are_ignored(self):
+        from unittest import mock
+        for err in ("读取播放地址失败：502 Bad Gateway", "取不到文件 id，可能路径写错了"):
+            with mock.patch.object(m, "pk_play_info", return_value={"error": err}):
+                self.assertEqual(m._probe_source_dead({"remote": "R", "subpath": "a"}, "b.mp4"), "")
+
+    def test_exception_never_breaks_download(self):
+        from unittest import mock
+        with mock.patch.object(m, "pk_play_info", side_effect=RuntimeError("boom")):
+            self.assertEqual(m._probe_source_dead({"remote": "R", "subpath": "a"}, "b.mp4"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
