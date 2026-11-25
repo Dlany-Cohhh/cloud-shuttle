@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.16"
+APP_VERSION = "v4.17"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -2515,6 +2515,7 @@ SAFE_LIVE = {}                 # job_id -> worker 的内存 state；详情页读
                                # v3.92：异步 copyfile 之后 job 不再有单一 jobid，
                                # 详情页原先读 core/stats 的路径失效，文件级进度恒为 0
 SAFE_THREADS = {}              # job_id -> worker Thread；stop/remove 用它等在飞任务退出
+SAFE_RESTART_WAIT = 8          # v4.17：重复启动时等旧世代退出的上限（秒），等不到就不起新的
 SAFE_BACKOFF = (2, 8, 30)      # 瞬时错误指数退避（秒）
 FILE_RC_TIMEOUT = 3600         # 单文件 copyfile 的硬超时（含异步轮询总时长）
 COPY_POLL_INTERVAL = 1.0       # 异步 copyfile 状态轮询间隔（秒）
@@ -2782,11 +2783,34 @@ def log_event(job_id, event, **kw):
 
 
 def _start_safe_dir_job(job, s):
+    """启动目录任务的工作线程。
+
+    v4.17：同一个任务绝不允许两代 worker 并存。以前这里发现旧线程只做 `old["stop"].set()`
+    就马上把 SAFE_JOBS[id] 换成新的 Event —— 而旧线程判停是按 job_id 去查 SAFE_JOBS 的，
+    换掉之后它永远看不到那个已置位的信号，会把自己那一套 entries 一路跑到底。两代交替写
+    同一个计划文件、同一个 bytes，界面就出现「进度条一会长一会短、完成数从 5 掉回 2」。
+    现在的做法：置旧信号 → 按组取消在飞 job → 等旧线程真正退出 → 才换新 Event；
+    等不到（例如卡在收尾阶段）就拒绝启动，交给下次「继续」。
+    """
+    jid = job["id"]
     with SAFE_JOBS_LOCK:
-        old = SAFE_JOBS.get(job["id"])
-        if old:
-            old["stop"].set()          # 理论上不会重复启动，兜底停掉旧线程
-        SAFE_JOBS[job["id"]] = {"stop": threading.Event()}
+        old = SAFE_JOBS.get(jid)
+        old_th = SAFE_THREADS.get(jid)
+    if old:
+        old["stop"].set()
+    if old or (old_th and old_th.is_alive()):
+        try:
+            stop_job_group(jid, bool(job.get("proxy")))   # 先打断在飞的 copyfile
+        except Exception:
+            pass
+        if old_th and old_th.is_alive() and old_th is not threading.current_thread():
+            old_th.join(SAFE_RESTART_WAIT)
+        if old_th and old_th.is_alive():
+            job["error"] = ("上一轮的工作线程还在收尾（在飞传输已取消），%d 秒内没退出；"
+                            "等几秒再点「继续」" % SAFE_RESTART_WAIT)
+            return False
+    with SAFE_JOBS_LOCK:
+        SAFE_JOBS[jid] = {"stop": threading.Event()}
     job["jobid"] = None                # 没有 rclone 异步 job，进度由工作线程自己写
     job["started_ts"] = time.time()
     job["state"] = "running"
@@ -9901,8 +9925,12 @@ def api(action, body):
                         # v4.13：人工点「继续」= 用户明确再试一次，把自动重试次数清零重新给额度
                         j["_arTries"], j["_arErrAt"] = 0, None
                     if running < s["maxConcurrent"]:
-                        if launch_job(j, s):
-                            running += 1
+                        if not launch_job(j, s):
+                            # v4.17：旧世代还没退出时拒绝启动（见 _start_safe_dir_job），
+                            # 把原因直接回给界面，而不是让它停在「已暂停」还以为是成功
+                            save_jobs(jobs)
+                            return {"error": j.get("error") or "启动失败"}
+                        running += 1
                     else:
                         j["state"] = "queued"
                     break
