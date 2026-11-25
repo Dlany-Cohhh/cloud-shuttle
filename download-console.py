@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.13"
+APP_VERSION = "v4.14"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1773,10 +1773,11 @@ def notify_loop():
 # 在这里复制一份等于把两套逻辑慢慢跑偏；直接 POST 给本机 /api 就一次都不漏。
 # 代价是必须放开锁再发请求（api 处理时自己拿 LOCK，持锁调用会死锁）。
 AUTO_RETRY_SCAN_SEC = 30          # 巡检间隔（秒）；与等待分钟数无关，30 秒粒度足够
-AUTO_RETRY_SKIP_RE = re.compile(
-    r"重新登录|登录失效|captcha|人机验证|额度|流量已达|存储空间保护|空间不足|磁盘")
-# 这些失败重试也没用，还会把 PikPak 风控刷得更狠 / 等一天磁盘也腾不出来 — 直接跳过。
-# 「控制台重启过」不在 error 里（那是 stopped），不在此列。
+AUTO_RETRY_SKIP_RE = re.compile(r"额度|流量已达|存储空间保护|空间不足|磁盘")
+# v4.14：账号失效 / 需重新登录 / 人机验证 不再一律跳过 —— 先修账号再继续（见 AUTO_RETRY_CRED_RE）。
+# 还留在跳过名单里的只剩「等多久都没用」的两类：额度用尽（要等第二天）、磁盘保护（要你先腾空间）。
+AUTO_RETRY_CRED_RE = re.compile(
+    r"重新登录|登录失效|captcha|人机验证|unauthorized|401|refresh_token|token 失效|凭证")
 AUTO_RETRY_WORKER_BUSY = "旧工作线程还没退出"   # 这不是失败，是还没退干净：不计次数，下轮再看
 
 
@@ -1793,9 +1794,10 @@ def _api_post(payload, timeout=150):
         return {"error": "内部请求失败：%s" % str(e)[:120]}
 
 
-def auto_retry_scan(now=None, resume=None):
+def auto_retry_scan(now=None, resume=None, repair=None):
     """巡检一次：把「失败已满 autoRetryMin 分钟、且还没试满 autoRetryMax 次」的任务重新拉起来。
-    resume(job_id) 可注入（测试用），默认实现回环调本机 /api；返回 (ok, msg)。"""
+    resume(job_id) 可注入（测试用），默认实现回环调本机 /api；返回 (ok, msg)。
+    repair(账号名) 可注入（测试用），默认 pikpak_verify —— 账号类失败先修账号再继续。"""
     s = load_settings()
     on = _truthy(s.get("autoRetryOn"))
     wait = int(s.get("autoRetryMin") or 10) * 60
@@ -1838,12 +1840,35 @@ def auto_retry_scan(now=None, resume=None):
             if left > 0:
                 out["waiting"].append(j.get("id"))
                 continue
-            cands.append((j.get("id"), err[:120]))
+            cands.append((j.get("id"), err[:120], str(j.get("remote") or "")))
         if dirty:
             save_jobs(jobs)
 
-    # 第二段（不持锁）：真的去点「继续」。api 内部会自己拿锁、自己做预检。
-    for jid, err in cands:
+    # 第二段（不持锁）：账号类失败先修账号，再点「继续」。api 自己拿锁、自己做预检。
+    for jid, err, remote in cands:
+        cred = bool(err and AUTO_RETRY_CRED_RE.search(err))
+        if cred and remote and remote != "URL":     # URL 直链任务没有账号可修，直接重试
+            # v4.14：账号失效 / 需要重新登录 / 人机验证 —— pikpak_verify 会自动换 device_id 重试
+            # （PikPak 的 captcha 风控常常换一个 device_id 就过），凭证被轮换的情况也会顺手同步镜像。
+            # 修不好就记一次尝试、继续等下一轮，别每 30 秒去撞一次验证码。
+            fixed, why = True, ""
+            try:
+                fixed, why = (repair or pikpak_verify)(remote)
+            except Exception as e:
+                fixed, why = False, str(e)[:100]
+            if not fixed:
+                out["credFail"] = int(out.get("credFail") or 0) + 1
+                out["errors"].append("任务 %s 所属账号「%s」仍未恢复：%s" % (jid, remote, str(why)[:80]))
+                with LOCK:
+                    jobs = load_jobs()
+                    for j in jobs:
+                        if j.get("id") == jid:
+                            j["_arTries"] = int(j.get("_arTries") or 0) + 1
+                            j["_arErrAt"] = None
+                    save_jobs(jobs)
+                continue
+            print("%s 任务 %s 的账号「%s」已修复（%s），接着重试" % (
+                time.strftime("%F %T"), jid, remote, str(why or "连通")[:60]), flush=True)
         ok, msg = True, ""
         try:
             r = (resume or (lambda i: _api_post({"action": "resume", "id": i, "_auto": True})))(jid)

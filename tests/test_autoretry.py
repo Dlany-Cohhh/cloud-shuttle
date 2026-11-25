@@ -82,16 +82,49 @@ class AutoRetryTest(unittest.TestCase):
         self.assertEqual(r["retried"], 0)
 
     def test_skips_errors_that_retry_cannot_fix(self):
-        """账号失效 / 人机验证 / 额度用尽 / 磁盘保护：重试只会白等，还可能把风控刷得更狠。"""
+        """额度用尽要等第二天、磁盘保护要人等腾空间：等 N 分钟也救不回来，跳过。"""
         self._settings()
-        errs = ["refresh token 已失效，请重新登录", "需要人机验证（captcha）",
-                "当日下载额度已用尽", "目标存储空间保护中（剩余 3.1 GB）"]
+        errs = ["当日下载额度已用尽", "目标存储空间保护中（剩余 3.1 GB）"]
         self.jobs = [{"id": i, "state": "error", "error": e, "_arErrAt": T0}
                      for i, e in enumerate(errs)]
         r = m.auto_retry_scan(now=T0 + 3600, resume=self._resume_ok)
         self.assertEqual(r["retried"], 0)
-        self.assertEqual(r["skipped"], 4)
+        self.assertEqual(r["skipped"], 2)
         self.assertEqual(self.calls, [])
+
+    # ── v4.14 账号失效 / 需重新登录 / 人机验证 也要救：先修账号再继续 ──
+    def test_cred_error_repairs_account_then_retries(self):
+        self._settings()
+        self.jobs = [{"id": 7, "state": "error", "remote": "会员号",
+                      "error": "couldn't get captcha token，请重新登录", "_arErrAt": T0}]
+        r = m.auto_retry_scan(now=T0 + 3600, resume=self._resume_ok,
+                              repair=lambda n: (True, "已自动更换 device_id 后连通"))
+        self.assertEqual(r["retried"], 1)
+        self.assertEqual(self.calls, [7])
+        self.assertEqual(self.jobs[0]["_arTries"], 1)
+
+    def test_cred_error_not_retried_when_repair_fails(self):
+        """账号修不好就别去撞验证码：记一次尝试、继续等下一轮。"""
+        self._settings()
+        self.jobs = [{"id": 8, "state": "error", "remote": "会员号",
+                      "error": "refresh_token 已失效，请重新登录", "_arErrAt": T0}]
+        r = m.auto_retry_scan(now=T0 + 3600, resume=self._resume_ok,
+                              repair=lambda n: (False, "仍需在浏览器重新登录"))
+        self.assertEqual(r["retried"], 0)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.jobs[0]["_arTries"], 1)
+        self.assertEqual(r["credFail"], 1)
+        self.assertTrue(r["errors"])
+
+    def test_cred_error_without_remote_still_retries(self):
+        """URL 直链任务没有账号，不该因为「账号类文案」被卡住。"""
+        self._settings()
+        self.jobs = [{"id": 9, "state": "error", "remote": "URL",
+                      "error": "401 unauthorized", "_arErrAt": T0}]
+        r = m.auto_retry_scan(now=T0 + 3600, resume=self._resume_ok,
+                              repair=lambda n: (False, "不该被调用"))
+        self.assertEqual(r["retried"], 1)
+        self.assertEqual(self.calls, [9])
 
     def test_done_clears_tries(self):
         self._settings()

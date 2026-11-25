@@ -140,6 +140,10 @@ grep -n 'action ==' download-console.py
 | `savesettings` | `stallSeconds` | v3.95 龟速让位：单文件连续低于 50 KB/s 满该秒数就让位（30–600，默认 90）；让位过的文件第二轮只占 1 个并发槽，尾池 30 分钟推不动 1 MB 判失败 |
 | `savesettings` | `pushplusOn` / `pushplusToken` | v4.10 PushPlus 微信通知：开关（默认关）+ 16~64 位字母数字 token（非法值会被清空，避免每 5 秒报一次错） |
 | `savesettings` | `autoRetryOn` / `autoRetryMin` / `autoRetryMax` | v4.13 失败任务自动重试：开关（默认关）、失败后等待分钟数（1~1440，默认 10）、最多重试次数（0~10，默认 3，0 = 只记录） |
+
+自动重试的失败分类（v4.14）：普通失败直接重试；**账号失效 / 需重新登录 / 人机验证**先跑 `pikpak_verify(账号)`
+（自动换 device_id、同步被轮换的凭证）修好账号再继续，修不好计一次尝试等下一轮；
+**额度用尽**与**磁盘保护 / 空间不足**不重试（等多久都没用）。
 | `pushplustest` | `token`（可省，省略则用已保存的） | v4.10：发一条测试微信，返回 `{ok,msg}` 或 `{error}`；不依赖保存，改完 token 可先测 |
 | `notifystate` | — | v4.10：`{on, tokenSet, tokenTail(末 4 位), sentCount}`，用于页面显示状态，不返回 token 原文 |
 
