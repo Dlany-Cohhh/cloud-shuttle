@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.15"
+APP_VERSION = "v4.16"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -2542,6 +2542,16 @@ class _JobAbort(Exception):
         self.state, self.msg = state, str(msg)
 
 
+def unfinished_entries(entries):
+    """还没落盘完成的条目：pending / deferred / running。
+
+    v4.15：running 必须算在内。收尾时若还有在飞文件（status=running）就写 done，
+    会出现「已完成 209/212、错误行说 3 个文件失败，详情 failedFiles 却是空」的自相矛盾，
+    「仅重试失败项」也无从下手。"""
+    return [e for e in (entries or [])
+            if str(e.get("status") or "") in ("pending", "deferred", "running")]
+
+
 def build_live_transferring(entries, lives):
     """v3.92：把 worker 采样到的「在传」字节/速度还原成详情页的 transferring 列表。
 
@@ -4003,7 +4013,10 @@ def _safe_dir_worker(job_id, snapshot=None):
         # v3.89：还有 pending 就不能标 done。暂停/续传时若旧线程的外层 copyfile 还在飞，
         # 工作线程会把整批文件「看到 stop 就原样保持 pending」，然后一路走到这里被标成
         # done —— 界面显示完成、其实还剩几十 GB 没下（实测 45 个 / 58 GB 被吞）。
-        still = [e for e in entries if e["status"] in ("pending", "deferred")]
+        # v4.15：running 也要算「没完成」。以前只看 pending/deferred，收尾时若还有在飞的
+        # 文件（status=running），任务会被标成 done —— 界面显示「209/212 完成」+ 错误行说
+        # 「3 个文件失败」，但详情里 failedFiles 是空的、只重试失败项也没得可重试。
+        still = unfinished_entries(entries)
         if still:
             _xfer_patch(job_id, state="stopped", phase="", speed=0, eta=None, curfile="",
                         bytes=got, total=total,

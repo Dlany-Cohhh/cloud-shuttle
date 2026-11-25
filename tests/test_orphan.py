@@ -144,3 +144,19 @@ class ActiveSpeedTest(unittest.TestCase):
     def test_missing_speed_counts_as_zero(self):
         d = {"transferring": [{"speed": None}, {"speed": 1024}, {}]}
         self.assertEqual(m.active_speed(d), 1024.0)
+
+class UnfinishedEntriesTest(unittest.TestCase):
+    def test_running_counts_as_unfinished(self):
+        """v4.15：收尾时在飞的文件不能再被写成 done。"""
+        es = [{"status": "done"}, {"status": "skipped"}, {"status": "running"},
+              {"status": "pending"}, {"status": "deferred"}]
+        got = [e["status"] for e in m.unfinished_entries(es)]
+        self.assertEqual(got, ["running", "pending", "deferred"])
+
+    def test_all_done_returns_empty(self):
+        es = [{"status": "done"}, {"status": "skipped"}]
+        self.assertEqual(m.unfinished_entries(es), [])
+
+    def test_empty_input(self):
+        self.assertEqual(m.unfinished_entries(None), [])
+        self.assertEqual(m.unfinished_entries([]), [])

@@ -1446,3 +1446,17 @@ mihomo 节点仍偶发 `SSL: UNEXPECTED_EOF_WHILE_READING`，一次失败就把�
 - 设置页新增「NAS 主页地址」，保存后侧边栏与移动端顶栏的「返回 NAS 主页」同时生效，带「用默认」「试打开」；
 - 前后端都只放行 `http://` / `https://` 绝对地址，拦截 `javascript:` 等伪协议。
 
+
+## v4.16 — 修「done 但仍有文件在飞」的自相矛盾（2026-11-25）
+
+现场：任务卡片显示「3 个文件失败，其余 209 个已完成」，可点开详情 `failedFiles` 是空的、
+`fileStats.failed = 0`、只剩 2 个 `pending`，「仅重试失败项」也没得重试。
+
+原因：worker 收尾判「还有没完成的文件」时只看 `pending` / `deferred`，漏了 `running`。
+只要收尾那一刻还有文件在飞（让位后第二轮重试、或被计成 running 的那几个），
+任务就会被写成 `done`，同时错误行还保留着几分钟前的「3 个文件失败」，两边对不上。
+
+- 新增 `unfinished_entries(entries)`：`pending` / `deferred` / `running` 都算未完成
+- 收尾判定改用它：只要还有在飞文件就落 `stopped`（「还有 N 个文件未完成」），不再写 `done`
+
+测试 332 → **335 项**（`test_orphan.py` 新增 3 项）。
