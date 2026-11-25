@@ -33,6 +33,13 @@ class NotifyEventTest(unittest.TestCase):
     def test_user_stop_is_silent(self):
         self.assertIsNone(m.notify_event({"state": "stopped", "error": ""}))
 
+    def test_restart_interruption_is_silent(self):
+        """v4.11：重启容器把在传任务标成 stopped + 「控制台重启过…」，那不是任务故障，别推「任务失败」。"""
+        for err in ("控制台重启过，下载已中断（点「继续」会跳过已完成文件接着传）",
+                    "控制台重启过，解压已中断（重新提交即可，已解出的文件会保留）",
+                    "守护进程重启过，任务已中断（点继续即可续传）"):
+            self.assertIsNone(m.notify_event({"state": "stopped", "error": err}))
+
     def test_running_and_queued_are_silent(self):
         for st in ("running", "queued", "paused", "stopping"):
             self.assertIsNone(m.notify_event({"state": st}))
@@ -92,6 +99,27 @@ class NotifyContentTest(unittest.TestCase):
         content = m.notify_content(job, "fail", "2026-11-25 10:00")
         self.assertIn("captcha token", content)
         self.assertIn("任务失败", m.notify_title(job, "fail"))
+
+    def test_dir_job_shows_file_counts(self):
+        job = {"id": 9, "state": "done", "filesDone": 3, "filesTotal": 3, "filesFailed": 0}
+        self.assertIn("3/3 个", m.notify_content(job, "success", "2026-11-25 10:00"))
+
+    def test_dir_job_shows_failed_count(self):
+        job = {"id": 10, "state": "error", "filesDone": 5, "filesTotal": 7,
+               "filesFailed": 2, "error": "2 个文件失败"}
+        content = m.notify_content(job, "fail", "2026-11-25 10:00")
+        self.assertIn("5/7 个（失败 2）", content)
+
+    def test_legacy_job_omits_file_row(self):
+        # v4.11：rclone 老任务没有文件级计数，不能显示「文件：0/0 个」
+        job = {"id": 11, "state": "done", "remote": "会员号", "subpath": "a/b"}
+        content = m.notify_content(job, "success", "2026-11-25 10:00")
+        self.assertNotIn("<b>文件</b>", content)
+        self.assertNotIn("0/0", content)
+
+    def test_single_file_job_says_one_file(self):
+        job = {"id": 12, "state": "done", "single_file": True, "bytes": 123456}
+        self.assertIn("<b>文件</b>：1 个", m.notify_content(job, "success", "2026-11-25 10:00"))
 
 
 class NotifyScanTest(unittest.TestCase):

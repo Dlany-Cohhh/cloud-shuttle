@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.10"
+APP_VERSION = "v4.11"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1568,6 +1568,9 @@ NOTIFY_SCAN_SEC = 5           # 巡检间隔（秒）
 NOTIFY_SEND_GAP = 1.0         # 一批里多条消息之间的间隔，别被 PushPlus 限流
 NOTIFY_SEEN_MAX = 400         # 去重表保留条数
 NOTIFY_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{16,64}$")
+# v4.11：容器/守护进程重启会把在传的任务标成「控制台重启过，下载已中断…」「守护进程重启过…」的 stopped，
+# 那不是任务故障，是运维动作 —— 照 fail 推的话，每次升级/重启都给你发一串「任务失败」。
+NOTIFY_RESTART_MARK = ("控制台重启过", "守护进程重启过")
 
 
 def pushplus_token_ok(t):
@@ -1577,14 +1580,17 @@ def pushplus_token_ok(t):
 
 def notify_event(job):
     """任务该不该发通知。success = 下完；fail = 失败，或「带错误信息的停止」（额度用尽 / 看门狗 / 重连用尽）。
-    用户自己点「停止」的 stopped 没有 error，不发。"""
+    用户自己点「停止」的 stopped 没有 error，不发；重启中断的 stopped 也不发（那是我们重启容器，不是任务出错）。"""
     j = job or {}
     st = str(j.get("state") or "")
+    err = str(j.get("error") or "").strip()
     if st == "done":
         return "success"
     if st == "error":
         return "fail"
-    if st == "stopped" and str(j.get("error") or "").strip():
+    if st == "stopped" and err:
+        if err.startswith(NOTIFY_RESTART_MARK):   # str.startswith 支持元组前缀
+            return None
         return "fail"
     return None
 
@@ -1634,14 +1640,26 @@ def notify_content(job, kind, when):
         src = str(j.get("src"))
     done, total = int(j.get("filesDone") or 0), int(j.get("filesTotal") or 0)
     failed = int(j.get("filesFailed") or 0)
+    # v4.11：只有目录任务（安全命名 v2）才有文件级计数，rclone 老任务这些字段缺省，
+    # 以前会显示「文件：0/0 个」—— 明显是错的，干脆不提这一行。
+    files = ""
+    if total:
+        files = "%d/%d 个" % (done, total)
+        if failed:
+            files += "（失败 %d）" % failed
+    elif done:
+        files = "%d 个" % done
+        if failed:
+            files += "（失败 %d）" % failed
+    elif j.get("single_file") and kind == "success":
+        files = "1 个"
     rows = [("任务", name),
             ("来源", src),
-            ("落盘", j.get("dest") or "-"),
-            ("文件", ("%d/%d 个" % (done, total)) if total else ("%d 个" % done)),
-            ("大小", "%s / %s" % (_human_bytes(j.get("bytes")), _human_bytes(j.get("total")))),
-            ("结束", when)]
-    if failed:
-        rows[3] = ("文件", "%d/%d 个（失败 %d）" % (done, total if total else done, failed))
+            ("落盘", j.get("dest") or "-")]
+    if files:
+        rows.append(("文件", files))
+    rows += [("大小", "%s / %s" % (_human_bytes(j.get("bytes")), _human_bytes(j.get("total")))),
+             ("结束", when)]
     if kind == "fail" and str(j.get("error") or "").strip():
         rows.append(("错误", str(j.get("error"))[:300]))
     body = "".join("<p><b>%s</b>：%s</p>" % (_h(k, 20), _h(v, 400)) for k, v in rows)
