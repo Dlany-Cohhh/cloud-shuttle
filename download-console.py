@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.17"
+APP_VERSION = "v4.18"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -2806,8 +2806,11 @@ def _start_safe_dir_job(job, s):
         if old_th and old_th.is_alive() and old_th is not threading.current_thread():
             old_th.join(SAFE_RESTART_WAIT)
         if old_th and old_th.is_alive():
-            job["error"] = ("上一轮的工作线程还在收尾（在飞传输已取消），%d 秒内没退出；"
-                            "等几秒再点「继续」" % SAFE_RESTART_WAIT)
+            # v4.18：等不到就排回队列，交给 scheduler 每 20 秒重试一次 —— 它一定会等到
+            # 旧线程退出，既不会两代并存，也不用用户手动再点「继续」。
+            job["state"] = "queued"
+            job["error"] = ("上一轮的工作线程还在收尾（在飞传输已取消），已排队，"
+                            "退出后自动开始")
             return False
     with SAFE_JOBS_LOCK:
         SAFE_JOBS[jid] = {"stop": threading.Event()}
@@ -9926,9 +9929,11 @@ def api(action, body):
                         j["_arTries"], j["_arErrAt"] = 0, None
                     if running < s["maxConcurrent"]:
                         if not launch_job(j, s):
-                            # v4.17：旧世代还没退出时拒绝启动（见 _start_safe_dir_job），
-                            # 把原因直接回给界面，而不是让它停在「已暂停」还以为是成功
+                            # v4.17/v4.18：旧世代还没退出时不会硬起（见 _start_safe_dir_job）。
+                            # 已排回队列的任务由 scheduler 自动重试，这里不算失败。
                             save_jobs(jobs)
+                            if j.get("state") == "queued":
+                                return {"ok": True, "queued": True}
                             return {"error": j.get("error") or "启动失败"}
                         running += 1
                     else:

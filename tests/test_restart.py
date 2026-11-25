@@ -72,7 +72,7 @@ class RestartGuardTest(unittest.TestCase):
         m.SAFE_THREADS[1].join(timeout=2)
 
     def test_second_start_refuses_when_old_hangs(self):
-        """旧线程不理会停信号（卡在收尾）：必须拒绝启动，而不是并行两代。"""
+        """旧线程不理会停信号（卡在收尾）：不硬起第二世代，改为排队等 scheduler 重试。"""
         m._safe_dir_worker = lambda job_id, snapshot=None: time.sleep(3)
         m.SAFE_RESTART_WAIT = 0.3
         job = _job(2)
@@ -81,6 +81,7 @@ class RestartGuardTest(unittest.TestCase):
         job2 = _job(2)
         self.assertFalse(m._start_safe_dir_job(job2, {}))
         self.assertIn("还在收尾", job2["error"])
+        self.assertEqual(job2["state"], "queued")     # v4.18：排回队列自动重试
         # 没有第二个线程抢进来
         self.assertEqual(len(m.SAFE_THREADS), 1)
 
