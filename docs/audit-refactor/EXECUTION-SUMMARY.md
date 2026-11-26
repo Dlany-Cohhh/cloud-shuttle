@@ -69,13 +69,21 @@
 | `scripts/field_check.py` | 高频 action 前后端字段名比对（候选生成器） | `python scripts/field_check.py` |
 | `docs/audit-refactor/tools/` | 函数规模排行、依赖簇并查集（原有） | — |
 
-## 六、遗留事项
+## 六、遗留事项（2026-11-26 部署后更新）
 
-1. **git 提交**：全部改动未提交（用户未授权提交操作）。建议拆两个提交：①阶段 1–2 修复（download-console.py 的 2 处 proxyScope + API.md + 回归测试 + 追踪表）；②阶段 3 铺平重构（可打 tag `v4.21-refactor`）。回滚：`git checkout -- download-console.py` 即整体回退。
-2. **前端冒烟**：本地 Windows 环境无 docker/rclone，服务端冒烟通过（未知 action / 静态页 / 只读 action）；**建议在 NAS 真实环境**过一遍五页冒烟（概览 / 云盘预览 / 任务 / 设置 / 检查更新）再发版。
-3. **build_release.py 兼容性**：它从单文件 AST 解析 `UPDATE_FILES`/`APP_VERSION`。本轮**未新增文件、未搬常量**，白名单与入口完全未动，协议零触碰；`UPDATE_FILES` 仍在原位（现 8965 行附近），构建不受影响。发版前跑一次 `python scripts/build_release.py` 确认出包即可。
-4. **在线更新**：本轮改动全在 `download-console.py` 单文件内，白名单覆盖，老容器在线更新路径不变。
+1. ~~git 提交~~ ✅ 已完成：两个提交（`991e3ff` 阶段 1–2 修复、`c09d2ca` 阶段 3 重构）+ tag `v4.21` 已推送 main。
+2. ~~前端冒烟~~ ✅ 已完成：**v4.21 已通过在线更新部署到 NAS（192.168.10.108）**，验证记录：
+   - 在线更新：`updatecheck`（force）→ `updateapply`，8 个白名单文件全部替换，备份 `update-20261126-042552`，容器自动重启；
+   - 版本：`consoleVersion: v4.21` ✅；
+   - 静态页：GET / 200（281 KB）✅；
+   - **proxyScope 修复实测生效**：jobs 响应带 `proxyScope: {mode: "direct", ...}` ✅；
+   - 分发正确性：未知 action 回「未知操作」✅（HANDLERS 注册表工作正常）；
+   - remotes 9 个、accounts 9 个、history 280 天、health 15.9 MB 全部正常；
+   - 任务连续性：控制台重启把 3 个 running 任务标记中断（设计预期，rclone 侧传输未停），`resume` 后 3 个任务全部恢复且进度推进（0.05–3.1 MB/s），已完成文件未重下；
+   - `updatecheck` 复查：`hasUpdate: false`（已是最新）。
+3. ~~build_release.py 兼容性~~ ✅ 已验证：出包正常（8 文件、327 KB），`UPDATE_FILES` 白名单解析未受重构影响。
+4. 回滚方式：NAS 控制台「设置 → 版本与更新 → 回滚上一版」，或恢复 `/app/update-backups/update-20261126-042552/`。
 
 ## 七、一句话总结
 
-**审计修了 4 处（2 文档 + 2 字段断链）、猎杀 0 缺陷证明基线健康、api() 从 2,114 行铺平成 5 行注册表且 96 action AST 逐分支等价、337 用例全绿——单文件分发协议零触碰，随时可在 NAS 上演练发版。**
+**审计修了 4 处（2 文档 + 2 字段断链）、猎杀 0 缺陷证明基线健康、api() 从 2,114 行铺平成 5 行注册表且 96 action AST 逐分支等价、337 用例全绿——单文件分发协议零触碰，已于 2026-11-26 经 GitHub Release v4.21 在线更新部署到 NAS 并通过全部冒烟。**
