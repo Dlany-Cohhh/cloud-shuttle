@@ -15,7 +15,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # 两者互不相通 —— 于是任务/历史全写进了容器内，docker rm 重建即全部丢失。
 # 现在统一跟随脚本所在目录（容器内 /app == 宿主机 /vol1/@appshare/zcode/console），
 # 需要时可再用环境变量 CONSOLE_DATA_DIR 覆盖。
-DATA_DIR = os.environ.get("CONSOLE_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+# v4.21 结构重构（STRUCTURE-OPTIMIZATION-GUIDE 4.2）：脚本所在目录唯一出处。
+# 全文 6 处 dirname(abspath(__file__)) 收敛引用本常量，行为完全不变。
+APP_HOME = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("CONSOLE_DATA_DIR") or APP_HOME
 JOBS_FILE = os.path.join(DATA_DIR, "jobs.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 SHARE_LIMITS_FILE = os.path.join(DATA_DIR, "share_limits.json")   # v3.42 分享提取上限
@@ -84,9 +87,9 @@ LEGACY_DATA_DIR = "/vol1/@appshare/zcode/console"   # 仅用于首次启动时�
 # 账号 → PikPak sub/邮箱（导入时用于识别身份）。优先放代码目录(=宿主机目录)，容器重建也不丢。
 ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_meta.json",
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
-                   os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
+                   os.path.join(APP_HOME, "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.20"
+APP_VERSION = "v4.21"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -8955,7 +8958,7 @@ UPDATE_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 UPDATE_TIMEOUT = int(os.environ.get("UPDATE_TIMEOUT", "15") or 15)
 UPDATE_MAX_BYTES = 24 * 1024 * 1024
 UPDATE_CONTAINER = os.environ.get("UPDATE_CONTAINER", "download-console")
-UPDATE_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+UPDATE_APP_DIR = APP_HOME
 UPDATE_STATE_FILE = os.path.join(DATA_DIR, "update-state.json")
 UPDATE_BACKUP_DIR = os.path.join(DATA_DIR, "update-backups")
 UPDATE_FILES = frozenset((
@@ -9257,370 +9260,206 @@ def update_rollback():
             st.get("from", "上一版"), "正在重启容器…" if st["restart"] else "请手动重启控制台后生效")}
 
 
-def api(action, body):
-    if action == "updatecheck":
-        return update_check(bool(body.get("force")))
-    if action == "updateapply":
-        return update_apply()
-    if action == "updatestate":
-        return update_state()
-    if action == "updaterollback":
-        return update_rollback()
 
-    if action == "localsize":
-        # v3.64 本地目录总大小：os.walk 实时求和（NAS 本地盘，不涉及 PikPak 请求）。
-        # 结果缓存 60s，避免连续刷新重复扫描大目录；隐藏项与临时文件不计入。
-        try:
-            p = safe_local_path(str(body.get("path") or ""))
-        except ValueError as e:
-            return {"error": mask_secret(str(e))}
-        rp = os.path.realpath(p)
-        if not os.path.isdir(rp):
-            return {"error": "目录不存在或已被移动"}
-        key = "localsize|" + rp
-        now = time.time()
-        with QUOTA_LOCK:
-            hit = QUOTA_CACHE.get(key)
-            if hit and now - hit[0] < 60:
-                return hit[1]
-        try:
-            r = _local_dir_size(rp, time.time() + 55)
-        except RuntimeError as e:
-            return {"error": str(e)}
-        with QUOTA_LOCK:
-            QUOTA_CACHE[key] = (now, r)
-        return r
+# ────────────────────────────────────────────────────────────────────────────
+# v4.21 结构重构：api() 铺平为注册表。原 2,114 行 if action == "..." 分支
+# 机械搬移为下面的 @action 函数（只搬不改，AST 逐分支等价断言见
+# docs/audit-refactor/）。注册顺序 = 原分支顺序。
+# ────────────────────────────────────────────────────────────────────────────
+HANDLERS = {}
 
-    if action == "dirsize":
-        # v3.60 目录总大小：rclone size 递归统计。前端勾选文件夹时按需调用，
-        # 结果缓存（QUOTA_CACHE 同池，key 前缀隔离）——浏览列表绝不触发，
-        # 同一目录反复勾选 / 下载预检不重复递归。
-        remote = str(body.get("remote") or "").strip()
-        sub = str(body.get("path") or "").strip("/")
-        if not remote:
-            return {"error": "缺少账号"}
-        if any(seg == ".." for seg in sub.split("/")) or "\x00" in sub:
-            return {"error": "路径不合法"}
-        key = "dirsize|%s|%s" % (remote, sub)
-        now = time.time()
-        with QUOTA_LOCK:
-            hit = QUOTA_CACHE.get(key)
-            if hit and now - hit[0] < QUOTA_TTL:
-                return hit[1]
-        fid = str(body.get("id") or "").strip()
-        r = None
-        # v3.62：优先走 PikPak 原生 API 递归（直读文件对象 size，不依赖 rclone 递归，
-        # 参考 PikPak_Enhancement_Master）；失败再回退 rclone size。
+
+def action(*names):
+    """把函数注册为 /api 的一个（或多个）action。"""
+    def deco(fn):
+        for n in names:
+            HANDLERS[n] = fn
+        return fn
+    return deco
+
+@action("updatecheck")
+def h_updatecheck(body):
+    return update_check(bool(body.get("force")))
+
+@action("updateapply")
+def h_updateapply(body):
+    return update_apply()
+
+@action("updatestate")
+def h_updatestate(body):
+    return update_state()
+
+@action("updaterollback")
+def h_updaterollback(body):
+    return update_rollback()
+
+@action("localsize")
+def h_localsize(body):
+    try:
+        p = safe_local_path(str(body.get("path") or ""))
+    except ValueError as e:
+        return {"error": mask_secret(str(e))}
+    rp = os.path.realpath(p)
+    if not os.path.isdir(rp):
+        return {"error": "目录不存在或已被移动"}
+    key = "localsize|" + rp
+    now = time.time()
+    with QUOTA_LOCK:
+        hit = QUOTA_CACHE.get(key)
+        if hit and now - hit[0] < 60:
+            return hit[1]
+    try:
+        r = _local_dir_size(rp, time.time() + 55)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    with QUOTA_LOCK:
+        QUOTA_CACHE[key] = (now, r)
+    return r
+
+@action("dirsize")
+def h_dirsize(body):
+    remote = str(body.get("remote") or "").strip()
+    sub = str(body.get("path") or "").strip("/")
+    if not remote:
+        return {"error": "缺少账号"}
+    if any(seg == ".." for seg in sub.split("/")) or "\x00" in sub:
+        return {"error": "路径不合法"}
+    key = "dirsize|%s|%s" % (remote, sub)
+    now = time.time()
+    with QUOTA_LOCK:
+        hit = QUOTA_CACHE.get(key)
+        if hit and now - hit[0] < QUOTA_TTL:
+            return hit[1]
+    fid = str(body.get("id") or "").strip()
+    r = None
+    # v3.62：优先走 PikPak 原生 API 递归（直读文件对象 size，不依赖 rclone 递归，
+    # 参考 PikPak_Enhancement_Master）；失败再回退 rclone size。
+    try:
+        if not fid:
+            fid = pk_walk(remote, sub)
+        r = {"bytes": int(_pk_folder_size(remote, fid, time.time() + PK_SIZE_DEADLINE)), "count": -1}
+    except Exception as e:
+        p = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=120)
+        out, err = _decode(p.stdout), _decode(p.stderr)
+        if p.returncode != 0:
+            return {"error": "目录大小统计失败：%s / %s" % (str(e)[:100], (err or out)[:100])}
         try:
-            if not fid:
-                fid = pk_walk(remote, sub)
-            r = {"bytes": int(_pk_folder_size(remote, fid, time.time() + PK_SIZE_DEADLINE)), "count": -1}
-        except Exception as e:
-            p = _rclone_run(["size", "--json", "%s:%s" % (remote, sub)], timeout=120)
-            out, err = _decode(p.stdout), _decode(p.stderr)
-            if p.returncode != 0:
-                return {"error": "目录大小统计失败：%s / %s" % (str(e)[:100], (err or out)[:100])}
+            d = json.loads(out)
+        except Exception:
+            return {"error": "解析 rclone size 输出失败"}
+        r = {"bytes": int(d.get("bytes") or 0), "count": int(d.get("count") or 0)}
+    with QUOTA_LOCK:
+        QUOTA_CACHE[key] = (now, r)
+    return r
+
+@action("remotes")
+def h_remotes(body):
+    p = subprocess.run(["docker", "exec", RCLONE_CONTAINER, "rclone", "listremotes"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    return {"remotes": [x.strip().rstrip(":") for x in p.stdout.splitlines() if x.strip()]}
+
+@action("proxycheck")
+def h_proxycheck(body):
+    return api_proxy_check()
+
+@action("foldercovers")
+def h_foldercovers(body):
+    name = str(body.get("remote") or "").strip()
+    raw = body.get("items") if isinstance(body.get("items"), list) else []
+    todo = [(str(x.get("name") or ""), str(x.get("id") or ""))
+            for x in raw[:12] if isinstance(x, dict) and x.get("name") and x.get("id")]
+    covers = {}
+    if name and todo:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(pair):
+            nm, fid = pair
+            # v3.80：同一文件夹的封面 1 小时内复用。以前每次切目录/切视图都重新
+            # 打 12 个 PikPak 请求，来回点几次就可能触发风控（表现为封面全空）。
+            ck = (name, fid)
+            hit = FOLDERCOVERS_CACHE.get(ck)
+            # 有封面缓存 1 小时；「确实没有封面」只缓存 5 分钟 —— 否则用户传了新
+            # 缩略图、云端才开始生成，要干等一小时才可能看到。
+            if hit and time.time() - hit[0] < (3600 if hit[1] else 300):
+                return nm, hit[1]
             try:
-                d = json.loads(out)
+                q = ("/drive/v1/files?parent_id=%s&limit=30&phase=PHASE_TYPE_COMPLETE"
+                     "&thumbnail_size=SIZE_SMALL" % urllib.parse.quote(fid))
+                code, d = pk_api(name, "GET", q, _timeout=6)
+                if code >= 400:
+                    return nm, ""
+                for f in (d.get("files") or []):
+                    u = str(f.get("thumbnail_link") or "")
+                    host = urllib.parse.urlparse(u).netloc.lower() if u.startswith("https://") else ""
+                    if host == "mypikpak.com" or host.endswith(".mypikpak.com"):
+                        FOLDERCOVERS_CACHE[ck] = (time.time(), u)
+                        return nm, u
+                FOLDERCOVERS_CACHE[ck] = (time.time(), "")   # 没有封面也记一笔，别反复问
             except Exception:
-                return {"error": "解析 rclone size 输出失败"}
-            r = {"bytes": int(d.get("bytes") or 0), "count": int(d.get("count") or 0)}
-        with QUOTA_LOCK:
-            QUOTA_CACHE[key] = (now, r)
-        return r
+                pass
+            return nm, ""
 
-    if action == "remotes":
-        p = subprocess.run(["docker", "exec", RCLONE_CONTAINER, "rclone", "listremotes"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
-        return {"remotes": [x.strip().rstrip(":") for x in p.stdout.splitlines() if x.strip()]}
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            for nm, u in ex.map(one, todo):
+                if u:
+                    covers[nm] = u
+    return {"covers": covers}
 
-    if action == "proxycheck":
-        return api_proxy_check()
+@action("dirs")
+def h_dirs(body):
+    name = body["remote"]
+    sub = body.get("path", "").strip("/")
+    lst, err = cloud_list(name, sub)
+    # v3.40：只有缩略图视图才拉封面元数据；列表视图仍是零额外开销
+    tmap = _pk_thumb_map(name, sub) if body.get("thumbs") else {}
+    local_idx = local_download_index()
+    items = []
+    for e in lst:
+        nm = str(e.get("Name") or "")
+        size = int(e.get("Size") or 0)
+        is_dir = bool(e.get("IsDir", False))
+        it = {"name": nm, "isdir": is_dir, "size": size, "id": str(e.get("ID") or ""),
+              # v3.43：带修改时间，导出 CSV / 目录树时用得上，列表页也可排序
+              "mtime": str(e.get("ModTime") or "")[:19],
+              # 目录不打标（要判「整个目录都下过」得递归列云端，太重）；
+              # 文件按「同名 + 同大小」判定，与一致性校验同一套归一化规则。
+              "downloaded": bool(not is_dir and size > 0
+                                 and (_norm_key(nm), size) in local_idx),
+              # v3.44：压缩包标记，前端据此显示「解压」按钮
+              "archive": bool(not is_dir and is_archive_name(nm)),
+              # v3.45：音视频标记。container = 浏览器能解的容器，
+              # 编码（h264/hevc）要等 playinfo 查详情才知道，这里不下结论。
+              "mediaKind": "" if is_dir else cloud_media_kind(nm),
+              "playable": bool(not is_dir and cloud_playable(nm))}
+        meta = tmap.get(nm)
+        if meta:
+            it.update(meta)
+        items.append(it)
+    items.sort(key=lambda x: (not x["isdir"], x["name"].lower()))
+    # 明确区分「加载失败」与「目录确实为空」，前端据此显示不同提示
+    return {"path": sub, "dirs": items,
+            "downloadedCount": sum(1 for x in items if x["downloaded"]),
+            "listError": ("列表加载失败：" + err) if err else ""}
 
-    if action == "foldercovers":
-        # v3.74：PikPak 顶层文件夹常没有 thumbnail_link，异步取内部第一张封面补齐。
-        # 单独接口、不阻塞 dirs；前端在缩略图视图加载完后请求并渐进填充。
-        name = str(body.get("remote") or "").strip()
-        raw = body.get("items") if isinstance(body.get("items"), list) else []
-        todo = [(str(x.get("name") or ""), str(x.get("id") or ""))
-                for x in raw[:12] if isinstance(x, dict) and x.get("name") and x.get("id")]
-        covers = {}
-        if name and todo:
-            from concurrent.futures import ThreadPoolExecutor
-
-            def one(pair):
-                nm, fid = pair
-                # v3.80：同一文件夹的封面 1 小时内复用。以前每次切目录/切视图都重新
-                # 打 12 个 PikPak 请求，来回点几次就可能触发风控（表现为封面全空）。
-                ck = (name, fid)
-                hit = FOLDERCOVERS_CACHE.get(ck)
-                # 有封面缓存 1 小时；「确实没有封面」只缓存 5 分钟 —— 否则用户传了新
-                # 缩略图、云端才开始生成，要干等一小时才可能看到。
-                if hit and time.time() - hit[0] < (3600 if hit[1] else 300):
-                    return nm, hit[1]
-                try:
-                    q = ("/drive/v1/files?parent_id=%s&limit=30&phase=PHASE_TYPE_COMPLETE"
-                         "&thumbnail_size=SIZE_SMALL" % urllib.parse.quote(fid))
-                    code, d = pk_api(name, "GET", q, _timeout=6)
-                    if code >= 400:
-                        return nm, ""
-                    for f in (d.get("files") or []):
-                        u = str(f.get("thumbnail_link") or "")
-                        host = urllib.parse.urlparse(u).netloc.lower() if u.startswith("https://") else ""
-                        if host == "mypikpak.com" or host.endswith(".mypikpak.com"):
-                            FOLDERCOVERS_CACHE[ck] = (time.time(), u)
-                            return nm, u
-                    FOLDERCOVERS_CACHE[ck] = (time.time(), "")   # 没有封面也记一笔，别反复问
-                except Exception:
-                    pass
-                return nm, ""
-
-            with ThreadPoolExecutor(max_workers=3) as ex:
-                for nm, u in ex.map(one, todo):
-                    if u:
-                        covers[nm] = u
-        return {"covers": covers}
-
-    if action == "dirs":
-        name = body["remote"]
+@action("start")
+def h_start(body):
+    with LOCK:
+        s = load_settings()
+        jobs = load_jobs()
+        running = sum(1 for j in jobs if j["state"] == "running")
         sub = body.get("path", "").strip("/")
-        lst, err = cloud_list(name, sub)
-        # v3.40：只有缩略图视图才拉封面元数据；列表视图仍是零额外开销
-        tmap = _pk_thumb_map(name, sub) if body.get("thumbs") else {}
-        local_idx = local_download_index()
-        items = []
-        for e in lst:
-            nm = str(e.get("Name") or "")
-            size = int(e.get("Size") or 0)
-            is_dir = bool(e.get("IsDir", False))
-            it = {"name": nm, "isdir": is_dir, "size": size, "id": str(e.get("ID") or ""),
-                  # v3.43：带修改时间，导出 CSV / 目录树时用得上，列表页也可排序
-                  "mtime": str(e.get("ModTime") or "")[:19],
-                  # 目录不打标（要判「整个目录都下过」得递归列云端，太重）；
-                  # 文件按「同名 + 同大小」判定，与一致性校验同一套归一化规则。
-                  "downloaded": bool(not is_dir and size > 0
-                                     and (_norm_key(nm), size) in local_idx),
-                  # v3.44：压缩包标记，前端据此显示「解压」按钮
-                  "archive": bool(not is_dir and is_archive_name(nm)),
-                  # v3.45：音视频标记。container = 浏览器能解的容器，
-                  # 编码（h264/hevc）要等 playinfo 查详情才知道，这里不下结论。
-                  "mediaKind": "" if is_dir else cloud_media_kind(nm),
-                  "playable": bool(not is_dir and cloud_playable(nm))}
-            meta = tmap.get(nm)
-            if meta:
-                it.update(meta)
-            items.append(it)
-        items.sort(key=lambda x: (not x["isdir"], x["name"].lower()))
-        # 明确区分「加载失败」与「目录确实为空」，前端据此显示不同提示
-        return {"path": sub, "dirs": items,
-                "downloadedCount": sum(1 for x in items if x["downloaded"]),
-                "listError": ("列表加载失败：" + err) if err else ""}
-
-    if action == "start":
-        with LOCK:
-            s = load_settings()
-            jobs = load_jobs()
-            running = sum(1 for j in jobs if j["state"] == "running")
-            sub = body.get("path", "").strip("/")
-            name = basename_of(sub) if sub else body["remote"]
-            folder = str(body.get("folder") or "").strip("/")
-            # v3.87：folder 允许最多 4 层（每层仍按原来的安全字符集校验），
-            # 这样 API / 批量脚本能精确指定「Downloads/子目录」，与历史任务的 dest 对齐。
-            if folder:
-                parts = folder.split("/")
-                if len(parts) > 4 or not all(
-                        p and re.match(r'^[\w\u4e00-\u9fff][\w\u4e00-\u9fff -]{0,60}$', p)
-                        for p in parts):
-                    return {"error": "保存目录名不合法（最多 4 层，每层中英文/数字/空格/连字符）"}
-            # v3.57 可选存储空间：body["volume"] 传 rclone 侧根（localdirs 返回的 volumes），
-            # 缺省 = 主卷；保护门槛按目标卷的有效剩余判断，不再一刀切拦全部任务
-            vol_req = str(body.get("volume") or "").strip().rstrip("/")
-            vols = STATE.get("volumePairs") or [LEGACY_VOLUME]
-            if vol_req:
-                vol = next((p for p in vols if p["rclone"] == vol_req), None)
-                if not vol:
-                    return {"error": "未知存储空间：%s" % vol_req}
-            else:
-                vol = vols[0]
-            vroot = vol["rclone"]
-            # v4.07：不可写的卷一律不给建任务。现场那个假卷「能建 0 字节文件、写数据 EPERM」，
-            # 旧版放行后表现就是 0.0% 无限重试；这里提前拦住，错误信息直接指向根本原因。
-            if not vol.get("writable", True):
-                return {"error": "「%s」（%s）当前不可写：能创建文件、但写数据被系统拒绝"
-                                 "（operation not permitted）。这通常不是磁盘满或账号问题，"
-                                 "而是宿主上这个目录已经失效（换盘 / 卷被卸载后留下的空壳），"
-                                 "容器还 bind 在上面。请改选其它存储空间；"
-                                 "或在 NAS 上把该容器的挂载路径改到真实卷后重建容器。"
-                                 % (vol.get("name") or vroot, vroot)}
-            vf = volume_effective_free(vol, s)
-            disk_min = float(s["diskMinGB"] or 0)
-            if vf is not None and vf < disk_min:
-                return {"error": "「%s」空间保护中（剩余 %.1f GB），请清理该卷或到设置里调低阈值"
-                                 % (vol.get("name") or vroot, vf)}
-            # v3.87：没指定 folder 时落到「下载子目录/任务名」，与历史任务（/data/Downloads/xxx）
-            # 保持一致。v3.83 起这里少了 Downloads 层，新建任务会写进卷根（/data/绿帽学院），
-            # 与已有数据不是同一目录，rclone 无从判断「已下过」，只能整目录重下。
-            src = "%s:%s" % (body["remote"], sub) if sub else "%s:" % body["remote"]
-            base_dest = vroot + "/" + (folder if folder else (DOWNLOAD_SUBDIR + "/" + name))
-            force = bool(body.get("force"))
-            warn = ""
-            # v3.93：同一个源重复建任务只会抢带宽、还可能两个线程同时写同一个文件；
-            # 而旧版 dedupe_dest 会在这时造出「目录-2」，等于把已有数据全部重下一遍。
-            live = next((j for j in jobs if j.get("src") == src
-                         and j.get("state") in ("running", "queued")), None)
-            if live and not force:
-                return {"error": "同一个源已有任务在跑（id %s，落点 %s）。重复建任务只会抢带宽、"
-                                 "还可能同时写同一个文件；等它结束，或带 force=true 才并行。"
-                                 % (live.get("id"), live.get("dest")),
-                        "duplicate": True, "existing": live.get("id")}
-            prev = next((j for j in jobs if j.get("src") == src
-                         and j.get("state") not in ("running", "queued")
-                         and not j.get("single_file")), None)
-            if force:
-                dest = base_dest
-            elif prev and str(prev.get("dest") or "").startswith(vroot + "/"):
-                # 直接沿用同源旧任务的落点：既不会造出「-2」，也能按名字+大小跳过已下好的文件
-                dest = prev["dest"]
-                warn = ("沿用同源旧任务 %s 的落点 %s（已完成的文件会按「名字+大小」跳过，不会重下）"
-                        % (prev.get("id"), dest))
-            else:
-                dest = dedupe_dest(base_dest, fs=vroot)
-                if dest != base_dest:
-                    warn = ("目标目录 %s 已存在，落点改为 %s：这一份会从头下载。"
-                            "要接着用已有数据请显式指定 folder，或带 force=true"
-                            % (base_dest, dest))
-            # 必须先定下 proxy：预检与后续 launch_job 都依赖它。
-            # v3.31 曾把赋值放在预检之后，导致批量下载全程抛
-            # UnboundLocalError: cannot access local variable 'proxy'。
-            proxy = bool(body.get("proxy", s["downloadProxy"]))
-            # v3.43 下载过滤：规范化后随任务一起落盘，续传 / 重启都能沿用同一套规则
-            flt = norm_download_filter(body.get("filter"))
-            # v4.05：预检走在 launch_job 之前，而 5573 只在 launch_job 里按需拉起。
-            # rclone-backend 重启后 5573 就没了，此时任何「走代理」的新任务都会在预检
-            # 阶段报「connection refused」，看起来像网络故障。所以这里也先确保 5573 在。
-            if proxy and not ensure_proxy_rc():
-                return {"error": "代理守护进程（%d）启动失败，请检查代理客户端与 %s 容器"
-                                 % (PROXY_RC_PORT, RCLONE_CONTAINER)}
-            # 预检源：sub 可能是目录也可能是单个文件（cloud_precheck 内部区分）
-            pre_list, pre_err, is_file = cloud_precheck(body["remote"], sub, proxy)
-            if pre_err:
-                return {"error": "预检源目录失败: %s" % pre_err}
-            if not pre_list:
-                return {"error": "源目录为空（%s:%s），没有可下载的文件" % (body["remote"], sub or "/")}
-            job = {"id": int(time.time() * 1000), "jobid": None, "remote": body["remote"],
-                   "subpath": sub, "src": src,
-                   "mode": body.get("mode", "copy"), "dest": dest, "state": "queued",
-                   "started": time.strftime("%m-%d %H:%M"), "bytes": 0, "total": 0,
-                   "speed": 0, "eta": None, "error": "", "proxy": proxy,
-                   # v3.93：记下建任务时的版本，列表里可区分「哪版建的」同名任务
-                   "createdVersion": APP_VERSION, "createdAt": int(time.time() * 1000)}
-            if flt:
-                job["filter"] = flt
-                job["filterText"] = describe_filter(flt)
-            # v3.83：安全命名只作用于「新创建」的任务；老任务没有 naming 字段，
-            # 继续走 v3.82 及以前的原样命名逻辑，升级不会影响在跑 / 排队的旧任务。
-            if s.get("safeNaming", True):
-                job["naming"] = "v2"
-            if is_file:
-                parent, _, leaf = sub.rpartition("/")
-                job["single_file"] = True
-                job["leaf"] = leaf
-                job["src_dir"] = "%s:%s" % (body["remote"], parent)
-                if job.get("naming") == "v2":
-                    # 源端仍用 leaf（原名），只有落盘名换成安全名
-                    job["safe_leaf"] = safe_basename(
-                        leaf, body["remote"], sub,
-                        max_bytes=int(s.get("safeNameMaxBytes") or 180),
-                        hash_len=int(s.get("safeNameHashLen") or 12))
-                # v4.08：单文件任务的「显示落点」必须等于「真实落点」。
-                # 旧版未指定 folder 时 dst_dir 直接取卷根，rclone 实际写的是
-                # /data/xxx.mp4.partial，而卡片上显示 /data/Downloads/xxx.mp4 ——
-                # 差一层目录。出现 operation not permitted 这类落盘错误时，
-                # 报错路径和界面路径对不上，排障会被带偏（现场已踩过一次）。
-                if folder:
-                    dst_dir = dest                      # 指定保存目录：dest 就是该目录
-                else:
-                    dst_dir = single_file_dst_dir(vroot, folder, parent, dest)
-                job["dst_dir"] = dst_dir
-                dest = dst_dir + "/" + (job.get("safe_leaf") or leaf)
-                job["dest"] = dest
-            launched_ok = True
-            if running < s["maxConcurrent"]:
-                launched_ok = launch_job(job, s)
-            jobs.append(job)
-            save_jobs(jobs)
-            if not launched_ok:
-                return {"error": "启动失败: %s" % (job.get("error") or "未知原因"), "job": job}
-            if warn:
-                return {"job": job, "warn": warn}
-            return {"job": job}
-
-    # ── v4.01 分账号下载：只读预检 ──────────────────────────────────────────
-    # 把「这 N 个账号能不能一起下、各自分多少」先算清楚再动手，避免建完任务才发现
-    # 某个账号根本没转存这份资源（历史遗留问题里最常见的一条）。
-    if action == "splitscan":
-        remotes = [str(x).strip() for x in (body.get("remotes") or []) if str(x).strip()]
-        remotes = list(dict.fromkeys(remotes))
-        sub = str(body.get("path") or "").strip("/")
-        if len(remotes) < 2:
-            return {"error": "至少要选 2 个账号才有意义（单账号请用普通下载）"}
-        if len(remotes) > SPLIT_MAX_ACCOUNTS:
-            return {"error": "一次最多 %d 个账号" % SPLIT_MAX_ACCOUNTS}
-        avail = set(pikpak_remotes())
-        bad = [r for r in remotes if r not in avail]
-        if bad:
-            return {"error": "这些账号不是可用的 PikPak 账号：%s" % "、".join(bad)}
-        s = load_settings()
-        proxy = bool(body.get("proxy", s["downloadProxy"]))
-        flt = norm_download_filter(body.get("filter"))
-        out = split_scan(remotes, sub, flt, proxy)
-        out["filterText"] = describe_filter(flt)
-        return out
-
-    # ── v4.01 分账号下载：按文件拆分建任务 ──────────────────────────────────
-    if action == "splitstart":
-        remotes = [str(x).strip() for x in (body.get("remotes") or []) if str(x).strip()]
-        remotes = list(dict.fromkeys(remotes))
-        sub = str(body.get("path") or "").strip("/")
-        if len(remotes) < 2:
-            return {"error": "至少要选 2 个账号才能分账号下载"}
-        if len(remotes) > SPLIT_MAX_ACCOUNTS:
-            return {"error": "一次最多 %d 个账号" % SPLIT_MAX_ACCOUNTS}
-        avail = set(pikpak_remotes())
-        bad = [r for r in remotes if r not in avail]
-        if bad:
-            return {"error": "这些账号不是可用的 PikPak 账号：%s" % "、".join(bad)}
-        s = load_settings()
-        proxy = bool(body.get("proxy", s["downloadProxy"]))
-        flt = norm_download_filter(body.get("filter"))
-        scan = split_scan(remotes, sub, flt, proxy, want_files=True)
-        if not scan["fileCount"]:
-            detail = "；".join("%s：%s" % (x["remote"], x["error"] or "没有文件")
-                              for x in scan["accounts"] if x["state"] != "ok")
-            return {"error": "源目录在这些账号里都没有可下载的文件" + ("（" + detail + "）" if detail else ""),
-                    "scan": scan}
-        if not scan["consistent"]:
-            return {"error": "这些账号看到的文件集合不一致，不能直接分：" +
-                             "；".join(scan["warnings"] or ["有账号看不到该目录"]),
-                    "scan": scan}
-        files = scan.get("files") or split_apply_filter(split_list_files(remotes[0], sub, proxy), flt)
-        scan.pop("files", None)
-
-        if len(files) < SPLIT_MIN_FILES:
-            return {"error": "只有 %d 个文件，分给 %d 个账号没有收益（建议直接普通下载）"
-                             % (len(files), len(remotes)), "scan": scan}
-        assign, stats = split_assign(files, remotes)
-        if not all(assign.get(r) for r in remotes):
-            return {"error": "文件数（%d）少于账号数（%d），无法保证每个账号都有活干；"
-                             "请减少账号或改用普通下载" % (len(files), len(remotes))}
-
+        name = basename_of(sub) if sub else body["remote"]
         folder = str(body.get("folder") or "").strip("/")
+        # v3.87：folder 允许最多 4 层（每层仍按原来的安全字符集校验），
+        # 这样 API / 批量脚本能精确指定「Downloads/子目录」，与历史任务的 dest 对齐。
         if folder:
             parts = folder.split("/")
             if len(parts) > 4 or not all(
                     p and re.match(r'^[\w\u4e00-\u9fff][\w\u4e00-\u9fff -]{0,60}$', p)
                     for p in parts):
                 return {"error": "保存目录名不合法（最多 4 层，每层中英文/数字/空格/连字符）"}
+        # v3.57 可选存储空间：body["volume"] 传 rclone 侧根（localdirs 返回的 volumes），
+        # 缺省 = 主卷；保护门槛按目标卷的有效剩余判断，不再一刀切拦全部任务
         vol_req = str(body.get("volume") or "").strip().rstrip("/")
         vols = STATE.get("volumePairs") or [LEGACY_VOLUME]
         if vol_req:
@@ -9630,1747 +9469,1954 @@ def api(action, body):
         else:
             vol = vols[0]
         vroot = vol["rclone"]
+        # v4.07：不可写的卷一律不给建任务。现场那个假卷「能建 0 字节文件、写数据 EPERM」，
+        # 旧版放行后表现就是 0.0% 无限重试；这里提前拦住，错误信息直接指向根本原因。
+        if not vol.get("writable", True):
+            return {"error": "「%s」（%s）当前不可写：能创建文件、但写数据被系统拒绝"
+                             "（operation not permitted）。这通常不是磁盘满或账号问题，"
+                             "而是宿主上这个目录已经失效（换盘 / 卷被卸载后留下的空壳），"
+                             "容器还 bind 在上面。请改选其它存储空间；"
+                             "或在 NAS 上把该容器的挂载路径改到真实卷后重建容器。"
+                             % (vol.get("name") or vroot, vroot)}
         vf = volume_effective_free(vol, s)
         disk_min = float(s["diskMinGB"] or 0)
         if vf is not None and vf < disk_min:
             return {"error": "「%s」空间保护中（剩余 %.1f GB），请清理该卷或到设置里调低阈值"
                              % (vol.get("name") or vroot, vf)}
-
-        name = basename_of(sub) if sub else remotes[0]
-        # 分片任务一律落同一个目录：dedupe_dest 在这里是**反效果** —— 它会把第二个
-        # 任务改到「目录-2」，等于把一份资源拆进两个文件夹，校验和对账全乱。
-        dest = vroot + "/" + (folder if folder else (DOWNLOAD_SUBDIR + "/" + name))
-        warn = []
-        try:
-            dest_abs = local_dest(dest)
-            if dest_abs and os.path.isdir(dest_abs) and os.listdir(dest_abs):
-                warn.append("目标目录 %s 已有文件：同名同大小的会被跳过（等同续传），"
-                            "不会重复下载" % dest)
-        except Exception:
-            pass
-
-        with LOCK:
-            jobs = load_jobs()
-            for r in remotes:
-                src = split_src(r, sub)
-                live = next((j for j in jobs if j.get("src") == src
-                             and j.get("state") in ("running", "queued")), None)
-                if live and not bool(body.get("force")):
-                    return {"error": "账号 %s 已有同源任务在跑（#%s，落点 %s）。"
-                                     "先停掉它再分账号，或带 force=true 强制并行。"
-                                     % (r, live.get("id"), live.get("dest")),
-                            "duplicate": True, "existing": live.get("id")}
-            made = make_split_jobs(remotes, sub, assign, stats, dest,
-                                   proxy=proxy, flt=flt, s=s)
-            failed = []
-            for job in made:
-                # 分账号是「同一份资源的分片」，共用一个源目录，不受 maxConcurrent 限制：
-                # 排队等前一片跑完就完全失去了并行的意义。每片仍是独立账号、独立连接预算。
-                if not launch_job(job, s):
-                    failed.append({"remote": job["remote"],
-                                   "error": job.get("error") or "启动失败"})
-            jobs.extend(made)
-            save_jobs(jobs)
-        ok = [j for j in made if j.get("state") != "error"]
-        if not ok:
-            return {"error": "全部分片都启动失败：" +
-                             "；".join("%s %s" % (x["remote"], x["error"]) for x in failed),
-                    "jobs": made}
-        return {"jobs": made, "dest": dest, "fileCount": len(files),
-                "bytes": sum(int(f.get("Size") or 0) for f in files),
-                "assign": [{"remote": r, "files": stats[r]["files"],
-                            "bytes": stats[r]["bytes"]} for r in remotes],
-                "failed": failed, "warnings": warn}
-
-    if action == "scanpath":
-        return cloud_scan(body["remote"], body.get("path", ""), body.get("depth", 6))
-
-    if action == "myshares":
-        only = str(body.get("remote") or "").strip()
-        names = [only] if only else pikpak_remotes()
-        if not names:
-            return {"error": "没有可用的 PikPak 账号"}
-        shares, errors = [], []
-        for n in names:
-            try:
-                rows = pk_share_list(n, force=bool(body.get("force")))
-                shares.extend(map_my_share(n, s) for s in rows if isinstance(s, dict))
-            except Exception as e:
-                errors.append("%s: %s" % (n, str(e)[:100]))
-        lim = load_share_limits()
-        return {"shares": shares, "limits": lim["limits"], "log": lim["log"][:20],
-                "autoCancel": bool(load_settings().get("shareAutoCancel")),
-                "errors": errors}
-
-    if action == "sharelimit":
-        remote = str(body.get("remote") or "").strip()
-        sid = str(body.get("shareId") or "").strip()
-        limit = max(0, min(100000, _as_int(body.get("limit"))))
-        if not remote or not sid:
-            return {"error": "缺少账号或分享 ID"}
-        key = _share_limit_key(remote, sid)
-        with SHARE_LIMITS_LOCK:
-            d = load_share_limits()
-            if limit <= 0:
-                d["limits"].pop(key, None)      # 0 = 清除上限
-            else:
-                d["limits"][key] = {"remote": remote, "shareId": sid,
-                                    "limit": limit, "setAt": time.time()}
-            save_share_limits(d)
-            out = dict(d["limits"])
-        return {"ok": True, "limits": out}
-
-    if action == "sharedel":
-        remote = str(body.get("remote") or "").strip()
-        sid = str(body.get("shareId") or "").strip()
-        if not remote or not sid:
-            return {"error": "缺少账号或分享 ID"}
-        if not pk_share_delete(remote, sid):
-            return {"error": "取消分享失败（链接可能已失效或账号凭证异常）"}
-        with SHARE_LIMITS_LOCK:
-            MYSHARES_CACHE.pop(remote, None)
-            d = load_share_limits()
-            d["limits"].pop(_share_limit_key(remote, sid), None)
-            d["log"].insert(0, {"at": time.strftime("%m-%d %H:%M"), "remote": remote,
-                                "shareId": sid, "title": "", "restores": 0,
-                                "limit": 0, "ok": True, "manual": True})
-            d["log"] = d["log"][:50]
-            save_share_limits(d)
-        return {"ok": True}
-
-    if action == "shareparse":
-        # 只读：解析链接 / 取 pass_code_token / 列分享内某一层，绝不写入网盘
-        name = str(body.get("remote") or "").strip()
-        sid, pcode, err = parse_share_input(body.get("text"), body.get("passCode"))
-        if err:
-            return {"error": err}
-        if not name:
-            return {"error": "请选择用于查看分享的账号"}
-        tok = str(body.get("passCodeToken") or "").strip()
-        # v3.81：双路尝试。第一路跟随全局网络模式（通常直连）；若 PikPak 因出口地区
-        # 返回 PROHIBITED / NOT_FOUND，且设置里「预置」了代理地址，就只让分享解析
-        # 改走这个地址重试 —— 下载、云盘数据、封面都保持直连，不被慢代理拖累。
-        # proxyUrl 本来就是「可预置、可不启用」的字段，这里复用它，无需新增设置项。
-        current = proxy_url()
-        preset = (str(load_settings().get("proxyUrl") or "").strip()
-                  or str(os.environ.get("PROXY_URL") or "").strip())
-        if preset.lower() in PROXY_OFF_WORDS or not PROXY_URL_RE.match(preset):
-            preset = ""
-        routes = [(True, "跟随全局（%s）" % ("代理" if current else "直连"))]
-        if preset and preset != current:
-            routes.append((preset, "分享专用代理 " + preset))
-        last, tried = "", []
-        for px, via in routes:
-            tried.append(via)
-            try:
-                info = pk_share_info(name, sid, pcode, proxy=px, via=via) if not tok else {
-                    "shareId": sid, "passCode": pcode, "passCodeToken": tok,
-                    "title": str(body.get("title") or "")[:120], "shareStatus": "OK",
-                    "shareStatusText": "", "shareUser": "", "via": via}
-                items, nxt = pk_share_detail(name, sid, info["passCodeToken"],
-                                             str(body.get("parentId") or ""),
-                                             str(body.get("pageToken") or ""),
-                                             proxy=px)
-                return {"ok": True, "info": info, "items": items,
-                        "nextPageToken": nxt, "parentId": str(body.get("parentId") or ""),
-                        "tried": tried}
-            except Exception as e:
-                last = str(e)[:300]
-                # 只有「换出口可能有救」的状态才重试；提取码 / 凭证错误重试无意义
-                if not any(k in last for k in ("PROHIBITED", "NOT_FOUND", "非 JSON")):
-                    break
-        if len(tried) > 1:
-            last += "；已尝试 %d 条路径：%s" % (len(tried), " → ".join(tried))
-        return {"error": last, "tried": tried}
-
-    if action == "sharesave":
-        name = str(body.get("remote") or "").strip()
-        sid = str(body.get("shareId") or "").strip()
-        tok = str(body.get("passCodeToken") or "").strip()
-        ids = [str(x) for x in (body.get("fileIds") or []) if x]
-        dst_path = str(body.get("dstPath") or "").strip("/")
-        if not name or not sid or not tok:
-            return {"error": "缺少分享信息或目标账号，请先重新解析链接"}
-        if not ids:
-            return {"error": "请至少勾选一个要转存的文件或文件夹"}
-        if len(ids) > 200:
-            return {"error": "一次最多转存 200 项，请分批选择"}
-        if ".." in dst_path.split("/"):
-            return {"error": "目标目录不能包含 .."}
-        with LOCK:
-            dup = next((j for j in load_jobs() if j.get("kind") == "xfer"
-                        and j.get("method") == "externalshare"
-                        and j.get("shareId") == sid and j.get("remote") == name
-                        and j.get("state") in ("running", "queued")), None)
-        if dup:
-            return {"error": "这个分享正在转存中（任务 #%s）" % dup["id"]}
-        job = {"id": int(time.time() * 1000), "jobid": None, "kind": "xfer",
-               "method": "externalshare", "mode": "copy", "remote": name,
-               "subpath": str(body.get("title") or sid)[:120], "src": "share:" + sid,
-               "dstRemote": name, "dstPath": dst_path,
-               "dest": "%s:%s" % (name, dst_path or "/"),
-               "shareId": sid, "passCodeToken": tok, "fileIds": ids,
-               "ancestorIds": [str(x) for x in (body.get("ancestorIds") or []) if x][:20],
-               "state": "queued", "phase": "restore",
-               "started": time.strftime("%m-%d %H:%M"), "bytes": 0, "total": 0,
-               "single_file": False, "speed": 0, "eta": None, "error": "",
-               "proxy": False, "srcCount": len(ids)}
-        with LOCK:
-            jobs = load_jobs()
-            jobs.append(job)
-            save_jobs(jobs)
-        threading.Thread(target=_sharesave_worker, args=(job["id"],), daemon=True).start()
-        return {"job": job}
-
-    if action == "xferstart":
-        src_remote = str(body.get("srcRemote") or "").strip()
-        dst_remote = str(body.get("dstRemote") or "").strip()
-        src_path = str(body.get("path") or "").strip("/")
-        dst_path = str(body.get("dstPath") or "").strip("/")
-        mode = "move" if str(body.get("mode")) == "move" else "copy"
-        method = "relay" if str(body.get("method")) == "relay" else "share"
-        if not src_remote or not src_path:
-            return {"error": "请选择要转移的源文件或文件夹"}
-        if not dst_remote:
-            return {"error": "请选择目标账号"}
-        if dst_remote == src_remote:
-            if dst_path == src_path:
-                return {"error": "目标与源是同一个位置"}
-            if (dst_path + "/").startswith(src_path + "/"):
-                return {"error": "不能转移到源目录自身或其子目录"}
-        if ".." in dst_path.split("/"):
-            return {"error": "目标目录不能包含 .."}
-        src_ref = "%s:%s" % (src_remote, src_path)
-        with LOCK:
-            dup = next((j for j in load_jobs() if j.get("kind") == "xfer"
-                        and j.get("state") in ("running", "queued")
-                        and j.get("src") == src_ref), None)
-        if dup:
-            return {"error": "这个路径已经在转移中（任务 #%s）" % dup["id"]}
-        proxy = bool(body.get("proxy", load_settings()["downloadProxy"]))
-        pre, perr, is_file = cloud_precheck(src_remote, src_path, proxy)
-        if perr:
-            return {"error": "预检源路径失败：%s" % perr}
-        if not pre:
-            return {"error": "源路径不存在或为空，没有可转移的内容"}
-        fsize = int((pre[0] or {}).get("Size") or 0) if is_file else 0
-        if is_file and dst_remote == src_remote:
-            parent = src_path.rpartition("/")[0]
-            if dst_path == parent:
-                return {"error": "目标与源是同一个位置，换个目录再试"}
-        job = {"id": int(time.time() * 1000), "jobid": None, "kind": "xfer",
-               "method": method, "remote": src_remote, "subpath": src_path,
-               "src": src_ref, "dstRemote": dst_remote, "dstPath": dst_path,
-               "dest": "%s:%s" % (dst_remote, dst_path or "/"),
-               "mode": mode, "state": "queued", "phase": "share",
-               "started": time.strftime("%m-%d %H:%M"), "bytes": 0,
-               "total": fsize, "single_file": is_file,
-               "speed": 0, "eta": None, "error": "", "proxy": proxy,
-               "srcCount": 1 if is_file else len(pre)}
-        with LOCK:
-            jobs = load_jobs()
-            jobs.append(job)
-            save_jobs(jobs)
-        threading.Thread(target=_share_worker if method == "share" else _xfer_worker,
-                         args=(job["id"],), daemon=True).start()
-        return {"job": job}
-
-    if action == "jobs":
-        # v3.80：前端每 2s 轮询一次，而 job_live 单个任务最坏 8s+8s（job/status +
-        # core/stats）。同时跑 3 个任务时这里会串行 40s+，接口超过前端 8s 超时，
-        # 界面直接报「请求超时」，且长时间持 LOCK 把「停止/暂停」也堵住。
-        # 现在给整轮查询一个总预算，超预算的 running 任务本轮沿用上次状态。
-        # v3.98：真正的原因不是"轮询太频繁"，而是 job_live 整段跑在 LOCK 里 ——
-        # 一个慢 rc 调用就同时卡住 stop/save/其它标签页的轮询，8 秒超时横幅就是这么来的。
-        # 现在：LOCK 只在读盘/写盘那一瞬间持有，job_live 在锁外跑完再把进度合并写回；
-        # 1.2 秒内的重复轮询直接复用上一份结果（多标签页/一秒一刷不会重复打 rc）。
-        now = time.time()
-        snap = JOBS_SNAP.get("payload")
-        if snap is not None and now - JOBS_SNAP["ts"] < JOBS_LIVE_TTL:
-            return dict(snap, remux=remux_public())
-        with LOCK:
-            jobs = load_jobs()
-            # v3.93：列表里补版本/创建时间，同名任务才分得清「哪版建的」
-            for j in jobs:
-                if not j.get("version"):
-                    j["version"] = j.get("createdVersion") or "旧版"
-        try:
-            before = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
-        except Exception:
-            before = None
-        deadline = time.time() + 4.0
-        for j in jobs:
-            if time.time() > deadline and j.get("state") == "running":
-                continue          # 本轮跳过，保留上次落盘的状态
-            try:
-                job_live(j)
-            except Exception:
-                pass              # 单个任务查失败不该让整张列表报错
-        try:
-            after = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
-        except Exception:
-            after = None
-        # 只写回「本轮真的查到进度」的那几个字段，避免把别人刚改的（停止/改名/删任务）覆盖掉
-        if before is None or after is None or before != after:
-            with LOCK:
-                cur = load_jobs()
-                by_id = {}
-                for j in cur:
-                    by_id[j.get("id")] = j
-                for j in jobs:
-                    tgt = by_id.get(j.get("id"))
-                    if isinstance(tgt, dict):
-                        _merge_live_job(tgt, j)
-                save_jobs(cur)
-        payload = {"jobs": [{k: v for k, v in j.items() if k != "fileList"} for j in jobs],
-                   "settings": load_settings(),
-                   "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
-                             "diskTotal": STATE.get("diskTotal"), "storages": storages(),
-                             "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
-                   "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
-                   "remux": remux_public()}
-        JOBS_SNAP.update({"ts": time.time(), "payload": payload})
-        return payload
-
-    if action == "stop":
-        tid = body.get("id")
-        with LOCK:
-            jobs = load_jobs()
-            for j in jobs:
-                if j["id"] == tid and j["state"] in ("running", "queued"):
-                    stop_job_entry(j)
-            save_jobs(jobs)
-        # v3.93：等 worker 线程真正退出后再返回。在飞的 copyfile 会被 job/stop 打断，
-        # 以前这里立刻返回，界面显示「已暂停」但 rclone 里还在传，下一次建任务就抢带宽。
-        waited, alive = wait_worker_exit(tid, timeout=float(body.get("wait") or 10))
-        return {"ok": True, "waited": waited, "alive": alive}
-
-    if action == "resume":
-        if wait_worker_exit(body.get("id"), timeout=0.2)[1]:
-            return {"error": "该任务的旧工作线程还没退出（正在中断在飞文件），等几秒再点「继续」，"
-                             "否则新旧线程会同时写同一个文件"}
-        with LOCK:
-            s = load_settings()
-            jobs = load_jobs()
-            # v3.57：按任务目标卷判断保护（转存到云盘的任务不占下载卷，放行）
-            tgt = next((j for j in jobs if j.get("id") == body.get("id")), None)
-            if tgt and tgt.get("kind") != "xfer":
-                vf = volume_effective_free(job_volume(tgt), s)
-                if vf is not None and vf < float(s["diskMinGB"] or 0):
-                    return {"error": "目标存储空间保护中（剩余 %.1f GB），无法继续" % vf}
-            running = sum(1 for j in jobs if j["state"] == "running")
-            for j in jobs:
-                if j["id"] == body.get("id") and j["state"] in ("stopped", "error"):
-                    if j.get("kind") == "xfer":
-                        # 转存类任务：重置阶段后重跑，已存在的同名目录会在定位阶段跳过
-                        j.update(state="queued", error="", phase="", speed=0, curfile="")
-                        save_jobs(jobs)
-                        _resume_worker = (
-                            _xfer_worker if j.get("method") == "relay" else
-                            _sharesave_worker if j.get("method") == "externalshare" else
-                            _share_worker)
-                        threading.Thread(target=_resume_worker,
-                                         args=(j["id"],), daemon=True).start()
-                        break
-                    if j.get("kind") == "unzip":
-                        # 解压没有「断点续传」这回事，重新提交才是唯一干净的做法
-                        j["error"] = "解压任务不支持续传，请重新点「解压」（已解出的文件会保留）"
-                        save_jobs(jobs)
-                        break
-                    # 预检：云端源已空（如 move 已删源）时拒绝续传（URL 直链任务无云端源，跳过）
-                    if j.get("remote") != "URL":
-                        pre, pre_err, _ = cloud_precheck(j["remote"], j.get("subpath", ""),
-                                                        bool(j.get("proxy")))
-                        if pre_err:
-                            # v3.85：这里以前 [:120] 从头部硬切，正好把预检文案尾部的
-                            # 「connection reset by peer」切掉，任务卡于是又显示成
-                            # 「couldn't get captcha token…请重新登录」。pre_err 已在
-                            # cloud_precheck 里压过尾，直接用即可。
-                            j["error"] = "预检源目录失败: %s" % pre_err
-                            continue
-                        if not pre:
-                            j["error"] = "源目录已空（%s:%s），无需继续" % (j["remote"], j.get("subpath", "/"))
-                            continue
-                    # v4.03：人工点「继续」= 用户明确想再试一次，把自动重连的次数与窗口清零，
-                    # 否则被自动重连过 5 次的任务再点继续也不会再自动重连了
-                    j["_kickN"], j["_kickWin"] = 0, None
-                    j["_kickAt"], j["_kickBytes"] = 0, None
-                    if not body.get("_auto"):
-                        # v4.13：人工点「继续」= 用户明确再试一次，把自动重试次数清零重新给额度
-                        j["_arTries"], j["_arErrAt"] = 0, None
-                    if running < s["maxConcurrent"]:
-                        if not launch_job(j, s):
-                            # v4.17/v4.18：旧世代还没退出时不会硬起（见 _start_safe_dir_job）。
-                            # 已排回队列的任务由 scheduler 自动重试，这里不算失败。
-                            save_jobs(jobs)
-                            if j.get("state") == "queued":
-                                return {"ok": True, "queued": True}
-                            return {"error": j.get("error") or "启动失败"}
-                        running += 1
-                    else:
-                        j["state"] = "queued"
-                    break
-            save_jobs(jobs)
-        return {"ok": True}
-
-    if action == "jobretryfailed":
-        # v3.83：只把目录任务里「失败」的文件重置为待下载，已完成 / 已跳过的一律不动
-        with LOCK:
-            s = load_settings()
-            jobs = load_jobs()
-            job = next((j for j in jobs if j.get("id") == body.get("id")), None)
-            if not job:
-                return {"error": "任务不存在"}
-            if job.get("naming") != "v2" or job.get("single_file"):
-                return {"error": "只有安全命名的目录任务支持按文件重试"}
-            if job.get("state") in ("running", "queued"):
-                return {"error": "任务正在运行或排队中，请先暂停再重试失败项"}
-            plan = load_file_plan(job["id"])
-            if not plan:
-                return {"error": "没有找到该任务的文件清单，请直接点「继续」"}
-            n = 0
-            for e in plan["entries"]:
-                if e.get("status") == "failed":
-                    e["status"], e["error"], e["attempts"] = "pending", "", 0
-                    n += 1
-            if not n:
-                return {"error": "没有失败的文件需要重试"}
-            save_file_plan(job["id"], plan)
-            job["error"] = ""
-            job["filesFailed"] = 0
-            running = sum(1 for j in jobs if j["state"] == "running")
-            if running < s["maxConcurrent"]:
-                launch_job(job, s)
-            else:
-                job["state"] = "queued"
-            save_jobs(jobs)
-        return {"ok": True, "count": n}
-
-    if action == "jobreproxy":
-        # 切换单个任务的下载路径并立即重启：停掉旧 rclone job → 换守护进程重新 launch
-        with LOCK:
-            s = load_settings()
-            jobs = load_jobs()
-            job = next((j for j in jobs if j.get("id") == body.get("id")), None)
-            if not job:
-                return {"error": "任务不存在"}
-            if job.get("remote") == "URL":
-                return {"error": "URL 直链任务不支持切换下载路径"}
-            new_proxy = bool(body.get("proxy", not job.get("proxy")))
-            if job["state"] in ("running", "queued"):
-                stop_job_entry(job)
-            job["proxy"] = new_proxy
-            job["error"] = ""
-            ok = launch_job(job, s)
-            save_jobs(jobs)
-            return {"ok": ok, "proxy": new_proxy,
-                    "error": "" if ok else (job.get("error") or "启动失败")}
-
-    if action == "remove":
-        tid = body.get("id")
-        with LOCK:
-            jobs = load_jobs()
-            for j in jobs:
-                # 转移任务可能挂着 rclone 子进程，删记录前先收掉，避免孤儿进程
-                if j["id"] == tid and j.get("kind") == "xfer":
-                    _xfer_kill(j)
-                if j["id"] == tid and j.get("naming") == "v2":
-                    ev = _safe_stop_event(tid)
-                    if ev:
-                        ev.set()
-                    # v4.15：记录都删了，还挂着异步 job 就永久变成孤儿流量
-                    try:
-                        stop_job_group(tid, bool(j.get("proxy")))
-                    except Exception:
-                        pass
-        # v3.93：线程还在收尾就删记录，会让它继续往已删除的任务写进度/计划文件。
-        # 先等在飞文件中断，再删；等不到就拒绝并提示用户先「停止」。
-        waited, alive = wait_worker_exit(tid, timeout=float(body.get("wait") or 10))
-        if alive:
-            return {"error": "任务仍在收尾（在飞文件还没中断），等几秒再删记录", "alive": True}
-        with LOCK:
-            jobs = load_jobs()
-            jobs = [j for j in jobs if j["id"] != tid]
-            save_jobs(jobs)
-        try:                    # v3.83：文件级执行计划随任务记录一起删，不留下孤儿 JSON
-            os.remove(_plan_path(body.get("id")))
-        except Exception:
-            pass
-        return {"ok": True}
-
-    if action == "stats":
-        try:
-            d = merged_stats()
-        except Exception as e:
-            return {"speed": 0, "bytes": 0, "transferring": [], "error": str(e)[:150]}
-        spd, _ = instant_speed(int(d.get("bytes", 0) or 0))   # 保留采样状态，历史页仍用它
-        # v4.15：没有任何在跑/排队的任务时速度必须是 0；有任务时用「在传文件实测速度合计」。
-        # 残留 / 重启的异步 job 会让累计字节继续涨，按累计差分算会显示还在下载，其实任务早停了。
-        try:
-            with LOCK:
-                busy = any(str(j.get("state") or "") in ("running", "queued") for j in load_jobs())
-        except Exception:
-            busy = True
-        if not busy:
-            spd = 0.0
+        # v3.87：没指定 folder 时落到「下载子目录/任务名」，与历史任务（/data/Downloads/xxx）
+        # 保持一致。v3.83 起这里少了 Downloads 层，新建任务会写进卷根（/data/绿帽学院），
+        # 与已有数据不是同一目录，rclone 无从判断「已下过」，只能整目录重下。
+        src = "%s:%s" % (body["remote"], sub) if sub else "%s:" % body["remote"]
+        base_dest = vroot + "/" + (folder if folder else (DOWNLOAD_SUBDIR + "/" + name))
+        force = bool(body.get("force"))
+        warn = ""
+        # v3.93：同一个源重复建任务只会抢带宽、还可能两个线程同时写同一个文件；
+        # 而旧版 dedupe_dest 会在这时造出「目录-2」，等于把已有数据全部重下一遍。
+        live = next((j for j in jobs if j.get("src") == src
+                     and j.get("state") in ("running", "queued")), None)
+        if live and not force:
+            return {"error": "同一个源已有任务在跑（id %s，落点 %s）。重复建任务只会抢带宽、"
+                             "还可能同时写同一个文件；等它结束，或带 force=true 才并行。"
+                             % (live.get("id"), live.get("dest")),
+                    "duplicate": True, "existing": live.get("id")}
+        prev = next((j for j in jobs if j.get("src") == src
+                     and j.get("state") not in ("running", "queued")
+                     and not j.get("single_file")), None)
+        if force:
+            dest = base_dest
+        elif prev and str(prev.get("dest") or "").startswith(vroot + "/"):
+            # 直接沿用同源旧任务的落点：既不会造出「-2」，也能按名字+大小跳过已下好的文件
+            dest = prev["dest"]
+            warn = ("沿用同源旧任务 %s 的落点 %s（已完成的文件会按「名字+大小」跳过，不会重下）"
+                    % (prev.get("id"), dest))
         else:
-            spd = round(active_speed(d), 1)
-        return {"speed": spd, "bytes": d.get("bytes", 0),
-                "transferring": [{"name": t.get("name", ""), "bytes": t.get("bytes", 0),
-                                  "total": t.get("totalBytes", 0), "speed": t.get("speed", 0)}
-                                 for t in d.get("transferring", [])]}
+            dest = dedupe_dest(base_dest, fs=vroot)
+            if dest != base_dest:
+                warn = ("目标目录 %s 已存在，落点改为 %s：这一份会从头下载。"
+                        "要接着用已有数据请显式指定 folder，或带 force=true"
+                        % (base_dest, dest))
+        # 必须先定下 proxy：预检与后续 launch_job 都依赖它。
+        # v3.31 曾把赋值放在预检之后，导致批量下载全程抛
+        # UnboundLocalError: cannot access local variable 'proxy'。
+        proxy = bool(body.get("proxy", s["downloadProxy"]))
+        # v3.43 下载过滤：规范化后随任务一起落盘，续传 / 重启都能沿用同一套规则
+        flt = norm_download_filter(body.get("filter"))
+        # v4.05：预检走在 launch_job 之前，而 5573 只在 launch_job 里按需拉起。
+        # rclone-backend 重启后 5573 就没了，此时任何「走代理」的新任务都会在预检
+        # 阶段报「connection refused」，看起来像网络故障。所以这里也先确保 5573 在。
+        if proxy and not ensure_proxy_rc():
+            return {"error": "代理守护进程（%d）启动失败，请检查代理客户端与 %s 容器"
+                             % (PROXY_RC_PORT, RCLONE_CONTAINER)}
+        # 预检源：sub 可能是目录也可能是单个文件（cloud_precheck 内部区分）
+        pre_list, pre_err, is_file = cloud_precheck(body["remote"], sub, proxy)
+        if pre_err:
+            return {"error": "预检源目录失败: %s" % pre_err}
+        if not pre_list:
+            return {"error": "源目录为空（%s:%s），没有可下载的文件" % (body["remote"], sub or "/")}
+        job = {"id": int(time.time() * 1000), "jobid": None, "remote": body["remote"],
+               "subpath": sub, "src": src,
+               "mode": body.get("mode", "copy"), "dest": dest, "state": "queued",
+               "started": time.strftime("%m-%d %H:%M"), "bytes": 0, "total": 0,
+               "speed": 0, "eta": None, "error": "", "proxy": proxy,
+               # v3.93：记下建任务时的版本，列表里可区分「哪版建的」同名任务
+               "createdVersion": APP_VERSION, "createdAt": int(time.time() * 1000)}
+        if flt:
+            job["filter"] = flt
+            job["filterText"] = describe_filter(flt)
+        # v3.83：安全命名只作用于「新创建」的任务；老任务没有 naming 字段，
+        # 继续走 v3.82 及以前的原样命名逻辑，升级不会影响在跑 / 排队的旧任务。
+        if s.get("safeNaming", True):
+            job["naming"] = "v2"
+        if is_file:
+            parent, _, leaf = sub.rpartition("/")
+            job["single_file"] = True
+            job["leaf"] = leaf
+            job["src_dir"] = "%s:%s" % (body["remote"], parent)
+            if job.get("naming") == "v2":
+                # 源端仍用 leaf（原名），只有落盘名换成安全名
+                job["safe_leaf"] = safe_basename(
+                    leaf, body["remote"], sub,
+                    max_bytes=int(s.get("safeNameMaxBytes") or 180),
+                    hash_len=int(s.get("safeNameHashLen") or 12))
+            # v4.08：单文件任务的「显示落点」必须等于「真实落点」。
+            # 旧版未指定 folder 时 dst_dir 直接取卷根，rclone 实际写的是
+            # /data/xxx.mp4.partial，而卡片上显示 /data/Downloads/xxx.mp4 ——
+            # 差一层目录。出现 operation not permitted 这类落盘错误时，
+            # 报错路径和界面路径对不上，排障会被带偏（现场已踩过一次）。
+            if folder:
+                dst_dir = dest                      # 指定保存目录：dest 就是该目录
+            else:
+                dst_dir = single_file_dst_dir(vroot, folder, parent, dest)
+            job["dst_dir"] = dst_dir
+            dest = dst_dir + "/" + (job.get("safe_leaf") or leaf)
+            job["dest"] = dest
+        launched_ok = True
+        if running < s["maxConcurrent"]:
+            launched_ok = launch_job(job, s)
+        jobs.append(job)
+        save_jobs(jobs)
+        if not launched_ok:
+            return {"error": "启动失败: %s" % (job.get("error") or "未知原因"), "job": job}
+        if warn:
+            return {"job": job, "warn": warn}
+        return {"job": job}
 
-    if action == "settings":
-        return {"settings": load_settings(),
-                "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
-                        "diskTotal": STATE.get("diskTotal"), "storages": storages(),
-                        "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
-                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
-                "netMode": net_mode(), "proxyScope": proxy_scope(),
-                "remux": remux_public()}
+@action("splitscan")
+def h_splitscan(body):
+    remotes = [str(x).strip() for x in (body.get("remotes") or []) if str(x).strip()]
+    remotes = list(dict.fromkeys(remotes))
+    sub = str(body.get("path") or "").strip("/")
+    if len(remotes) < 2:
+        return {"error": "至少要选 2 个账号才有意义（单账号请用普通下载）"}
+    if len(remotes) > SPLIT_MAX_ACCOUNTS:
+        return {"error": "一次最多 %d 个账号" % SPLIT_MAX_ACCOUNTS}
+    avail = set(pikpak_remotes())
+    bad = [r for r in remotes if r not in avail]
+    if bad:
+        return {"error": "这些账号不是可用的 PikPak 账号：%s" % "、".join(bad)}
+    s = load_settings()
+    proxy = bool(body.get("proxy", s["downloadProxy"]))
+    flt = norm_download_filter(body.get("filter"))
+    out = split_scan(remotes, sub, flt, proxy)
+    out["filterText"] = describe_filter(flt)
+    return out
 
-    if action == "remuxscan":
-        raw = str(body.get("path") or "").strip()
-        root = raw if raw.startswith("/") else os.path.join(DOWNLOAD_ROOT, raw) if raw else DOWNLOAD_ROOT
-        root = os.path.normpath(root)
-        roots = [DOWNLOAD_ROOT.rstrip("/")] + [p["console"].rstrip("/")
-                                               for p in (STATE.get("volumePairs") or [])]
-        # 只允许扫下载根/已挂载卷之内的目录：这个接口会批量起 ffmpeg，别给它任意路径
-        if not any(root == r or root.startswith(r + "/") for r in roots if r):
-            return {"error": "只能扫描下载目录内的路径"}
-        if not os.path.isdir(root):
-            return {"error": "目录不存在：%s" % root}
+@action("splitstart")
+def h_splitstart(body):
+    remotes = [str(x).strip() for x in (body.get("remotes") or []) if str(x).strip()]
+    remotes = list(dict.fromkeys(remotes))
+    sub = str(body.get("path") or "").strip("/")
+    if len(remotes) < 2:
+        return {"error": "至少要选 2 个账号才能分账号下载"}
+    if len(remotes) > SPLIT_MAX_ACCOUNTS:
+        return {"error": "一次最多 %d 个账号" % SPLIT_MAX_ACCOUNTS}
+    avail = set(pikpak_remotes())
+    bad = [r for r in remotes if r not in avail]
+    if bad:
+        return {"error": "这些账号不是可用的 PikPak 账号：%s" % "、".join(bad)}
+    s = load_settings()
+    proxy = bool(body.get("proxy", s["downloadProxy"]))
+    flt = norm_download_filter(body.get("filter"))
+    scan = split_scan(remotes, sub, flt, proxy, want_files=True)
+    if not scan["fileCount"]:
+        detail = "；".join("%s：%s" % (x["remote"], x["error"] or "没有文件")
+                          for x in scan["accounts"] if x["state"] != "ok")
+        return {"error": "源目录在这些账号里都没有可下载的文件" + ("（" + detail + "）" if detail else ""),
+                "scan": scan}
+    if not scan["consistent"]:
+        return {"error": "这些账号看到的文件集合不一致，不能直接分：" +
+                         "；".join(scan["warnings"] or ["有账号看不到该目录"]),
+                "scan": scan}
+    files = scan.get("files") or split_apply_filter(split_list_files(remotes[0], sub, proxy), flt)
+    scan.pop("files", None)
+
+    if len(files) < SPLIT_MIN_FILES:
+        return {"error": "只有 %d 个文件，分给 %d 个账号没有收益（建议直接普通下载）"
+                         % (len(files), len(remotes)), "scan": scan}
+    assign, stats = split_assign(files, remotes)
+    if not all(assign.get(r) for r in remotes):
+        return {"error": "文件数（%d）少于账号数（%d），无法保证每个账号都有活干；"
+                         "请减少账号或改用普通下载" % (len(files), len(remotes))}
+
+    folder = str(body.get("folder") or "").strip("/")
+    if folder:
+        parts = folder.split("/")
+        if len(parts) > 4 or not all(
+                p and re.match(r'^[\w\u4e00-\u9fff][\w\u4e00-\u9fff -]{0,60}$', p)
+                for p in parts):
+            return {"error": "保存目录名不合法（最多 4 层，每层中英文/数字/空格/连字符）"}
+    vol_req = str(body.get("volume") or "").strip().rstrip("/")
+    vols = STATE.get("volumePairs") or [LEGACY_VOLUME]
+    if vol_req:
+        vol = next((p for p in vols if p["rclone"] == vol_req), None)
+        if not vol:
+            return {"error": "未知存储空间：%s" % vol_req}
+    else:
+        vol = vols[0]
+    vroot = vol["rclone"]
+    vf = volume_effective_free(vol, s)
+    disk_min = float(s["diskMinGB"] or 0)
+    if vf is not None and vf < disk_min:
+        return {"error": "「%s」空间保护中（剩余 %.1f GB），请清理该卷或到设置里调低阈值"
+                         % (vol.get("name") or vroot, vf)}
+
+    name = basename_of(sub) if sub else remotes[0]
+    # 分片任务一律落同一个目录：dedupe_dest 在这里是**反效果** —— 它会把第二个
+    # 任务改到「目录-2」，等于把一份资源拆进两个文件夹，校验和对账全乱。
+    dest = vroot + "/" + (folder if folder else (DOWNLOAD_SUBDIR + "/" + name))
+    warn = []
+    try:
+        dest_abs = local_dest(dest)
+        if dest_abs and os.path.isdir(dest_abs) and os.listdir(dest_abs):
+            warn.append("目标目录 %s 已有文件：同名同大小的会被跳过（等同续传），"
+                        "不会重复下载" % dest)
+    except Exception:
+        pass
+
+    with LOCK:
+        jobs = load_jobs()
+        for r in remotes:
+            src = split_src(r, sub)
+            live = next((j for j in jobs if j.get("src") == src
+                         and j.get("state") in ("running", "queued")), None)
+            if live and not bool(body.get("force")):
+                return {"error": "账号 %s 已有同源任务在跑（#%s，落点 %s）。"
+                                 "先停掉它再分账号，或带 force=true 强制并行。"
+                                 % (r, live.get("id"), live.get("dest")),
+                        "duplicate": True, "existing": live.get("id")}
+        made = make_split_jobs(remotes, sub, assign, stats, dest,
+                               proxy=proxy, flt=flt, s=s)
+        failed = []
+        for job in made:
+            # 分账号是「同一份资源的分片」，共用一个源目录，不受 maxConcurrent 限制：
+            # 排队等前一片跑完就完全失去了并行的意义。每片仍是独立账号、独立连接预算。
+            if not launch_job(job, s):
+                failed.append({"remote": job["remote"],
+                               "error": job.get("error") or "启动失败"})
+        jobs.extend(made)
+        save_jobs(jobs)
+    ok = [j for j in made if j.get("state") != "error"]
+    if not ok:
+        return {"error": "全部分片都启动失败：" +
+                         "；".join("%s %s" % (x["remote"], x["error"]) for x in failed),
+                "jobs": made}
+    return {"jobs": made, "dest": dest, "fileCount": len(files),
+            "bytes": sum(int(f.get("Size") or 0) for f in files),
+            "assign": [{"remote": r, "files": stats[r]["files"],
+                        "bytes": stats[r]["bytes"]} for r in remotes],
+            "failed": failed, "warnings": warn}
+
+@action("scanpath")
+def h_scanpath(body):
+    return cloud_scan(body["remote"], body.get("path", ""), body.get("depth", 6))
+
+@action("myshares")
+def h_myshares(body):
+    only = str(body.get("remote") or "").strip()
+    names = [only] if only else pikpak_remotes()
+    if not names:
+        return {"error": "没有可用的 PikPak 账号"}
+    shares, errors = [], []
+    for n in names:
         try:
-            n = int(body.get("depth") or 3)
+            rows = pk_share_list(n, force=bool(body.get("force")))
+            shares.extend(map_my_share(n, s) for s in rows if isinstance(s, dict))
+        except Exception as e:
+            errors.append("%s: %s" % (n, str(e)[:100]))
+    lim = load_share_limits()
+    return {"shares": shares, "limits": lim["limits"], "log": lim["log"][:20],
+            "autoCancel": bool(load_settings().get("shareAutoCancel")),
+            "errors": errors}
+
+@action("sharelimit")
+def h_sharelimit(body):
+    remote = str(body.get("remote") or "").strip()
+    sid = str(body.get("shareId") or "").strip()
+    limit = max(0, min(100000, _as_int(body.get("limit"))))
+    if not remote or not sid:
+        return {"error": "缺少账号或分享 ID"}
+    key = _share_limit_key(remote, sid)
+    with SHARE_LIMITS_LOCK:
+        d = load_share_limits()
+        if limit <= 0:
+            d["limits"].pop(key, None)      # 0 = 清除上限
+        else:
+            d["limits"][key] = {"remote": remote, "shareId": sid,
+                                "limit": limit, "setAt": time.time()}
+        save_share_limits(d)
+        out = dict(d["limits"])
+    return {"ok": True, "limits": out}
+
+@action("sharedel")
+def h_sharedel(body):
+    remote = str(body.get("remote") or "").strip()
+    sid = str(body.get("shareId") or "").strip()
+    if not remote or not sid:
+        return {"error": "缺少账号或分享 ID"}
+    if not pk_share_delete(remote, sid):
+        return {"error": "取消分享失败（链接可能已失效或账号凭证异常）"}
+    with SHARE_LIMITS_LOCK:
+        MYSHARES_CACHE.pop(remote, None)
+        d = load_share_limits()
+        d["limits"].pop(_share_limit_key(remote, sid), None)
+        d["log"].insert(0, {"at": time.strftime("%m-%d %H:%M"), "remote": remote,
+                            "shareId": sid, "title": "", "restores": 0,
+                            "limit": 0, "ok": True, "manual": True})
+        d["log"] = d["log"][:50]
+        save_share_limits(d)
+    return {"ok": True}
+
+@action("shareparse")
+def h_shareparse(body):
+    name = str(body.get("remote") or "").strip()
+    sid, pcode, err = parse_share_input(body.get("text"), body.get("passCode"))
+    if err:
+        return {"error": err}
+    if not name:
+        return {"error": "请选择用于查看分享的账号"}
+    tok = str(body.get("passCodeToken") or "").strip()
+    # v3.81：双路尝试。第一路跟随全局网络模式（通常直连）；若 PikPak 因出口地区
+    # 返回 PROHIBITED / NOT_FOUND，且设置里「预置」了代理地址，就只让分享解析
+    # 改走这个地址重试 —— 下载、云盘数据、封面都保持直连，不被慢代理拖累。
+    # proxyUrl 本来就是「可预置、可不启用」的字段，这里复用它，无需新增设置项。
+    current = proxy_url()
+    preset = (str(load_settings().get("proxyUrl") or "").strip()
+              or str(os.environ.get("PROXY_URL") or "").strip())
+    if preset.lower() in PROXY_OFF_WORDS or not PROXY_URL_RE.match(preset):
+        preset = ""
+    routes = [(True, "跟随全局（%s）" % ("代理" if current else "直连"))]
+    if preset and preset != current:
+        routes.append((preset, "分享专用代理 " + preset))
+    last, tried = "", []
+    for px, via in routes:
+        tried.append(via)
+        try:
+            info = pk_share_info(name, sid, pcode, proxy=px, via=via) if not tok else {
+                "shareId": sid, "passCode": pcode, "passCodeToken": tok,
+                "title": str(body.get("title") or "")[:120], "shareStatus": "OK",
+                "shareStatusText": "", "shareUser": "", "via": via}
+            items, nxt = pk_share_detail(name, sid, info["passCodeToken"],
+                                         str(body.get("parentId") or ""),
+                                         str(body.get("pageToken") or ""),
+                                         proxy=px)
+            return {"ok": True, "info": info, "items": items,
+                    "nextPageToken": nxt, "parentId": str(body.get("parentId") or ""),
+                    "tried": tried}
+        except Exception as e:
+            last = str(e)[:300]
+            # 只有「换出口可能有救」的状态才重试；提取码 / 凭证错误重试无意义
+            if not any(k in last for k in ("PROHIBITED", "NOT_FOUND", "非 JSON")):
+                break
+    if len(tried) > 1:
+        last += "；已尝试 %d 条路径：%s" % (len(tried), " → ".join(tried))
+    return {"error": last, "tried": tried}
+
+@action("sharesave")
+def h_sharesave(body):
+    name = str(body.get("remote") or "").strip()
+    sid = str(body.get("shareId") or "").strip()
+    tok = str(body.get("passCodeToken") or "").strip()
+    ids = [str(x) for x in (body.get("fileIds") or []) if x]
+    dst_path = str(body.get("dstPath") or "").strip("/")
+    if not name or not sid or not tok:
+        return {"error": "缺少分享信息或目标账号，请先重新解析链接"}
+    if not ids:
+        return {"error": "请至少勾选一个要转存的文件或文件夹"}
+    if len(ids) > 200:
+        return {"error": "一次最多转存 200 项，请分批选择"}
+    if ".." in dst_path.split("/"):
+        return {"error": "目标目录不能包含 .."}
+    with LOCK:
+        dup = next((j for j in load_jobs() if j.get("kind") == "xfer"
+                    and j.get("method") == "externalshare"
+                    and j.get("shareId") == sid and j.get("remote") == name
+                    and j.get("state") in ("running", "queued")), None)
+    if dup:
+        return {"error": "这个分享正在转存中（任务 #%s）" % dup["id"]}
+    job = {"id": int(time.time() * 1000), "jobid": None, "kind": "xfer",
+           "method": "externalshare", "mode": "copy", "remote": name,
+           "subpath": str(body.get("title") or sid)[:120], "src": "share:" + sid,
+           "dstRemote": name, "dstPath": dst_path,
+           "dest": "%s:%s" % (name, dst_path or "/"),
+           "shareId": sid, "passCodeToken": tok, "fileIds": ids,
+           "ancestorIds": [str(x) for x in (body.get("ancestorIds") or []) if x][:20],
+           "state": "queued", "phase": "restore",
+           "started": time.strftime("%m-%d %H:%M"), "bytes": 0, "total": 0,
+           "single_file": False, "speed": 0, "eta": None, "error": "",
+           "proxy": False, "srcCount": len(ids)}
+    with LOCK:
+        jobs = load_jobs()
+        jobs.append(job)
+        save_jobs(jobs)
+    threading.Thread(target=_sharesave_worker, args=(job["id"],), daemon=True).start()
+    return {"job": job}
+
+@action("xferstart")
+def h_xferstart(body):
+    src_remote = str(body.get("srcRemote") or "").strip()
+    dst_remote = str(body.get("dstRemote") or "").strip()
+    src_path = str(body.get("path") or "").strip("/")
+    dst_path = str(body.get("dstPath") or "").strip("/")
+    mode = "move" if str(body.get("mode")) == "move" else "copy"
+    method = "relay" if str(body.get("method")) == "relay" else "share"
+    if not src_remote or not src_path:
+        return {"error": "请选择要转移的源文件或文件夹"}
+    if not dst_remote:
+        return {"error": "请选择目标账号"}
+    if dst_remote == src_remote:
+        if dst_path == src_path:
+            return {"error": "目标与源是同一个位置"}
+        if (dst_path + "/").startswith(src_path + "/"):
+            return {"error": "不能转移到源目录自身或其子目录"}
+    if ".." in dst_path.split("/"):
+        return {"error": "目标目录不能包含 .."}
+    src_ref = "%s:%s" % (src_remote, src_path)
+    with LOCK:
+        dup = next((j for j in load_jobs() if j.get("kind") == "xfer"
+                    and j.get("state") in ("running", "queued")
+                    and j.get("src") == src_ref), None)
+    if dup:
+        return {"error": "这个路径已经在转移中（任务 #%s）" % dup["id"]}
+    proxy = bool(body.get("proxy", load_settings()["downloadProxy"]))
+    pre, perr, is_file = cloud_precheck(src_remote, src_path, proxy)
+    if perr:
+        return {"error": "预检源路径失败：%s" % perr}
+    if not pre:
+        return {"error": "源路径不存在或为空，没有可转移的内容"}
+    fsize = int((pre[0] or {}).get("Size") or 0) if is_file else 0
+    if is_file and dst_remote == src_remote:
+        parent = src_path.rpartition("/")[0]
+        if dst_path == parent:
+            return {"error": "目标与源是同一个位置，换个目录再试"}
+    job = {"id": int(time.time() * 1000), "jobid": None, "kind": "xfer",
+           "method": method, "remote": src_remote, "subpath": src_path,
+           "src": src_ref, "dstRemote": dst_remote, "dstPath": dst_path,
+           "dest": "%s:%s" % (dst_remote, dst_path or "/"),
+           "mode": mode, "state": "queued", "phase": "share",
+           "started": time.strftime("%m-%d %H:%M"), "bytes": 0,
+           "total": fsize, "single_file": is_file,
+           "speed": 0, "eta": None, "error": "", "proxy": proxy,
+           "srcCount": 1 if is_file else len(pre)}
+    with LOCK:
+        jobs = load_jobs()
+        jobs.append(job)
+        save_jobs(jobs)
+    threading.Thread(target=_share_worker if method == "share" else _xfer_worker,
+                     args=(job["id"],), daemon=True).start()
+    return {"job": job}
+
+@action("jobs")
+def h_jobs(body):
+    now = time.time()
+    snap = JOBS_SNAP.get("payload")
+    if snap is not None and now - JOBS_SNAP["ts"] < JOBS_LIVE_TTL:
+        return dict(snap, remux=remux_public())
+    with LOCK:
+        jobs = load_jobs()
+        # v3.93：列表里补版本/创建时间，同名任务才分得清「哪版建的」
+        for j in jobs:
+            if not j.get("version"):
+                j["version"] = j.get("createdVersion") or "旧版"
+    try:
+        before = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        before = None
+    deadline = time.time() + 4.0
+    for j in jobs:
+        if time.time() > deadline and j.get("state") == "running":
+            continue          # 本轮跳过，保留上次落盘的状态
+        try:
+            job_live(j)
         except Exception:
-            n = 3
-        res = remux_scan(root, maxdepth=max(1, min(n, 6)))
-        res["root"] = root
-        return res
+            pass              # 单个任务查失败不该让整张列表报错
+    try:
+        after = json.dumps(jobs, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        after = None
+    # 只写回「本轮真的查到进度」的那几个字段，避免把别人刚改的（停止/改名/删任务）覆盖掉
+    if before is None or after is None or before != after:
+        with LOCK:
+            cur = load_jobs()
+            by_id = {}
+            for j in cur:
+                by_id[j.get("id")] = j
+            for j in jobs:
+                tgt = by_id.get(j.get("id"))
+                if isinstance(tgt, dict):
+                    _merge_live_job(tgt, j)
+            save_jobs(cur)
+    payload = {"jobs": [{k: v for k, v in j.items() if k != "fileList"} for j in jobs],
+               "settings": load_settings(),
+               "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
+                         "diskTotal": STATE.get("diskTotal"), "storages": storages(),
+                         "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
+               "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
+               "proxyScope": proxy_scope(),
+               "remux": remux_public()}
+    JOBS_SNAP.update({"ts": time.time(), "payload": payload})
+    return payload
 
-    if action == "autotune":
-        if AUTOTUNE_RUN.get("running"):
-            return {"error": "已有一次测速在进行（%s），等它跑完" % (AUTOTUNE_RUN.get("step") or "")}
-        jid = body.get("id")
-        if not jid:
-            return {"error": "请指定要测速的任务"}
+@action("stop")
+def h_stop(body):
+    tid = body.get("id")
+    with LOCK:
+        jobs = load_jobs()
+        for j in jobs:
+            if j["id"] == tid and j["state"] in ("running", "queued"):
+                stop_job_entry(j)
+        save_jobs(jobs)
+    # v3.93：等 worker 线程真正退出后再返回。在飞的 copyfile 会被 job/stop 打断，
+    # 以前这里立刻返回，界面显示「已暂停」但 rclone 里还在传，下一次建任务就抢带宽。
+    waited, alive = wait_worker_exit(tid, timeout=float(body.get("wait") or 10))
+    return {"ok": True, "waited": waited, "alive": alive}
+
+@action("resume")
+def h_resume(body):
+    if wait_worker_exit(body.get("id"), timeout=0.2)[1]:
+        return {"error": "该任务的旧工作线程还没退出（正在中断在飞文件），等几秒再点「继续」，"
+                         "否则新旧线程会同时写同一个文件"}
+    with LOCK:
         s = load_settings()
-        secs = int(body.get("seconds") or s.get("autoTuneSeconds") or 45)
-        settle = int(body.get("settle") or s.get("autoTuneSettle") or 20)
-        cands = [(4, 4), (2, 8), (1, 16), (8, 2)]
-        threading.Thread(target=_autotune_worker, args=(jid, secs, settle, cands),
-                         daemon=True).start()
-        # 先占位，避免并发点两次都通过上面的 running 判定
-        AUTOTUNE_RUN.update({"running": True, "job": jid, "step": "准备",
-                             "results": [], "best": None, "error": "", "note": ""})
-        return {"ok": True, "candidates": [at_label(*c) for c in cands],
-                "seconds": secs, "settle": settle,
-                "etaSeconds": len(cands) * (secs + settle + 6)}
+        jobs = load_jobs()
+        # v3.57：按任务目标卷判断保护（转存到云盘的任务不占下载卷，放行）
+        tgt = next((j for j in jobs if j.get("id") == body.get("id")), None)
+        if tgt and tgt.get("kind") != "xfer":
+            vf = volume_effective_free(job_volume(tgt), s)
+            if vf is not None and vf < float(s["diskMinGB"] or 0):
+                return {"error": "目标存储空间保护中（剩余 %.1f GB），无法继续" % vf}
+        running = sum(1 for j in jobs if j["state"] == "running")
+        for j in jobs:
+            if j["id"] == body.get("id") and j["state"] in ("stopped", "error"):
+                if j.get("kind") == "xfer":
+                    # 转存类任务：重置阶段后重跑，已存在的同名目录会在定位阶段跳过
+                    j.update(state="queued", error="", phase="", speed=0, curfile="")
+                    save_jobs(jobs)
+                    _resume_worker = (
+                        _xfer_worker if j.get("method") == "relay" else
+                        _sharesave_worker if j.get("method") == "externalshare" else
+                        _share_worker)
+                    threading.Thread(target=_resume_worker,
+                                     args=(j["id"],), daemon=True).start()
+                    break
+                if j.get("kind") == "unzip":
+                    # 解压没有「断点续传」这回事，重新提交才是唯一干净的做法
+                    j["error"] = "解压任务不支持续传，请重新点「解压」（已解出的文件会保留）"
+                    save_jobs(jobs)
+                    break
+                # 预检：云端源已空（如 move 已删源）时拒绝续传（URL 直链任务无云端源，跳过）
+                if j.get("remote") != "URL":
+                    pre, pre_err, _ = cloud_precheck(j["remote"], j.get("subpath", ""),
+                                                    bool(j.get("proxy")))
+                    if pre_err:
+                        # v3.85：这里以前 [:120] 从头部硬切，正好把预检文案尾部的
+                        # 「connection reset by peer」切掉，任务卡于是又显示成
+                        # 「couldn't get captcha token…请重新登录」。pre_err 已在
+                        # cloud_precheck 里压过尾，直接用即可。
+                        j["error"] = "预检源目录失败: %s" % pre_err
+                        continue
+                    if not pre:
+                        j["error"] = "源目录已空（%s:%s），无需继续" % (j["remote"], j.get("subpath", "/"))
+                        continue
+                # v4.03：人工点「继续」= 用户明确想再试一次，把自动重连的次数与窗口清零，
+                # 否则被自动重连过 5 次的任务再点继续也不会再自动重连了
+                j["_kickN"], j["_kickWin"] = 0, None
+                j["_kickAt"], j["_kickBytes"] = 0, None
+                if not body.get("_auto"):
+                    # v4.13：人工点「继续」= 用户明确再试一次，把自动重试次数清零重新给额度
+                    j["_arTries"], j["_arErrAt"] = 0, None
+                if running < s["maxConcurrent"]:
+                    if not launch_job(j, s):
+                        # v4.17/v4.18：旧世代还没退出时不会硬起（见 _start_safe_dir_job）。
+                        # 已排回队列的任务由 scheduler 自动重试，这里不算失败。
+                        save_jobs(jobs)
+                        if j.get("state") == "queued":
+                            return {"ok": True, "queued": True}
+                        return {"error": j.get("error") or "启动失败"}
+                    running += 1
+                else:
+                    j["state"] = "queued"
+                break
+        save_jobs(jobs)
+    return {"ok": True}
 
-    if action == "autotuneinfo":
-        st = _at_read()
-        return {"ok": True, "best": at_best(),
-                "history": (st.get("history") or [])[-5:],
-                "run": dict(AUTOTUNE_RUN),
-                "candidates": [at_label(*c) for c in AUTOTUNE_CANDIDATES],
-                "maxConns": AUTOTUNE_MAX_CONNS}
-
-    if action == "tput":
-        job = next((j for j in load_jobs() if j.get("id") == body.get("id")), None)
+@action("jobretryfailed")
+def h_jobretryfailed(body):
+    with LOCK:
+        s = load_settings()
+        jobs = load_jobs()
+        job = next((j for j in jobs if j.get("id") == body.get("id")), None)
         if not job:
             return {"error": "任务不存在"}
-        secs = max(5, min(120, int(body.get("seconds") or 20)))
-        return {"ok": True, "seconds": secs,
-                "mbps": round(measure_rate(job.get("dest"), secs), 2),
-                "destBytes": dir_bytes(job.get("dest"))}
+        if job.get("naming") != "v2" or job.get("single_file"):
+            return {"error": "只有安全命名的目录任务支持按文件重试"}
+        if job.get("state") in ("running", "queued"):
+            return {"error": "任务正在运行或排队中，请先暂停再重试失败项"}
+        plan = load_file_plan(job["id"])
+        if not plan:
+            return {"error": "没有找到该任务的文件清单，请直接点「继续」"}
+        n = 0
+        for e in plan["entries"]:
+            if e.get("status") == "failed":
+                e["status"], e["error"], e["attempts"] = "pending", "", 0
+                n += 1
+        if not n:
+            return {"error": "没有失败的文件需要重试"}
+        save_file_plan(job["id"], plan)
+        job["error"] = ""
+        job["filesFailed"] = 0
+        running = sum(1 for j in jobs if j["state"] == "running")
+        if running < s["maxConcurrent"]:
+            launch_job(job, s)
+        else:
+            job["state"] = "queued"
+        save_jobs(jobs)
+    return {"ok": True, "count": n}
 
-    if action == "savesettings":
-        with LOCK:
-            old = load_settings()
-            s = dict(old)
-            for k in SETTINGS_WRITABLE:
-                if k in body:
-                    s[k] = body[k]
-            # v3.77：两个旧开关不再由前端单独控制，统一跟随全局模式
-            s["proxy"] = s["downloadProxy"] = (str(s.get("netMode") or "direct") == "proxy")
-            s["advancedMode"] = _truthy(body.get("advancedMode", s.get("advancedMode", False)))
-            s["shareAutoCancel"] = _truthy(body.get("shareAutoCancel", s.get("shareAutoCancel", False)))
-            s = _norm_settings(s)      # 统一钳制 / 白名单，非法值退回默认
-            save_settings(s)
-            STATE["firedStart"] = None
-            STATE["firedPause"] = None
-            changed = ((old.get("proxyUrl") or "") != (s.get("proxyUrl") or "")
-                       or old.get("netMode") != s.get("netMode"))
-            # v3.77：选代理却没有合法地址 → 自动回落直连，明确告知，不静默套默认地址
-            proxy_note = ""
-            if s.get("netMode") == "proxy" and not proxy_url():
-                s["netMode"] = "direct"
-                s["pkProxyMode"] = "direct"
-                s["proxy"] = s["downloadProxy"] = False
-                save_settings(s)
-                changed = True
-                proxy_note = "代理模式需要填写有效代理地址，已自动回落到直连"
-        # 只在模式/地址真的变了时重启 5573，且避开正在传输的任务
-        note2 = ""
-        if changed:
-            _, note2 = refresh_proxy_rc()
-        return {"ok": True, "settings": s,
-                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
-                "netMode": net_mode(), "proxyScope": proxy_scope(),
-                "proxyNote": proxy_note or note2}
-
-    if action == "resetsettings":
-        with LOCK:
-            s = dict(DEFAULTS)
-            # 清空「已完成传输」是显示层面的水位，不应该因为恢复默认设置而撤销
-            s["transfersClearedAt"] = load_settings().get("transfersClearedAt", 0)
-            save_settings(s)
-            STATE["firedStart"] = None
-            STATE["firedPause"] = None
-        return {"ok": True, "settings": s,
-                "effectiveProxyUrl": proxy_url() or "直连（未启用代理）"}
-
-    if action == "cleartransfers":
-        # 「本次运行已完成传输」来自 rclone 容器日志；清空 = 把日志读取起点推到当前时刻，
-        # 之后新完成的文件仍会正常出现，旧记录不再回来（刷新页面也一样）。
-        with LOCK:
-            s = load_settings()
-            s["transfersClearedAt"] = time.time()
-            save_settings(s)
-        return {"ok": True}
-
-    if action == "clearfinished":
-        # v3.37 下载任务页「一键清理」：清掉所有已结束（完成 / 出错 / 暂停）的任务记录，
-        # 保留运行中与排队中的任务；顺带把已完成传输的日志水位推到当前时刻，
-        # 让统计页那张卡片一起变干净。绝不动已下载到本地的文件。
-        with LOCK:
-            jobs = load_jobs()
-            keep, removed = [], 0
-            for j in jobs:
-                if j.get("state") in ("running", "queued"):
-                    keep.append(j)
-                    continue
-                removed += 1
-                if j.get("kind") == "xfer":
-                    try:
-                        _xfer_kill(j)
-                    except Exception:
-                        pass
-                if j.get("naming") == "v2":
-                    try:        # v3.83：一并清掉该任务的文件级执行计划
-                        os.remove(_plan_path(j["id"]))
-                    except Exception:
-                        pass
-            save_jobs(keep)
-            s = load_settings()
-            s["transfersClearedAt"] = time.time()
-            save_settings(s)
-        return {"ok": True, "removed": removed}
-
-    # ── v4.10 PushPlus 微信通知 ───────────────────────────────────────────
-    if action == "pushplustest":
-        # 前端「发送测试通知」按钮：校验 token 有没有填对、NAS 能不能连通 pushplus。
-        # 允许直接传 token（还没保存设置时也能先测），否则取已保存的那份。
+@action("jobreproxy")
+def h_jobreproxy(body):
+    with LOCK:
         s = load_settings()
-        token = str(body.get("token") or s.get("pushplusToken") or "").strip()
-        if not pushplus_token_ok(token):
-            return {"error": "PushPlus Token 未填写或格式不对（16~64 位字母数字）"}
-        res = pushplus_send(token, "云梭｜测试通知",
-                            "<p>这是一条测试消息：收到说明 PushPlus 链路正常。</p>"
-                            "<p style='color:#888;font-size:12px'>之后任务下载成功 / 失败会各推一条。</p>")
-        code = int(res.get("code") or 0) if isinstance(res, dict) else -1
-        if code != 200:
-            return {"error": "PushPlus 返回：%s" % str((res or {}).get("msg") or res)[:150]}
-        return {"ok": True, "msg": (res or {}).get("msg") or "已发送"}
+        jobs = load_jobs()
+        job = next((j for j in jobs if j.get("id") == body.get("id")), None)
+        if not job:
+            return {"error": "任务不存在"}
+        if job.get("remote") == "URL":
+            return {"error": "URL 直链任务不支持切换下载路径"}
+        new_proxy = bool(body.get("proxy", not job.get("proxy")))
+        if job["state"] in ("running", "queued"):
+            stop_job_entry(job)
+        job["proxy"] = new_proxy
+        job["error"] = ""
+        ok = launch_job(job, s)
+        save_jobs(jobs)
+        return {"ok": ok, "proxy": new_proxy,
+                "error": "" if ok else (job.get("error") or "启动失败")}
 
-    if action == "notifystate":
-        # 给前端看「当前能不能发、发过几条」，不暴露 token 原文
+@action("remove")
+def h_remove(body):
+    tid = body.get("id")
+    with LOCK:
+        jobs = load_jobs()
+        for j in jobs:
+            # 转移任务可能挂着 rclone 子进程，删记录前先收掉，避免孤儿进程
+            if j["id"] == tid and j.get("kind") == "xfer":
+                _xfer_kill(j)
+            if j["id"] == tid and j.get("naming") == "v2":
+                ev = _safe_stop_event(tid)
+                if ev:
+                    ev.set()
+                # v4.15：记录都删了，还挂着异步 job 就永久变成孤儿流量
+                try:
+                    stop_job_group(tid, bool(j.get("proxy")))
+                except Exception:
+                    pass
+    # v3.93：线程还在收尾就删记录，会让它继续往已删除的任务写进度/计划文件。
+    # 先等在飞文件中断，再删；等不到就拒绝并提示用户先「停止」。
+    waited, alive = wait_worker_exit(tid, timeout=float(body.get("wait") or 10))
+    if alive:
+        return {"error": "任务仍在收尾（在飞文件还没中断），等几秒再删记录", "alive": True}
+    with LOCK:
+        jobs = load_jobs()
+        jobs = [j for j in jobs if j["id"] != tid]
+        save_jobs(jobs)
+    try:                    # v3.83：文件级执行计划随任务记录一起删，不留下孤儿 JSON
+        os.remove(_plan_path(body.get("id")))
+    except Exception:
+        pass
+    return {"ok": True}
+
+@action("stats")
+def h_stats(body):
+    try:
+        d = merged_stats()
+    except Exception as e:
+        return {"speed": 0, "bytes": 0, "transferring": [], "error": str(e)[:150]}
+    spd, _ = instant_speed(int(d.get("bytes", 0) or 0))   # 保留采样状态，历史页仍用它
+    # v4.15：没有任何在跑/排队的任务时速度必须是 0；有任务时用「在传文件实测速度合计」。
+    # 残留 / 重启的异步 job 会让累计字节继续涨，按累计差分算会显示还在下载，其实任务早停了。
+    try:
+        with LOCK:
+            busy = any(str(j.get("state") or "") in ("running", "queued") for j in load_jobs())
+    except Exception:
+        busy = True
+    if not busy:
+        spd = 0.0
+    else:
+        spd = round(active_speed(d), 1)
+    return {"speed": spd, "bytes": d.get("bytes", 0),
+            "transferring": [{"name": t.get("name", ""), "bytes": t.get("bytes", 0),
+                              "total": t.get("totalBytes", 0), "speed": t.get("speed", 0)}
+                             for t in d.get("transferring", [])]}
+
+@action("settings")
+def h_settings(body):
+    return {"settings": load_settings(),
+            "state": {"diskLow": STATE["diskLow"], "diskFree": STATE["diskFree"],
+                    "diskTotal": STATE.get("diskTotal"), "storages": storages(),
+                    "proxyRcPort": PROXY_RC_PORT, "version": APP_VERSION},
+            "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
+            "netMode": net_mode(), "proxyScope": proxy_scope(),
+            "remux": remux_public()}
+
+@action("remuxscan")
+def h_remuxscan(body):
+    raw = str(body.get("path") or "").strip()
+    root = raw if raw.startswith("/") else os.path.join(DOWNLOAD_ROOT, raw) if raw else DOWNLOAD_ROOT
+    root = os.path.normpath(root)
+    roots = [DOWNLOAD_ROOT.rstrip("/")] + [p["console"].rstrip("/")
+                                           for p in (STATE.get("volumePairs") or [])]
+    # 只允许扫下载根/已挂载卷之内的目录：这个接口会批量起 ffmpeg，别给它任意路径
+    if not any(root == r or root.startswith(r + "/") for r in roots if r):
+        return {"error": "只能扫描下载目录内的路径"}
+    if not os.path.isdir(root):
+        return {"error": "目录不存在：%s" % root}
+    try:
+        n = int(body.get("depth") or 3)
+    except Exception:
+        n = 3
+    res = remux_scan(root, maxdepth=max(1, min(n, 6)))
+    res["root"] = root
+    return res
+
+@action("autotune")
+def h_autotune(body):
+    if AUTOTUNE_RUN.get("running"):
+        return {"error": "已有一次测速在进行（%s），等它跑完" % (AUTOTUNE_RUN.get("step") or "")}
+    jid = body.get("id")
+    if not jid:
+        return {"error": "请指定要测速的任务"}
+    s = load_settings()
+    secs = int(body.get("seconds") or s.get("autoTuneSeconds") or 45)
+    settle = int(body.get("settle") or s.get("autoTuneSettle") or 20)
+    cands = [(4, 4), (2, 8), (1, 16), (8, 2)]
+    threading.Thread(target=_autotune_worker, args=(jid, secs, settle, cands),
+                     daemon=True).start()
+    # 先占位，避免并发点两次都通过上面的 running 判定
+    AUTOTUNE_RUN.update({"running": True, "job": jid, "step": "准备",
+                         "results": [], "best": None, "error": "", "note": ""})
+    return {"ok": True, "candidates": [at_label(*c) for c in cands],
+            "seconds": secs, "settle": settle,
+            "etaSeconds": len(cands) * (secs + settle + 6)}
+
+@action("autotuneinfo")
+def h_autotuneinfo(body):
+    st = _at_read()
+    return {"ok": True, "best": at_best(),
+            "history": (st.get("history") or [])[-5:],
+            "run": dict(AUTOTUNE_RUN),
+            "candidates": [at_label(*c) for c in AUTOTUNE_CANDIDATES],
+            "maxConns": AUTOTUNE_MAX_CONNS}
+
+@action("tput")
+def h_tput(body):
+    job = next((j for j in load_jobs() if j.get("id") == body.get("id")), None)
+    if not job:
+        return {"error": "任务不存在"}
+    secs = max(5, min(120, int(body.get("seconds") or 20)))
+    return {"ok": True, "seconds": secs,
+            "mbps": round(measure_rate(job.get("dest"), secs), 2),
+            "destBytes": dir_bytes(job.get("dest"))}
+
+@action("savesettings")
+def h_savesettings(body):
+    with LOCK:
+        old = load_settings()
+        s = dict(old)
+        for k in SETTINGS_WRITABLE:
+            if k in body:
+                s[k] = body[k]
+        # v3.77：两个旧开关不再由前端单独控制，统一跟随全局模式
+        s["proxy"] = s["downloadProxy"] = (str(s.get("netMode") or "direct") == "proxy")
+        s["advancedMode"] = _truthy(body.get("advancedMode", s.get("advancedMode", False)))
+        s["shareAutoCancel"] = _truthy(body.get("shareAutoCancel", s.get("shareAutoCancel", False)))
+        s = _norm_settings(s)      # 统一钳制 / 白名单，非法值退回默认
+        save_settings(s)
+        STATE["firedStart"] = None
+        STATE["firedPause"] = None
+        changed = ((old.get("proxyUrl") or "") != (s.get("proxyUrl") or "")
+                   or old.get("netMode") != s.get("netMode"))
+        # v3.77：选代理却没有合法地址 → 自动回落直连，明确告知，不静默套默认地址
+        proxy_note = ""
+        if s.get("netMode") == "proxy" and not proxy_url():
+            s["netMode"] = "direct"
+            s["pkProxyMode"] = "direct"
+            s["proxy"] = s["downloadProxy"] = False
+            save_settings(s)
+            changed = True
+            proxy_note = "代理模式需要填写有效代理地址，已自动回落到直连"
+    # 只在模式/地址真的变了时重启 5573，且避开正在传输的任务
+    note2 = ""
+    if changed:
+        _, note2 = refresh_proxy_rc()
+    return {"ok": True, "settings": s,
+            "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
+            "netMode": net_mode(), "proxyScope": proxy_scope(),
+            "proxyNote": proxy_note or note2}
+
+@action("resetsettings")
+def h_resetsettings(body):
+    with LOCK:
+        s = dict(DEFAULTS)
+        # 清空「已完成传输」是显示层面的水位，不应该因为恢复默认设置而撤销
+        s["transfersClearedAt"] = load_settings().get("transfersClearedAt", 0)
+        save_settings(s)
+        STATE["firedStart"] = None
+        STATE["firedPause"] = None
+    return {"ok": True, "settings": s,
+            "effectiveProxyUrl": proxy_url() or "直连（未启用代理）",
+            "proxyScope": proxy_scope()}
+
+@action("cleartransfers")
+def h_cleartransfers(body):
+    with LOCK:
         s = load_settings()
-        token = str(s.get("pushplusToken") or "")
-        seen, _ = _notify_state_load()
-        return {"on": bool(_truthy(s.get("pushplusOn"))),
-                "tokenSet": pushplus_token_ok(token),
-                "tokenTail": token[-4:] if token else "",
-                "sentCount": len(seen)}
+        s["transfersClearedAt"] = time.time()
+        save_settings(s)
+    return {"ok": True}
 
-    if action == "quota":
-        remotes = [str(r) for r in (body.get("remotes") or [])]
-        force = bool(body.get("force"))
-        now = time.time()
-        def _quota_one(r):
-            try:
-                code, d = pk_api(r, "GET", "/vip/v1/quantity/list?type=transfer&limit=200")
-                if code >= 400 or (d or {}).get("error"):
-                    return {"remote": r, "error": _pk_err(code, d)}
-                b = (d or {}).get("base") or {}
-                def item(k):
-                    o = b.get(k) or {}
-                    return {"used": int(o.get("assets") or o.get("size") or 0),
-                            "total": int(o.get("total_assets") or 0)}
-                # 官方网页的四档：云下载 / 下行 / 上传 / 非会员每日下行
-                return {"remote": r, "offline": item("offline"), "download": item("download"),
-                        "upload": item("upload"), "daily": item("download_daily"),
-                        "vip": pk_vip_active(b),
-                        "sub": bool(b.get("sub_status"))}
-            except Exception as e:
-                msg = str(e)
-                # openlist / 本地盘等不是 PikPak 账号，没有 access_token 也就没有传输配额；
-                # 这是「不适用」，不是「读取失败」，前端应灰显而不是报红。
-                unsupported = ("access_token" in msg.lower() or
-                               "不在 rclone 配置里" in msg or "token" in msg.lower())
-                return {"remote": r, "error": ("非 PikPak 账号，无传输配额" if unsupported
-                                               else msg[:150]), "unsupported": unsupported}
+@action("clearfinished")
+def h_clearfinished(body):
+    with LOCK:
+        jobs = load_jobs()
+        keep, removed = [], 0
+        for j in jobs:
+            if j.get("state") in ("running", "queued"):
+                keep.append(j)
+                continue
+            removed += 1
+            if j.get("kind") == "xfer":
+                try:
+                    _xfer_kill(j)
+                except Exception:
+                    pass
+            if j.get("naming") == "v2":
+                try:        # v3.83：一并清掉该任务的文件级执行计划
+                    os.remove(_plan_path(j["id"]))
+                except Exception:
+                    pass
+        save_jobs(keep)
+        s = load_settings()
+        s["transfersClearedAt"] = time.time()
+        save_settings(s)
+    return {"ok": True, "removed": removed}
 
-        with QUOTA_LOCK:
-            todo = [r for r in remotes
-                    if force or not (QUOTA_CACHE.get(r) and now - QUOTA_CACHE[r][0] < QUOTA_TTL)]
-        if todo:
-            try:
-                from concurrent.futures import ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=min(9, len(todo))) as ex:
-                    results = list(ex.map(_quota_one, todo))
-                with QUOTA_LOCK:
-                    for r, out in zip(todo, results):
-                        QUOTA_CACHE[r] = (now, out)
-            except Exception:
-                for r in todo:
-                    out = _quota_one(r)
-                    with QUOTA_LOCK:
-                        QUOTA_CACHE[r] = (now, out)
-        out = []
-        with QUOTA_LOCK:
-            for r in remotes:
-                ent = QUOTA_CACHE.get(r)
-                out.append(ent[1] if ent else {"remote": r, "error": "未查询"})
-        return {"accounts": out}
+@action("pushplustest")
+def h_pushplustest(body):
+    s = load_settings()
+    token = str(body.get("token") or s.get("pushplusToken") or "").strip()
+    if not pushplus_token_ok(token):
+        return {"error": "PushPlus Token 未填写或格式不对（16~64 位字母数字）"}
+    res = pushplus_send(token, "云梭｜测试通知",
+                        "<p>这是一条测试消息：收到说明 PushPlus 链路正常。</p>"
+                        "<p style='color:#888;font-size:12px'>之后任务下载成功 / 失败会各推一条。</p>")
+    code = int(res.get("code") or 0) if isinstance(res, dict) else -1
+    if code != 200:
+        return {"error": "PushPlus 返回：%s" % str((res or {}).get("msg") or res)[:150]}
+    return {"ok": True, "msg": (res or {}).get("msg") or "已发送"}
 
-    if action == "history":
-        # 24h 速度曲线（5 分钟均值）+ 最近 14 天下载量
-        h = load_history()
-        now = int(time.time())
-        buckets = {}
-        for ts, sp in h.get("samples", []):
-            if now - 24 * 3600 <= ts <= now:
-                k = ts // 300
-                buckets.setdefault(k, []).append(sp)
-        series = [[k * 300, round(sum(v) / len(v), 1)] for k, v in sorted(buckets.items())]
-        daily = [{"date": d, "bytes": b} for d, b in sorted(h.get("daily", {}).items())[-14:]]
-        return {"series": series, "daily": daily}
+@action("notifystate")
+def h_notifystate(body):
+    s = load_settings()
+    token = str(s.get("pushplusToken") or "")
+    seen, _ = _notify_state_load()
+    return {"on": bool(_truthy(s.get("pushplusOn"))),
+            "tokenSet": pushplus_token_ok(token),
+            "tokenTail": token[-4:] if token else "",
+            "sentCount": len(seen)}
 
-    if action == "about":
-        remotes = [str(r) for r in (body.get("remotes") or [])]
+@action("quota")
+def h_quota(body):
+    remotes = [str(r) for r in (body.get("remotes") or [])]
+    force = bool(body.get("force"))
+    now = time.time()
+    def _quota_one(r):
+        try:
+            code, d = pk_api(r, "GET", "/vip/v1/quantity/list?type=transfer&limit=200")
+            if code >= 400 or (d or {}).get("error"):
+                return {"remote": r, "error": _pk_err(code, d)}
+            b = (d or {}).get("base") or {}
+            def item(k):
+                o = b.get(k) or {}
+                return {"used": int(o.get("assets") or o.get("size") or 0),
+                        "total": int(o.get("total_assets") or 0)}
+            # 官方网页的四档：云下载 / 下行 / 上传 / 非会员每日下行
+            return {"remote": r, "offline": item("offline"), "download": item("download"),
+                    "upload": item("upload"), "daily": item("download_daily"),
+                    "vip": pk_vip_active(b),
+                    "sub": bool(b.get("sub_status"))}
+        except Exception as e:
+            msg = str(e)
+            # openlist / 本地盘等不是 PikPak 账号，没有 access_token 也就没有传输配额；
+            # 这是「不适用」，不是「读取失败」，前端应灰显而不是报红。
+            unsupported = ("access_token" in msg.lower() or
+                           "不在 rclone 配置里" in msg or "token" in msg.lower())
+            return {"remote": r, "error": ("非 PikPak 账号，无传输配额" if unsupported
+                                           else msg[:150]), "unsupported": unsupported}
 
-        def _about_one(r):
-            try:
-                # 短超时：PikPak 等网盘常不支持 About，会挂到超时才失败；8s 拿不到就标记。
-                a = rc("operations/about", _timeout=8, fs=r + ":")
-                # rclone RC 出错是 HTTP 200 + {"error":...}，rc() 默认不抛异常；
-                # 不检查就会把失败当成 0 GB / 0 GB 配额显示，掩盖账号配置问题。
-                if isinstance(a, dict) and a.get("error"):
-                    raise RuntimeError(str(a["error"])[:150])
-                return {"remote": r,
-                        "used": int(a.get("used") or 0),
-                        "total": int(a.get("total") or 0),
-                        "free": int(a.get("free") or 0)}
-            except Exception as e:
-                msg = str(e)
-                low = msg.lower()
-                if isinstance(e, subprocess.TimeoutExpired) or ("timed out" in low) or ("timeout" in low):
-                    err, unsupported = "读取超时，稍后重试", False
-                elif ("about" in low) or ("not supported" in low) or ("not implement" in low) or ("doesn't support" in low):
-                    err, unsupported = "该网盘不提供容量配额接口", True
-                elif ("username" in low) or ("password" in low) or ("credential" in low) or ("no auth" in low):
-                    # v3.47：容量接口报这个同样是 token 失效后回退直登失败，
-                    # 不是「缺个字段去补一下」，指向重新登录采集才修得好。
-                    err, unsupported = "账号凭证已失效，请点该账号「重新登录」重新采集", False
-                else:
-                    err, unsupported = re.sub(r"Command '.*?'", "rclone", msg)[:100], False
-                return {"remote": r, "used": None, "total": None, "free": None,
-                        "unsupported": unsupported, "error": err}
-
-        # 并发查询：9 个账号串行 8s×9≈72s，前端会长时间停在骨架屏（几乎看不见的假空白）。
-        # 并发后总耗时≈最慢的一个（≤8s）；线程各自独立 subprocess，互不影响。
-        out = []
+    with QUOTA_LOCK:
+        todo = [r for r in remotes
+                if force or not (QUOTA_CACHE.get(r) and now - QUOTA_CACHE[r][0] < QUOTA_TTL)]
+    if todo:
         try:
             from concurrent.futures import ThreadPoolExecutor
-            n = min(12, max(1, len(remotes)))
-            with ThreadPoolExecutor(max_workers=n) as ex:
-                out = list(ex.map(_about_one, remotes))
+            with ThreadPoolExecutor(max_workers=min(9, len(todo))) as ex:
+                results = list(ex.map(_quota_one, todo))
+            with QUOTA_LOCK:
+                for r, out in zip(todo, results):
+                    QUOTA_CACHE[r] = (now, out)
         except Exception:
-            out = [_about_one(r) for r in remotes]
-        return {"accounts": out}
+            for r in todo:
+                out = _quota_one(r)
+                with QUOTA_LOCK:
+                    QUOTA_CACHE[r] = (now, out)
+    out = []
+    with QUOTA_LOCK:
+        for r in remotes:
+            ent = QUOTA_CACHE.get(r)
+            out.append(ent[1] if ent else {"remote": r, "error": "未查询"})
+    return {"accounts": out}
 
-    if action == "transfers":
-        # 本次运行已完成传输：从 rclone 日志解析 Copied 行（rclone 保留源 mtime，
-        # 文件系统时间无法区分，故 core/stats 的 transferring 差异也不可靠）。
+@action("history")
+def h_history(body):
+    h = load_history()
+    now = int(time.time())
+    buckets = {}
+    for ts, sp in h.get("samples", []):
+        if now - 24 * 3600 <= ts <= now:
+            k = ts // 300
+            buckets.setdefault(k, []).append(sp)
+    series = [[k * 300, round(sum(v) / len(v), 1)] for k, v in sorted(buckets.items())]
+    daily = [{"date": d, "bytes": b} for d, b in sorted(h.get("daily", {}).items())[-14:]]
+    return {"series": series, "daily": daily}
+
+@action("about")
+def h_about(body):
+    remotes = [str(r) for r in (body.get("remotes") or [])]
+
+    def _about_one(r):
         try:
-            jobs = load_jobs()
-            run = [j for j in jobs if j.get("state") == "running"]
-            if run:
-                since = min((j.get("started_ts") or time.time()) for j in run)
-            elif jobs:
-                since = max((j.get("started_ts") or 0) for j in jobs) or (time.time() - 21600)
+            # 短超时：PikPak 等网盘常不支持 About，会挂到超时才失败；8s 拿不到就标记。
+            a = rc("operations/about", _timeout=8, fs=r + ":")
+            # rclone RC 出错是 HTTP 200 + {"error":...}，rc() 默认不抛异常；
+            # 不检查就会把失败当成 0 GB / 0 GB 配额显示，掩盖账号配置问题。
+            if isinstance(a, dict) and a.get("error"):
+                raise RuntimeError(str(a["error"])[:150])
+            return {"remote": r,
+                    "used": int(a.get("used") or 0),
+                    "total": int(a.get("total") or 0),
+                    "free": int(a.get("free") or 0)}
+        except Exception as e:
+            msg = str(e)
+            low = msg.lower()
+            if isinstance(e, subprocess.TimeoutExpired) or ("timed out" in low) or ("timeout" in low):
+                err, unsupported = "读取超时，稍后重试", False
+            elif ("about" in low) or ("not supported" in low) or ("not implement" in low) or ("doesn't support" in low):
+                err, unsupported = "该网盘不提供容量配额接口", True
+            elif ("username" in low) or ("password" in low) or ("credential" in low) or ("no auth" in low):
+                # v3.47：容量接口报这个同样是 token 失效后回退直登失败，
+                # 不是「缺个字段去补一下」，指向重新登录采集才修得好。
+                err, unsupported = "账号凭证已失效，请点该账号「重新登录」重新采集", False
             else:
-                since = time.time() - 21600
-            # 「清空记录」水位：旧日志不再解析，之后新完成的文件照常出现
-            since = max(since, float(load_settings().get("transfersClearedAt") or 0))
-            return {"list": completed_transfers(since)[:80]}
-        except Exception as e:
-            return {"list": [], "error": str(e)[:120]}
+                err, unsupported = re.sub(r"Command '.*?'", "rclone", msg)[:100], False
+            return {"remote": r, "used": None, "total": None, "free": None,
+                    "unsupported": unsupported, "error": err}
 
-    if action == "bwlimit":
-        try:
-            d = rc("core/bwlimit")
-            return {"bytesPerSecond": d.get("bytesPerSecond", -1),
-                    "transferred": d.get("bytesTransferred", 0)}
-        except Exception as e:
-            return {"error": str(e)[:150]}
+    # 并发查询：9 个账号串行 8s×9≈72s，前端会长时间停在骨架屏（几乎看不见的假空白）。
+    # 并发后总耗时≈最慢的一个（≤8s）；线程各自独立 subprocess，互不影响。
+    out = []
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        n = min(12, max(1, len(remotes)))
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            out = list(ex.map(_about_one, remotes))
+    except Exception:
+        out = [_about_one(r) for r in remotes]
+    return {"accounts": out}
 
-    if action == "setbwlimit":
-        rate = (str(body.get("rate") or "off")).strip()
-        try:
-            rc_ok("core/bwlimit", rate=rate)
-        except Exception as e:
-            return {"error": str(e)[:150]}
-        try:
-            d = rc("core/bwlimit")
-            return {"ok": True, "bytesPerSecond": d.get("bytesPerSecond", -1)}
-        except Exception:
-            return {"ok": True}
+@action("transfers")
+def h_transfers(body):
+    try:
+        jobs = load_jobs()
+        run = [j for j in jobs if j.get("state") == "running"]
+        if run:
+            since = min((j.get("started_ts") or time.time()) for j in run)
+        elif jobs:
+            since = max((j.get("started_ts") or 0) for j in jobs) or (time.time() - 21600)
+        else:
+            since = time.time() - 21600
+        # 「清空记录」水位：旧日志不再解析，之后新完成的文件照常出现
+        since = max(since, float(load_settings().get("transfersClearedAt") or 0))
+        return {"list": completed_transfers(since)[:80]}
+    except Exception as e:
+        return {"list": [], "error": str(e)[:120]}
 
-    if action == "version":
-        # consoleVersion 同源返回，前端页脚不再硬编码，避免版本显示落后
-        try:
-            d = rc("core/version")
-            return {"version": str(d.get("version", "")), "os": str(d.get("os", "")),
-                    "arch": str(d.get("arch", "")), "consoleVersion": APP_VERSION,
-                    "https": tls_cert_ready()}
-        except Exception as e:
-            return {"error": str(e)[:150], "consoleVersion": APP_VERSION,
-                    "https": tls_cert_ready()}
+@action("bwlimit")
+def h_bwlimit(body):
+    try:
+        d = rc("core/bwlimit")
+        return {"bytesPerSecond": d.get("bytesPerSecond", -1),
+                "transferred": d.get("bytesTransferred", 0)}
+    except Exception as e:
+        return {"error": str(e)[:150]}
 
-    if action == "jobdetail":
-        # 任务详情：实时传输文件 + 落盘文件清单（含总大小）
-        jid = body.get("id")
-        with LOCK:
-            jobs = load_jobs()
-            job = next((j for j in jobs if j.get("id") == jid), None)
-            if job:
-                job_live(job)
-                save_jobs(jobs)
-        if not job:
-            return {"error": "任务不存在"}
-        d = {"job": job, "transferring": [], "files": [], "diskTotal": 0,
-             "diskCount": 0, "exists": False, "truncated": False}
-        if job.get("naming") == "v2":
-            # v3.83：详情里同时给出原名与落盘名，以及文件级进度 / 失败清单
-            d["naming"] = "v2"
-            d["originalName"] = job.get("leaf") or basename_of(job.get("subpath") or "")
-            d["safeName"] = job.get("safe_leaf") or ""
-            plan = None if job.get("single_file") else load_file_plan(job["id"])
-            if plan:
-                entries = plan.get("entries") or []
-                d["fileStats"] = {
-                    "total": len(entries),
-                    "done": sum(1 for e in entries if e.get("status") in ("done", "skipped")),
-                    "failed": sum(1 for e in entries if e.get("status") == "failed"),
-                    "pending": sum(1 for e in entries if e.get("status") in ("pending", "running")),
-                }
-                fails = [{"src": e.get("src"), "dst": e.get("dst"),
-                          "error": e.get("error") or "", "attempts": e.get("attempts") or 0}
-                         for e in entries if e.get("status") == "failed"]
-                d["failedFiles"] = fails[:200]
-                d["failedTruncated"] = len(fails) > 200
-                d["nameMap"] = [{"src": e.get("src"), "dst": e.get("dst"),
-                                 "status": e.get("status"), "size": e.get("size") or 0}
-                                for e in entries if e.get("src") != e.get("dst")][:200]
-                with SAFE_JOBS_LOCK:
-                    live_state = SAFE_LIVE.get(job["id"]) or {}
-                lives = dict(live_state.get("live") or {})
-                # v3.92：用 worker 的实时采样填字节/速度，不再写死 0
-                d["transferring"] = build_live_transferring(entries, lives)
-        if job["state"] == "running" and job.get("jobid"):
-            try:
-                s = rc("core/stats", group="job/%d" % job["jobid"],
-                       _proxy=bool(job.get("proxy")))
-                d["transferring"] = [{"name": t.get("name", ""), "bytes": t.get("bytes", 0),
-                                      "total": t.get("totalBytes", 0), "speed": t.get("speed", 0)}
-                                     for t in (s.get("transferring") or [])]
-            except Exception:
-                pass
-        dest = str(job.get("dest") or "")
-        lp = local_dest(dest)
-        p = os.path.realpath(lp) if lp else ""
-        # v3.57：落盘内容须落在任一存储空间内，且不能是卷根本身
-        in_root = bool(lp) and any(
-            p != os.path.realpath(r) and p.startswith(os.path.realpath(r) + os.sep)
-            for r in local_roots())
-        if in_root and os.path.isdir(p):
-            d["exists"] = True
-            total, rows = 0, []
-            for root, dirs, files in os.walk(p):
-                dirs.sort()
-                for fn in sorted(files):
-                    fp = os.path.join(root, fn)
-                    try:
-                        if not os.path.isfile(fp):
-                            continue
-                        st = os.stat(fp)
-                    except OSError:
-                        continue
-                    total += st.st_size
-                    rows.append({"path": os.path.relpath(fp, p), "size": st.st_size,
-                                 "mtime": int(st.st_mtime)})
-                    if len(rows) >= 1000:
-                        d["truncated"] = True
-                        break
-                if d["truncated"]:
-                    break
-            rows.sort(key=lambda x: -x["size"])
-            d["files"], d["diskTotal"], d["diskCount"] = rows, total, len(rows)
-        return d
-
-    if action == "cleanup":
-        # 清理落盘文件（危险操作：仅允许存储空间内的任务目录，防止路径逃逸或整卷删除）
-        dest = str(body.get("dest") or "")
-        # v3.61：该目录还有任务在排队/下载时拒绝清理，避免边下边删
-        with LOCK:
-            busy = sum(1 for j in load_jobs()
-                       if j.get("dest") == dest and j.get("state") in ("running", "queued"))
-        if busy:
-            return {"error": "该目录还有 %d 个任务在排队或下载中，请先暂停/等任务结束再清理" % busy}
-        lp = local_dest(dest)
-        p = os.path.realpath(lp) if lp else ""
-        if not lp or not any(
-                p != os.path.realpath(r) and p.startswith(os.path.realpath(r) + os.sep)
-                for r in local_roots()):
-            return {"error": "非法路径，仅允许清理存储空间内的任务目录"}
-        if not os.path.isdir(p):
-            return {"error": "目录不存在（可能已清理过）"}
-        freed = 0
-        for root, dirs, files in os.walk(p):
-            for fn in files:
-                try:
-                    freed += os.stat(os.path.join(root, fn)).st_size
-                except OSError:
-                    pass
-        shutil.rmtree(p)
-        with LOCK:
-            jobs = load_jobs()
-            for j in jobs:
-                if j.get("dest") == dest:
-                    j["cleaned"] = True
-            save_jobs(jobs)
-        return {"ok": True, "freed": freed}
-
-    if action == "accounts":
-        # 账号列表：只回传名称、类型与身份记录里的登录邮箱，token/密码等敏感字段绝不离开后端
-        # v3.51：config/dump 会列出「只有 captcha_token、没有 type」的空壳段，
-        # 那是 rclone 给已改名/删除的旧账号名回写验证码留下的残留，rclone 无法实例化，
-        # 放进列表就会显示 type=? 并在「一键测试全部」里刷一排 didn't find section。
-        # 这里统一过滤，并把名字单独回传给前端供「清理残留」使用。
-        try:
-            d = rc("config/dump")
-        except Exception as e:
-            return {"error": str(e)[:150], "accounts": [], "ghosts": []}
-        meta = load_meta()
-        out, ghosts = [], []
-        for k, v in sorted(d.items()):
-            atype = str((v or {}).get("type") or "").strip()
-            if not atype:
-                ghosts.append(k)
-                continue
-            ident = meta.get(k)
-            email = str((ident or {}).get("email") or "") if isinstance(ident, dict) else ""
-            cred = cred_health(k, v, meta) if atype == "pikpak" else None
-            out.append({"name": k, "type": atype, "email": email, "cred": cred})
-        # v3.93：账号页只刷一排超时时，用户看不出「某几个账号凭证已经彻底死了」。
-        # 这里聚合一次，前端可以只渲染一条提示 + 直接去重新登录。
-        dead = [{"name": a["name"], "note": (a.get("cred") or {}).get("note", "")}
-                for a in out
-                if isinstance(a.get("cred"), dict) and a["cred"].get("state") == "dead"]
-        alerts = []
-        if dead:
-            alerts.append({"kind": "cred_dead", "level": "error",
-                           "title": "%d 个账号凭证已失效" % len(dead),
-                           "text": "、".join(d["name"] for d in dead[:5])
-                                   + "，点对应账号的「重新登录」重新采集 Token",
-                           "accounts": dead})
-        return {"accounts": out, "ghosts": ghosts, "alerts": alerts}
-
-    if action == "providers":
-        return {"providers": PROVIDERS}
-
-    if action == "credcheck":
-        # 手动触发一轮凭证保活 / 体检（后台保活每 12 小时自动跑一次，无需人工点）
-        names = body.get("names") if isinstance(body.get("names"), list) else None
-        rs = cred_keepalive_once(names)
-        return {"results": rs, "okCount": sum(1 for r in rs if r["ok"]), "total": len(rs)}
-
-    if action == "acctadd":
-        name = str(body.get("name") or "").strip()
-        atype = str(body.get("type") or "").strip()
-        params = body.get("params") if isinstance(body.get("params"), dict) else {}
-        if not re.match(r'^[\w\u4e00-\u9fff-]{1,64}$', name):
-            return {"error": "账号名只能包含中英文/数字/下划线/连字符（1-64 位）"}
-        if atype not in [p["type"] for p in PROVIDERS]:
-            return {"error": "不支持的类型: " + atype[:40]}
-        clean = {}
-        for k, v in params.items():
-            k, v = str(k).strip(), str(v).strip()
-            if k and v:
-                clean[k] = v
-        if atype == "webdav":
-            # v3.67：OpenList/Alist 场景 vendor 几乎总是 other，不填自动补默认，
-            # 保证 rclone 非交互 config/create 不会因缺 vendor 失败
-            clean.setdefault("vendor", "other")
-        if atype == "pikpak" and clean.get("refresh_token") and len(clean["refresh_token"]) < 20:
-            return {"error": "refresh_token 看起来无效（长度不足）"}
-        if atype == "pikpak":
-            # pikpak 后端只认 token 字段：refresh_token 换发，或账号密码直登
-            if clean.get("refresh_token"):
-                try:
-                    tok_json, newrt = pikpak_token_json(clean["refresh_token"])
-                except RuntimeError as e:
-                    return {"error": mask_secret(str(e))}
-                clean["token"] = tok_json
-                clean["refresh_token"] = newrt
-            elif clean.get("username") and clean.get("password"):
-                try:
-                    tok_json, newrt, did = pikpak_signin(clean["username"], clean["password"],
-                                                        clean.get("device_id"))
-                except RuntimeError as e:
-                    return {"error": mask_secret(str(e))}
-                clean.pop("username", None)
-                clean.pop("password", None)
-                clean["token"] = tok_json
-                clean["refresh_token"] = newrt
-                clean["device_id"] = did
-            else:
-                return {"error": "PikPak 需要填 refresh_token，或填账号 + 密码"}
-        try:
-            conf = rc("config/dump")
-            if name in conf:
-                return {"error": "账号名已存在"}
-        except Exception:
-            pass
-        try:
-            rc("config/create", name=name, type=atype,
-               parameters=json.dumps(clean, ensure_ascii=False), obscure="true")
-        except Exception:
-            pass  # 后端实例化校验可能报错，但配置段已写入 —— 以 list 实测为准
-        ok, err = (pikpak_verify(name) if atype == "pikpak" else verify_list(name))
-        if not ok:
-            try:
-                rc("config/delete", name=name)
-            except Exception:
-                pass
-            return {"error": "连接验证失败，已回滚删除：%s" % err}
-        return {"ok": True, "note": err} if err else {"ok": True}
-
-    if action == "acctdel":
-        name = str(body.get("name") or "").strip()
-        try:
-            rc("config/delete", name=name)
-        except Exception as e:
-            return {"error": str(e)[:150]}
-        # v3.68：代理 rcd（5573）内存里也删一份 —— 只删主进程时，代理进程的下一次
-        # SaveConfig 会把已删段落写回 rclone.conf，账号就在云盘浏览列表里"复活"
-        try:
-            rc("config/delete", name=name, _proxy=True)
-        except Exception:
-            pass
-        # v3.51：两个 rcd 各清一次，否则另一个进程的下一次 SaveConfig 会把它写回来
-        try:
-            purge_ghost_sections([name])
-        except Exception:
-            pass
+@action("setbwlimit")
+def h_setbwlimit(body):
+    rate = (str(body.get("rate") or "off")).strip()
+    try:
+        rc_ok("core/bwlimit", rate=rate)
+    except Exception as e:
+        return {"error": str(e)[:150]}
+    try:
+        d = rc("core/bwlimit")
+        return {"ok": True, "bytesPerSecond": d.get("bytesPerSecond", -1)}
+    except Exception:
         return {"ok": True}
 
-    if action == "acctpurge":
-        # v3.51 手动清理无 type 的残留空壳段（改名 / 删除后 rclone 的 captcha 回写）
-        removed = purge_ghost_sections()
-        # v3.68 双进程对账：代理 rcd（5573）内存里比主进程多出来的段（含有效段）同步删除。
-        # 根治「账号删除后云盘浏览列表又冒出来」——旧版只删主进程，代理侧写回即复活。
-        ghost = []
-        try:
-            main = rc("config/dump", _timeout=20)
-        except Exception:
-            main = {}
-        try:
-            pconf = rc("config/dump", _proxy=True, _timeout=20)
-        except Exception:
-            pconf = {}
-        if isinstance(main, dict) and isinstance(pconf, dict):
-            for k in pconf:
-                if k not in main:
-                    try:
-                        rc("config/delete", name=k, _proxy=True, _timeout=20)
-                        ghost.append(k)
-                    except Exception:
-                        pass
-        return {"ok": True, "removed": removed, "resynced": ghost}
+@action("version")
+def h_version(body):
+    try:
+        d = rc("core/version")
+        return {"version": str(d.get("version", "")), "os": str(d.get("os", "")),
+                "arch": str(d.get("arch", "")), "consoleVersion": APP_VERSION,
+                "https": tls_cert_ready()}
+    except Exception as e:
+        return {"error": str(e)[:150], "consoleVersion": APP_VERSION,
+                "https": tls_cert_ready()}
 
-    if action == "acctrename":
-        # rclone RC 没有 config/rename，只能「读整段 → 建新段 → 删旧段」。
-        # config/dump 的值已是配置文件里的形态，必须用 obscure=false 原样写回
-        # （实测 token / refresh_token / device_id / captcha_token 逐字段一致）。
-        old = str(body.get("name") or "").strip()
-        new = str(body.get("newName") or "").strip()
-        if not old or not new:
-            return {"error": "账号名不能为空"}
-        if old == new:
-            return {"ok": True, "name": new}
-        if not re.fullmatch(r"[\w\u4e00-\u9fff.\-]{1,64}", new):
-            return {"error": "账号名只能用中英文、数字、_ - .，最长 64 字符"}
+@action("jobdetail")
+def h_jobdetail(body):
+    jid = body.get("id")
+    with LOCK:
+        jobs = load_jobs()
+        job = next((j for j in jobs if j.get("id") == jid), None)
+        if job:
+            job_live(job)
+            save_jobs(jobs)
+    if not job:
+        return {"error": "任务不存在"}
+    d = {"job": job, "transferring": [], "files": [], "diskTotal": 0,
+         "diskCount": 0, "exists": False, "truncated": False}
+    if job.get("naming") == "v2":
+        # v3.83：详情里同时给出原名与落盘名，以及文件级进度 / 失败清单
+        d["naming"] = "v2"
+        d["originalName"] = job.get("leaf") or basename_of(job.get("subpath") or "")
+        d["safeName"] = job.get("safe_leaf") or ""
+        plan = None if job.get("single_file") else load_file_plan(job["id"])
+        if plan:
+            entries = plan.get("entries") or []
+            d["fileStats"] = {
+                "total": len(entries),
+                "done": sum(1 for e in entries if e.get("status") in ("done", "skipped")),
+                "failed": sum(1 for e in entries if e.get("status") == "failed"),
+                "pending": sum(1 for e in entries if e.get("status") in ("pending", "running")),
+            }
+            fails = [{"src": e.get("src"), "dst": e.get("dst"),
+                      "error": e.get("error") or "", "attempts": e.get("attempts") or 0}
+                     for e in entries if e.get("status") == "failed"]
+            d["failedFiles"] = fails[:200]
+            d["failedTruncated"] = len(fails) > 200
+            d["nameMap"] = [{"src": e.get("src"), "dst": e.get("dst"),
+                             "status": e.get("status"), "size": e.get("size") or 0}
+                            for e in entries if e.get("src") != e.get("dst")][:200]
+            with SAFE_JOBS_LOCK:
+                live_state = SAFE_LIVE.get(job["id"]) or {}
+            lives = dict(live_state.get("live") or {})
+            # v3.92：用 worker 的实时采样填字节/速度，不再写死 0
+            d["transferring"] = build_live_transferring(entries, lives)
+    if job["state"] == "running" and job.get("jobid"):
         try:
-            conf = rc_ok("config/dump")
-        except Exception as e:
-            return {"error": "读取配置失败：%s" % str(e)[:120]}
-        if old not in conf:
-            return {"error": "原账号不存在：" + old}
-        if new in conf:
-            return {"error": "账号名已存在：" + new}
-        seg = dict(conf[old] or {})
-        atype = str(seg.pop("type") or "")
-        if not atype:
-            return {"error": "账号类型缺失，无法重命名"}
-        try:
-            rc_ok("config/create", name=new, type=atype,
-                  parameters=json.dumps(seg, ensure_ascii=False), obscure="false")
-        except Exception as e:
-            return {"error": "创建新账号失败：%s" % str(e)[:150]}
-        try:
-            chk = rc_ok("config/get", name=new)
-            if str(chk.get("type") or "") != atype:
-                raise RuntimeError("类型不一致")
-        except Exception as e:
-            try:
-                rc("config/delete", name=new)
-            except Exception:
-                pass
-            return {"error": "新账号回读失败，已回滚：%s" % str(e)[:120]}
-        # 身份表与任务记录的改写必须持 LOCK：jobs 轮询 / worker 线程随时可能并发写盘，
-        # 裸奔的整表覆盖写会把别人刚写的进度/新任务回滚掉（v3.57 修复的丢数据竞态）
-        try:
-            with LOCK:
-                m = load_meta()
-                if old in m:
-                    m[new] = m.pop(old)
-                    save_meta(m)
+            s = rc("core/stats", group="job/%d" % job["jobid"],
+                   _proxy=bool(job.get("proxy")))
+            d["transferring"] = [{"name": t.get("name", ""), "bytes": t.get("bytes", 0),
+                                  "total": t.get("totalBytes", 0), "speed": t.get("speed", 0)}
+                                 for t in (s.get("transferring") or [])]
         except Exception:
             pass
-        # 任务记录：remote 和 src 的「账号:路径」前缀同步替换，避免历史任务指向空配置
-        try:
-            with LOCK:
-                jobs = load_jobs()
-                changed = False
-                for j in jobs if isinstance(jobs, list) else []:
-                    if not isinstance(j, dict):
+    dest = str(job.get("dest") or "")
+    lp = local_dest(dest)
+    p = os.path.realpath(lp) if lp else ""
+    # v3.57：落盘内容须落在任一存储空间内，且不能是卷根本身
+    in_root = bool(lp) and any(
+        p != os.path.realpath(r) and p.startswith(os.path.realpath(r) + os.sep)
+        for r in local_roots())
+    if in_root and os.path.isdir(p):
+        d["exists"] = True
+        total, rows = 0, []
+        for root, dirs, files in os.walk(p):
+            dirs.sort()
+            for fn in sorted(files):
+                fp = os.path.join(root, fn)
+                try:
+                    if not os.path.isfile(fp):
                         continue
-                    if str(j.get("remote") or "") == old:
-                        j["remote"] = new
-                        changed = True
-                    src = str(j.get("src") or "")
-                    if src.startswith(old + ":"):
-                        j["src"] = new + src[len(old):]
-                        changed = True
-                if changed:
-                    save_jobs(jobs)
-        except Exception:
-            pass
-        try:
-            rc_ok("config/delete", name=old)
-        except Exception as e:
-            return {"error": "新名已生效，但旧名删除失败（请手动清理）：%s" % str(e)[:120]}
-        # v3.51：pikpak 后端可能给刚删掉的旧名回写 captcha_token 造出空壳段，
-        # 两个 rcd 都清一次，避免下次「一键测试全部」又列出旧账号。
-        try:
-            purge_ghost_sections([old])
-        except Exception:
-            pass
-        return {"ok": True, "name": new}
-
-    if action == "acctrepair":
-        # 一键修复 PikPak 账号：token 空则用 refresh_token 重换；device_id 被风控则换新
-        name = str(body.get("name") or "").strip()
-        try:
-            conf = rc("config/dump")
-        except Exception as e:
-            return {"error": str(e)[:150]}
-        targets = [name] if name else [k for k, v in conf.items()
-                                       if str((v or {}).get("type")) == "pikpak"]
-        results = []
-        for n in targets:
-            cfg = conf.get(n) or {}
-            msg = ""
-            if not str(cfg.get("token") or ""):
-                rt = cfg_rt(cfg)
-                if not rt:
-                    results.append({"name": n, "ok": False, "msg": "没有 refresh_token，请在「编辑」里填新的"})
+                    st = os.stat(fp)
+                except OSError:
                     continue
-                try:
-                    tok_json, newrt = pikpak_token_json(rt)
-                except RuntimeError as e:
-                    results.append({"name": n, "ok": False, "msg": str(e)[:180]})
-                    continue
-                try:
-                    rc("config/update", name=n, type="pikpak",
-                       parameters=json.dumps({"token": tok_json, "refresh_token": newrt}))
-                    msg = "已用 refresh_token 换发 token；"
-                except Exception as e:
-                    results.append({"name": n, "ok": False, "msg": "写入 token 失败：%s" % str(e)[:120]})
-                    continue
-            ok, note = pikpak_verify(n)
-            if ok:
-                meta_patch(n, {"lastOk": int(time.time()), "lastErr": "", "cred": "ok"})
-            else:
-                meta_patch(n, {"lastErr": str(note)[:200], "lastCheck": int(time.time())})
-            sync_rt_mirror(n)
-            results.append({"name": n, "ok": ok, "msg": (msg + (note or "连接正常"))[:200]})
-        return {"results": results, "okCount": sum(1 for r in results if r["ok"]),
-                "total": len(results)}
+                total += st.st_size
+                rows.append({"path": os.path.relpath(fp, p), "size": st.st_size,
+                             "mtime": int(st.st_mtime)})
+                if len(rows) >= 1000:
+                    d["truncated"] = True
+                    break
+            if d["truncated"]:
+                break
+        rows.sort(key=lambda x: -x["size"])
+        d["files"], d["diskTotal"], d["diskCount"] = rows, total, len(rows)
+    return d
 
-    if action == "accttest":
-        name = str(body.get("name") or "").strip()
-        # 真连接测试：list 根目录会真正实例化该 remote（about 很多后端不支持，会假成功）
-        atype = ""
-        try:
-            atype = str((rc("config/get", name=name) or {}).get("type") or "")
-        except Exception:
-            pass
-        if atype == "pikpak":
-            ok, err = pikpak_verify(name)   # 被风控时自动换 device_id 自愈
-        else:
-            ok, err = verify_list(name)
-        if atype == "pikpak":
-            if ok:
-                meta_patch(name, {"lastOk": int(time.time()), "lastErr": "", "cred": "ok"})
-                sync_rt_mirror(name)        # rclone 若刚轮换过 rt，立刻同步顶层镜像
-            else:
-                meta_patch(name, {"lastErr": str(err)[:200], "lastCheck": int(time.time())})
-        if not ok:
-            # v3.38：告诉前端这是「只能重新登录」的凭证错误，行内直接给按钮
-            return {"ok": False, "error": mask_secret(err[:250]), "relink": need_relink(err)}
-        used = total = free = None
-        try:
-            a = rc_ok("operations/about", fs=name + ":")
-            used, total, free = a.get("used"), a.get("total"), a.get("free")
-        except Exception:
-            pass
-        try:
-            items = len((rc_ok("operations/list", fs=name + ":", remote="") or {}).get("list") or [])
-        except Exception:
-            items = None
-        return {"ok": True, "used": used, "total": total, "free": free,
-                "items": items, "note": err}
-
-    if action == "acctget":
-        # 编辑账号：只回传脱敏后的当前值，refresh_token / 密码等绝不离开后端
-        name = str(body.get("name") or "").strip()
-        try:
-            cfg = rc("config/get", name=name)
-        except Exception as e:
-            return {"error": "读取账号配置失败: %s" % str(e)[:150]}
-        atype = str(cfg.get("type") or "")
-        if not atype:
-            return {"error": "账号不存在: " + name}
-        prov = next((p for p in PROVIDERS if p["type"] == atype), None)
-        if prov:
-            defs = [{"name": p["name"], "label": p["label"],
-                     "secret": bool(p.get("secret")) or bool(re.search(r"token|pass|secret|key", p["name"], re.I)),
-                     "ph": p.get("ph", "")} for p in prov["params"]]
-        else:
-            # 未知类型：按现有配置键生成字段，跳过 rclone 内部缓存字段
-            defs = [{"name": k, "label": k,
-                     "secret": bool(re.search(r"pass|token|secret|key", k, re.I)), "ph": ""}
-                    for k in sorted(cfg) if k not in ("type", "token", "captcha_token")]
-        fields = []
-        for d in defs:
-            s = str(cfg.get(d["name"]) or "")
-            if not s:
-                masked = ""
-            elif d["secret"]:
-                masked = "已设置 · %d 位" % len(s)
-            else:
-                masked = (s[:6] + "…" + s[-4:]) if len(s) > 14 else s
-            fields.append(dict(d, has=bool(s), masked=masked))
-        ident = load_meta().get(name)
-        ident = ident if isinstance(ident, dict) else {}
-        return {"name": name, "type": atype, "fields": fields,
-                "email": str(ident.get("email") or ""),
-                "sub": str(ident.get("sub") or "")}
-
-    if action == "acctedit":
-        # 局部更新账号配置。留空的字段保持原值；pikpak 可用现有 refresh_token 重新换发 token
-        name = str(body.get("name") or "").strip()
-        renewed = bool(body.get("refresh"))
-        params = body.get("params") if isinstance(body.get("params"), dict) else {}
-        clean = {}
-        for k, v in params.items():
-            k, v = str(k).strip(), str(v).strip()
-            if k and v:
-                clean[k] = v
-        if not clean and not renewed:
-            return {"error": "没有填写任何要修改的内容"}
-        try:
-            cfg = rc("config/get", name=name)
-        except Exception as e:
-            return {"error": "账号不存在或读取失败: %s" % str(e)[:150]}
-        atype = str(cfg.get("type") or "")
-        if not atype:
-            return {"error": "账号不存在: " + name}
-        if atype == "pikpak" and "refresh_token" in clean and len(clean["refresh_token"]) < 20:
-            return {"error": "refresh_token 看起来无效（长度不足）"}
-        if atype == "pikpak" and (renewed or ("refresh_token" in clean and body.get("clearToken", True))):
-            # pikpak 后端不读 refresh_token，必须换出 access_token 后整段写回 token
-            rt = clean.get("refresh_token") or cfg_rt(cfg)
-            if not rt:
-                return {"error": "该账号没有可用的 refresh_token，请在下面填写一个新的"}
+@action("cleanup")
+def h_cleanup(body):
+    dest = str(body.get("dest") or "")
+    # v3.61：该目录还有任务在排队/下载时拒绝清理，避免边下边删
+    with LOCK:
+        busy = sum(1 for j in load_jobs()
+                   if j.get("dest") == dest and j.get("state") in ("running", "queued"))
+    if busy:
+        return {"error": "该目录还有 %d 个任务在排队或下载中，请先暂停/等任务结束再清理" % busy}
+    lp = local_dest(dest)
+    p = os.path.realpath(lp) if lp else ""
+    if not lp or not any(
+            p != os.path.realpath(r) and p.startswith(os.path.realpath(r) + os.sep)
+            for r in local_roots()):
+        return {"error": "非法路径，仅允许清理存储空间内的任务目录"}
+    if not os.path.isdir(p):
+        return {"error": "目录不存在（可能已清理过）"}
+    freed = 0
+    for root, dirs, files in os.walk(p):
+        for fn in files:
             try:
-                tok_json, newrt = pikpak_token_json(rt)
+                freed += os.stat(os.path.join(root, fn)).st_size
+            except OSError:
+                pass
+    shutil.rmtree(p)
+    with LOCK:
+        jobs = load_jobs()
+        for j in jobs:
+            if j.get("dest") == dest:
+                j["cleaned"] = True
+        save_jobs(jobs)
+    return {"ok": True, "freed": freed}
+
+@action("accounts")
+def h_accounts(body):
+    try:
+        d = rc("config/dump")
+    except Exception as e:
+        return {"error": str(e)[:150], "accounts": [], "ghosts": []}
+    meta = load_meta()
+    out, ghosts = [], []
+    for k, v in sorted(d.items()):
+        atype = str((v or {}).get("type") or "").strip()
+        if not atype:
+            ghosts.append(k)
+            continue
+        ident = meta.get(k)
+        email = str((ident or {}).get("email") or "") if isinstance(ident, dict) else ""
+        cred = cred_health(k, v, meta) if atype == "pikpak" else None
+        out.append({"name": k, "type": atype, "email": email, "cred": cred})
+    # v3.93：账号页只刷一排超时时，用户看不出「某几个账号凭证已经彻底死了」。
+    # 这里聚合一次，前端可以只渲染一条提示 + 直接去重新登录。
+    dead = [{"name": a["name"], "note": (a.get("cred") or {}).get("note", "")}
+            for a in out
+            if isinstance(a.get("cred"), dict) and a["cred"].get("state") == "dead"]
+    alerts = []
+    if dead:
+        alerts.append({"kind": "cred_dead", "level": "error",
+                       "title": "%d 个账号凭证已失效" % len(dead),
+                       "text": "、".join(d["name"] for d in dead[:5])
+                               + "，点对应账号的「重新登录」重新采集 Token",
+                       "accounts": dead})
+    return {"accounts": out, "ghosts": ghosts, "alerts": alerts}
+
+@action("providers")
+def h_providers(body):
+    return {"providers": PROVIDERS}
+
+@action("credcheck")
+def h_credcheck(body):
+    names = body.get("names") if isinstance(body.get("names"), list) else None
+    rs = cred_keepalive_once(names)
+    return {"results": rs, "okCount": sum(1 for r in rs if r["ok"]), "total": len(rs)}
+
+@action("acctadd")
+def h_acctadd(body):
+    name = str(body.get("name") or "").strip()
+    atype = str(body.get("type") or "").strip()
+    params = body.get("params") if isinstance(body.get("params"), dict) else {}
+    if not re.match(r'^[\w\u4e00-\u9fff-]{1,64}$', name):
+        return {"error": "账号名只能包含中英文/数字/下划线/连字符（1-64 位）"}
+    if atype not in [p["type"] for p in PROVIDERS]:
+        return {"error": "不支持的类型: " + atype[:40]}
+    clean = {}
+    for k, v in params.items():
+        k, v = str(k).strip(), str(v).strip()
+        if k and v:
+            clean[k] = v
+    if atype == "webdav":
+        # v3.67：OpenList/Alist 场景 vendor 几乎总是 other，不填自动补默认，
+        # 保证 rclone 非交互 config/create 不会因缺 vendor 失败
+        clean.setdefault("vendor", "other")
+    if atype == "pikpak" and clean.get("refresh_token") and len(clean["refresh_token"]) < 20:
+        return {"error": "refresh_token 看起来无效（长度不足）"}
+    if atype == "pikpak":
+        # pikpak 后端只认 token 字段：refresh_token 换发，或账号密码直登
+        if clean.get("refresh_token"):
+            try:
+                tok_json, newrt = pikpak_token_json(clean["refresh_token"])
             except RuntimeError as e:
                 return {"error": mask_secret(str(e))}
             clean["token"] = tok_json
             clean["refresh_token"] = newrt
-        # config/update 在后端实例化校验失败时也会返回 error，但配置已落盘 —— 以回读为准
+        elif clean.get("username") and clean.get("password"):
+            try:
+                tok_json, newrt, did = pikpak_signin(clean["username"], clean["password"],
+                                                    clean.get("device_id"))
+            except RuntimeError as e:
+                return {"error": mask_secret(str(e))}
+            clean.pop("username", None)
+            clean.pop("password", None)
+            clean["token"] = tok_json
+            clean["refresh_token"] = newrt
+            clean["device_id"] = did
+        else:
+            return {"error": "PikPak 需要填 refresh_token，或填账号 + 密码"}
+    try:
+        conf = rc("config/dump")
+        if name in conf:
+            return {"error": "账号名已存在"}
+    except Exception:
+        pass
+    try:
+        rc("config/create", name=name, type=atype,
+           parameters=json.dumps(clean, ensure_ascii=False), obscure="true")
+    except Exception:
+        pass  # 后端实例化校验可能报错，但配置段已写入 —— 以 list 实测为准
+    ok, err = (pikpak_verify(name) if atype == "pikpak" else verify_list(name))
+    if not ok:
         try:
-            rc("config/update", name=name, type=atype,
-               parameters=json.dumps(clean, ensure_ascii=False), obscure="true")
+            rc("config/delete", name=name)
         except Exception:
             pass
-        try:
-            now = rc("config/get", name=name)
-            bad = []
-            for k, v in clean.items():
-                cur = str(now.get(k) or "")
-                if v == "" and cur:
-                    bad.append(k + "(未清空)")
-                elif v != "" and not cur:
-                    bad.append(k + "(未写入)")
-            if bad:
-                return {"error": "写入未生效: " + ", ".join(bad)}
-        except Exception as e:
-            return {"error": "回读配置失败: %s" % str(e)[:150]}
-        # 写完立刻实测：配置落盘 ≠ 能连上（token 过期/被轮换/device_id 被风控都会失败）
-        ok, err = (pikpak_verify(name) if atype == "pikpak" else verify_list(name))
-        if not ok:
-            return {"error": "配置已写入，但 rclone 仍连不上：%s" % err}
-        return {"ok": True, "verified": True, "note": err} if err else {"ok": True, "verified": True}
+        return {"error": "连接验证失败，已回滚删除：%s" % err}
+    return {"ok": True, "note": err} if err else {"ok": True}
 
-    if action == "acctimport":
-        # 批量导入：面板/采集器/粘贴都走这里，服务端负责识别账号、换发、实测
-        items = body.get("items") if isinstance(body.get("items"), list) else []
-        if not items:
-            return {"error": "没有可导入的条目"}
-        return import_items(items, create=bool(body.get("create")), dry=bool(body.get("dryRun")))
+@action("acctdel")
+def h_acctdel(body):
+    name = str(body.get("name") or "").strip()
+    try:
+        rc("config/delete", name=name)
+    except Exception as e:
+        return {"error": str(e)[:150]}
+    # v3.68：代理 rcd（5573）内存里也删一份 —— 只删主进程时，代理进程的下一次
+    # SaveConfig 会把已删段落写回 rclone.conf，账号就在云盘浏览列表里"复活"
+    try:
+        rc("config/delete", name=name, _proxy=True)
+    except Exception:
+        pass
+    # v3.51：两个 rcd 各清一次，否则另一个进程的下一次 SaveConfig 会把它写回来
+    try:
+        purge_ghost_sections([name])
+    except Exception:
+        pass
+    return {"ok": True}
 
-    if action == "acctimporttext":
-        # 粘贴导入：每行「账号名 token」或只贴 token；也可直接贴面板导出的 JSON
-        items = parse_import_text(body.get("text"))
-        if not items:
-            return {"error": "没解析出 refresh_token —— 每行格式：账号名 + 空格 + token，或只贴一长串 token"}
-        # v3.38 定向重登：从某个失效账号的「重新登录」按钮进来时，
-        # 只贴 token 的条目一律归到该账号，且禁止自动新建（防止登错号时多出一个新账号）。
-        # 身份防错配仍由 import_items 用换发返回的真实 sub 兜底，不会把 A 的凭证写进 B。
-        target = str(body.get("target") or "").strip()
-        if target:
-            for it in items:
-                if isinstance(it, dict) and not str(it.get("env") or "").strip():
-                    it["env"] = target
-            return import_items(items, create=False)
-        return import_items(items, create=bool(body.get("create", True)))
-
-    if action == "acctident":
-        # 识别账号身份（sub / 邮箱）写进身份表：一次识别，之后任何电脑导入都能自动对号
-        names = body.get("names") if isinstance(body.get("names"), list) else []
-        try:
-            conf = rc("config/dump")
-        except Exception as e:
-            return {"error": str(e)[:150]}
-        targets = [n for n in names if n in conf] or [k for k, v in conf.items()
-                                                     if str((v or {}).get("type")) == "pikpak"]
-        results = []
-        for n in targets:
-            cfg = conf.get(n) or {}
-            at = ""
-            try:
-                at = str(json.loads(str(cfg.get("token") or "{}")).get("access_token") or "")
-            except Exception:
-                at = ""
-            sub, mail = pikpak_me(at)
-            note = ""
-            if not sub:
-                rt = cfg_rt(cfg)
-                if not rt:
-                    results.append({"name": n, "ok": False, "msg": "没有 refresh_token，无法识别"})
-                    continue
+@action("acctpurge")
+def h_acctpurge(body):
+    removed = purge_ghost_sections()
+    # v3.68 双进程对账：代理 rcd（5573）内存里比主进程多出来的段（含有效段）同步删除。
+    # 根治「账号删除后云盘浏览列表又冒出来」——旧版只删主进程，代理侧写回即复活。
+    ghost = []
+    try:
+        main = rc("config/dump", _timeout=20)
+    except Exception:
+        main = {}
+    try:
+        pconf = rc("config/dump", _proxy=True, _timeout=20)
+    except Exception:
+        pconf = {}
+    if isinstance(main, dict) and isinstance(pconf, dict):
+        for k in pconf:
+            if k not in main:
                 try:
-                    tok_json, newrt, sub, at = pikpak_token_full(rt)
-                except RuntimeError as e:
-                    results.append({"name": n, "ok": False, "msg": str(e)[:160]})
-                    continue
-                try:
-                    rc("config/update", name=n, type="pikpak",
-                       parameters=json.dumps({"token": tok_json, "refresh_token": newrt}))
-                    note = "token 已顺带换发"
+                    rc("config/delete", name=k, _proxy=True, _timeout=20)
+                    ghost.append(k)
                 except Exception:
                     pass
-                _s, mail = pikpak_me(at)
-                if mail:
-                    note = (note + "；").lstrip("；") if note else note
-            meta_set(n, sub, mail)
-            results.append({"name": n, "ok": bool(sub), "sub": sub, "email": mail,
-                            "msg": (note or "") + ((" " + mail) if mail else "") or (sub or "已识别")})
-        return {"results": [dict(r, msg=(r.get("msg") or "")[:160]) for r in results],
-                "okCount": sum(1 for r in results if r["ok"]), "total": len(results)}
+    return {"ok": True, "removed": removed, "resynced": ghost}
 
-    if action == "urldl":
-        # URL 直链下载：rclone 直接抓取到 NAS（/<卷根>/<folder>/），走任务队列展示
-        url = str(body.get("url") or "").strip()
-        sub = str(body.get("folder") or "URL下载").strip("/")
-        if not re.match(r'^https?://\S+$', url):
-            return {"error": "仅支持 http(s) 直链"}
-        if "/" in sub or sub in (".", "..") or not sub:
-            return {"error": "保存目录需为单层文件夹名"}
-        # v3.57：可选存储空间（volume 传 localdirs 返回的 rclone 根，缺省主卷）
-        vol_req = str(body.get("volume") or "").strip().rstrip("/")
-        vols = STATE.get("volumePairs") or [LEGACY_VOLUME]
-        if vol_req:
-            uvol = next((p for p in vols if p["rclone"] == vol_req), None)
-            if not uvol:
-                return {"error": "未知存储空间：%s" % vol_req}
-        else:
-            uvol = vols[0]
-        uroot = uvol["rclone"]
-        # v4.07：与 action=start 同一道闸，不可写的卷不接单
-        if not uvol.get("writable", True):
-            return {"error": "「%s」（%s）当前不可写（写数据被系统拒绝），请改选其它存储空间"
-                             % (uvol.get("name") or uroot, uroot)}
+@action("acctrename")
+def h_acctrename(body):
+    old = str(body.get("name") or "").strip()
+    new = str(body.get("newName") or "").strip()
+    if not old or not new:
+        return {"error": "账号名不能为空"}
+    if old == new:
+        return {"ok": True, "name": new}
+    if not re.fullmatch(r"[\w\u4e00-\u9fff.\-]{1,64}", new):
+        return {"error": "账号名只能用中英文、数字、_ - .，最长 64 字符"}
+    try:
+        conf = rc_ok("config/dump")
+    except Exception as e:
+        return {"error": "读取配置失败：%s" % str(e)[:120]}
+    if old not in conf:
+        return {"error": "原账号不存在：" + old}
+    if new in conf:
+        return {"error": "账号名已存在：" + new}
+    seg = dict(conf[old] or {})
+    atype = str(seg.pop("type") or "")
+    if not atype:
+        return {"error": "账号类型缺失，无法重命名"}
+    try:
+        rc_ok("config/create", name=new, type=atype,
+              parameters=json.dumps(seg, ensure_ascii=False), obscure="false")
+    except Exception as e:
+        return {"error": "创建新账号失败：%s" % str(e)[:150]}
+    try:
+        chk = rc_ok("config/get", name=new)
+        if str(chk.get("type") or "") != atype:
+            raise RuntimeError("类型不一致")
+    except Exception as e:
         try:
-            r = rc("operations/copyurl", fs=uroot + "/" + sub, remote="",
-                   url=url, autoFilename="true", _async="true")
-        except Exception as e:
-            return {"error": "提交失败: %s" % str(e)[:150]}
-        jid = r.get("jobid")
-        if not jid:
-            return {"error": "未获取到任务 id: %s" % json.dumps(r)[:120]}
-        guess = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1] or "url-file"
-        job = {"id": int(time.time() * 1000), "jobid": jid, "remote": "URL",
-               "subpath": guess, "src": url, "mode": "copy",
-               "dest": uroot + "/" + sub, "state": "running",
-               "started": time.strftime("%m-%d %H:%M"),
-               "bytes": 0, "total": 0, "speed": 0, "eta": None, "error": ""}
+            rc("config/delete", name=new)
+        except Exception:
+            pass
+        return {"error": "新账号回读失败，已回滚：%s" % str(e)[:120]}
+    # 身份表与任务记录的改写必须持 LOCK：jobs 轮询 / worker 线程随时可能并发写盘，
+    # 裸奔的整表覆盖写会把别人刚写的进度/新任务回滚掉（v3.57 修复的丢数据竞态）
+    try:
+        with LOCK:
+            m = load_meta()
+            if old in m:
+                m[new] = m.pop(old)
+                save_meta(m)
+    except Exception:
+        pass
+    # 任务记录：remote 和 src 的「账号:路径」前缀同步替换，避免历史任务指向空配置
+    try:
         with LOCK:
             jobs = load_jobs()
-            jobs.append(job)
-            save_jobs(jobs)
-        return {"job": job}
+            changed = False
+            for j in jobs if isinstance(jobs, list) else []:
+                if not isinstance(j, dict):
+                    continue
+                if str(j.get("remote") or "") == old:
+                    j["remote"] = new
+                    changed = True
+                src = str(j.get("src") or "")
+                if src.startswith(old + ":"):
+                    j["src"] = new + src[len(old):]
+                    changed = True
+            if changed:
+                save_jobs(jobs)
+    except Exception:
+        pass
+    try:
+        rc_ok("config/delete", name=old)
+    except Exception as e:
+        return {"error": "新名已生效，但旧名删除失败（请手动清理）：%s" % str(e)[:120]}
+    # v3.51：pikpak 后端可能给刚删掉的旧名回写 captcha_token 造出空壳段，
+    # 两个 rcd 都清一次，避免下次「一键测试全部」又列出旧账号。
+    try:
+        purge_ghost_sections([old])
+    except Exception:
+        pass
+    return {"ok": True, "name": new}
 
-    if action == "cloudrm":
-        remote = str(body.get("remote") or "").strip()
-        path = str(body.get("path") or "").strip("/")
-        if not remote or not path:
-            return {"error": "缺少参数"}
-        # v3.44：hard=true 走 PikPak 的彻底删除（files:batchDelete），不进回收站
-        if _truthy(body.get("hard")):
-            return cloud_hard_delete(remote, path, bool(body.get("isfile")))
+@action("acctrepair")
+def h_acctrepair(body):
+    name = str(body.get("name") or "").strip()
+    try:
+        conf = rc("config/dump")
+    except Exception as e:
+        return {"error": str(e)[:150]}
+    targets = [name] if name else [k for k, v in conf.items()
+                                   if str((v or {}).get("type")) == "pikpak"]
+    results = []
+    for n in targets:
+        cfg = conf.get(n) or {}
+        msg = ""
+        if not str(cfg.get("token") or ""):
+            rt = cfg_rt(cfg)
+            if not rt:
+                results.append({"name": n, "ok": False, "msg": "没有 refresh_token，请在「编辑」里填新的"})
+                continue
+            try:
+                tok_json, newrt = pikpak_token_json(rt)
+            except RuntimeError as e:
+                results.append({"name": n, "ok": False, "msg": str(e)[:180]})
+                continue
+            try:
+                rc("config/update", name=n, type="pikpak",
+                   parameters=json.dumps({"token": tok_json, "refresh_token": newrt}))
+                msg = "已用 refresh_token 换发 token；"
+            except Exception as e:
+                results.append({"name": n, "ok": False, "msg": "写入 token 失败：%s" % str(e)[:120]})
+                continue
+        ok, note = pikpak_verify(n)
+        if ok:
+            meta_patch(n, {"lastOk": int(time.time()), "lastErr": "", "cred": "ok"})
+        else:
+            meta_patch(n, {"lastErr": str(note)[:200], "lastCheck": int(time.time())})
+        sync_rt_mirror(n)
+        results.append({"name": n, "ok": ok, "msg": (msg + (note or "连接正常"))[:200]})
+    return {"results": results, "okCount": sum(1 for r in results if r["ok"]),
+            "total": len(results)}
+
+@action("accttest")
+def h_accttest(body):
+    name = str(body.get("name") or "").strip()
+    # 真连接测试：list 根目录会真正实例化该 remote（about 很多后端不支持，会假成功）
+    atype = ""
+    try:
+        atype = str((rc("config/get", name=name) or {}).get("type") or "")
+    except Exception:
+        pass
+    if atype == "pikpak":
+        ok, err = pikpak_verify(name)   # 被风控时自动换 device_id 自愈
+    else:
+        ok, err = verify_list(name)
+    if atype == "pikpak":
+        if ok:
+            meta_patch(name, {"lastOk": int(time.time()), "lastErr": "", "cred": "ok"})
+            sync_rt_mirror(name)        # rclone 若刚轮换过 rt，立刻同步顶层镜像
+        else:
+            meta_patch(name, {"lastErr": str(err)[:200], "lastCheck": int(time.time())})
+    if not ok:
+        # v3.38：告诉前端这是「只能重新登录」的凭证错误，行内直接给按钮
+        return {"ok": False, "error": mask_secret(err[:250]), "relink": need_relink(err)}
+    used = total = free = None
+    try:
+        a = rc_ok("operations/about", fs=name + ":")
+        used, total, free = a.get("used"), a.get("total"), a.get("free")
+    except Exception:
+        pass
+    try:
+        items = len((rc_ok("operations/list", fs=name + ":", remote="") or {}).get("list") or [])
+    except Exception:
+        items = None
+    return {"ok": True, "used": used, "total": total, "free": free,
+            "items": items, "note": err}
+
+@action("acctget")
+def h_acctget(body):
+    name = str(body.get("name") or "").strip()
+    try:
+        cfg = rc("config/get", name=name)
+    except Exception as e:
+        return {"error": "读取账号配置失败: %s" % str(e)[:150]}
+    atype = str(cfg.get("type") or "")
+    if not atype:
+        return {"error": "账号不存在: " + name}
+    prov = next((p for p in PROVIDERS if p["type"] == atype), None)
+    if prov:
+        defs = [{"name": p["name"], "label": p["label"],
+                 "secret": bool(p.get("secret")) or bool(re.search(r"token|pass|secret|key", p["name"], re.I)),
+                 "ph": p.get("ph", "")} for p in prov["params"]]
+    else:
+        # 未知类型：按现有配置键生成字段，跳过 rclone 内部缓存字段
+        defs = [{"name": k, "label": k,
+                 "secret": bool(re.search(r"pass|token|secret|key", k, re.I)), "ph": ""}
+                for k in sorted(cfg) if k not in ("type", "token", "captcha_token")]
+    fields = []
+    for d in defs:
+        s = str(cfg.get(d["name"]) or "")
+        if not s:
+            masked = ""
+        elif d["secret"]:
+            masked = "已设置 · %d 位" % len(s)
+        else:
+            masked = (s[:6] + "…" + s[-4:]) if len(s) > 14 else s
+        fields.append(dict(d, has=bool(s), masked=masked))
+    ident = load_meta().get(name)
+    ident = ident if isinstance(ident, dict) else {}
+    return {"name": name, "type": atype, "fields": fields,
+            "email": str(ident.get("email") or ""),
+            "sub": str(ident.get("sub") or "")}
+
+@action("acctedit")
+def h_acctedit(body):
+    name = str(body.get("name") or "").strip()
+    renewed = bool(body.get("refresh"))
+    params = body.get("params") if isinstance(body.get("params"), dict) else {}
+    clean = {}
+    for k, v in params.items():
+        k, v = str(k).strip(), str(v).strip()
+        if k and v:
+            clean[k] = v
+    if not clean and not renewed:
+        return {"error": "没有填写任何要修改的内容"}
+    try:
+        cfg = rc("config/get", name=name)
+    except Exception as e:
+        return {"error": "账号不存在或读取失败: %s" % str(e)[:150]}
+    atype = str(cfg.get("type") or "")
+    if not atype:
+        return {"error": "账号不存在: " + name}
+    if atype == "pikpak" and "refresh_token" in clean and len(clean["refresh_token"]) < 20:
+        return {"error": "refresh_token 看起来无效（长度不足）"}
+    if atype == "pikpak" and (renewed or ("refresh_token" in clean and body.get("clearToken", True))):
+        # pikpak 后端不读 refresh_token，必须换出 access_token 后整段写回 token
+        rt = clean.get("refresh_token") or cfg_rt(cfg)
+        if not rt:
+            return {"error": "该账号没有可用的 refresh_token，请在下面填写一个新的"}
         try:
-            if body.get("isfile"):
-                rc("operations/deletefile", _strict=True, fs=remote + ":", remote=path)
-            else:
-                rc("operations/purge", _strict=True, fs=remote + ":", remote=path)
-        except Exception as e:
-            return {"error": str(e)[:200]}
-        return {"ok": True}
+            tok_json, newrt = pikpak_token_json(rt)
+        except RuntimeError as e:
+            return {"error": mask_secret(str(e))}
+        clean["token"] = tok_json
+        clean["refresh_token"] = newrt
+    # config/update 在后端实例化校验失败时也会返回 error，但配置已落盘 —— 以回读为准
+    try:
+        rc("config/update", name=name, type=atype,
+           parameters=json.dumps(clean, ensure_ascii=False), obscure="true")
+    except Exception:
+        pass
+    try:
+        now = rc("config/get", name=name)
+        bad = []
+        for k, v in clean.items():
+            cur = str(now.get(k) or "")
+            if v == "" and cur:
+                bad.append(k + "(未清空)")
+            elif v != "" and not cur:
+                bad.append(k + "(未写入)")
+        if bad:
+            return {"error": "写入未生效: " + ", ".join(bad)}
+    except Exception as e:
+        return {"error": "回读配置失败: %s" % str(e)[:150]}
+    # 写完立刻实测：配置落盘 ≠ 能连上（token 过期/被轮换/device_id 被风控都会失败）
+    ok, err = (pikpak_verify(name) if atype == "pikpak" else verify_list(name))
+    if not ok:
+        return {"error": "配置已写入，但 rclone 仍连不上：%s" % err}
+    return {"ok": True, "verified": True, "note": err} if err else {"ok": True, "verified": True}
 
-    if action == "renamebatch":
-        remote = str(body.get("remote") or "").strip()
-        items = body.get("items")
-        if not isinstance(items, list) or not items:
-            return {"error": "缺少参数：items（要重命名的文件列表）"}
-        if len(items) > RENAME_MAX_ITEMS:
-            return {"error": "一次最多重命名 %d 项，请分批处理" % RENAME_MAX_ITEMS}
-        return rename_batch(remote, str(body.get("path") or "").strip("/"), items)
+@action("acctimport")
+def h_acctimport(body):
+    items = body.get("items") if isinstance(body.get("items"), list) else []
+    if not items:
+        return {"error": "没有可导入的条目"}
+    return import_items(items, create=bool(body.get("create")), dry=bool(body.get("dryRun")))
 
-    if action == "localrenamebatch":
-        # v3.50 本地文件页批量改名：真实改动 NAS 磁盘，整批预检后执行
-        return local_rename_batch(str(body.get("path") or ""), body.get("items"))
+@action("acctimporttext")
+def h_acctimporttext(body):
+    items = parse_import_text(body.get("text"))
+    if not items:
+        return {"error": "没解析出 refresh_token —— 每行格式：账号名 + 空格 + token，或只贴一长串 token"}
+    # v3.38 定向重登：从某个失效账号的「重新登录」按钮进来时，
+    # 只贴 token 的条目一律归到该账号，且禁止自动新建（防止登错号时多出一个新账号）。
+    # 身份防错配仍由 import_items 用换发返回的真实 sub 兜底，不会把 A 的凭证写进 B。
+    target = str(body.get("target") or "").strip()
+    if target:
+        for it in items:
+            if isinstance(it, dict) and not str(it.get("env") or "").strip():
+                it["env"] = target
+        return import_items(items, create=False)
+    return import_items(items, create=bool(body.get("create", True)))
 
-    if action == "trashlist":
-        remote = str(body.get("remote") or "").strip()
-        if not remote:
-            return {"error": "缺少参数：remote（请选择账号）"}
-        if remote not in pikpak_remotes():
-            return {"error": "只有 PikPak 账号有回收站；该账号不是 PikPak 类型",
-                    "unsupported": True}
+@action("acctident")
+def h_acctident(body):
+    names = body.get("names") if isinstance(body.get("names"), list) else []
+    try:
+        conf = rc("config/dump")
+    except Exception as e:
+        return {"error": str(e)[:150]}
+    targets = [n for n in names if n in conf] or [k for k, v in conf.items()
+                                                 if str((v or {}).get("type")) == "pikpak"]
+    results = []
+    for n in targets:
+        cfg = conf.get(n) or {}
+        at = ""
         try:
-            rows = pk_trash_list(remote)
+            at = str(json.loads(str(cfg.get("token") or "{}")).get("access_token") or "")
+        except Exception:
+            at = ""
+        sub, mail = pikpak_me(at)
+        note = ""
+        if not sub:
+            rt = cfg_rt(cfg)
+            if not rt:
+                results.append({"name": n, "ok": False, "msg": "没有 refresh_token，无法识别"})
+                continue
+            try:
+                tok_json, newrt, sub, at = pikpak_token_full(rt)
+            except RuntimeError as e:
+                results.append({"name": n, "ok": False, "msg": str(e)[:160]})
+                continue
+            try:
+                rc("config/update", name=n, type="pikpak",
+                   parameters=json.dumps({"token": tok_json, "refresh_token": newrt}))
+                note = "token 已顺带换发"
+            except Exception:
+                pass
+            _s, mail = pikpak_me(at)
+            if mail:
+                note = (note + "；").lstrip("；") if note else note
+        meta_set(n, sub, mail)
+        results.append({"name": n, "ok": bool(sub), "sub": sub, "email": mail,
+                        "msg": (note or "") + ((" " + mail) if mail else "") or (sub or "已识别")})
+    return {"results": [dict(r, msg=(r.get("msg") or "")[:160]) for r in results],
+            "okCount": sum(1 for r in results if r["ok"]), "total": len(results)}
+
+@action("urldl")
+def h_urldl(body):
+    url = str(body.get("url") or "").strip()
+    sub = str(body.get("folder") or "URL下载").strip("/")
+    if not re.match(r'^https?://\S+$', url):
+        return {"error": "仅支持 http(s) 直链"}
+    if "/" in sub or sub in (".", "..") or not sub:
+        return {"error": "保存目录需为单层文件夹名"}
+    # v3.57：可选存储空间（volume 传 localdirs 返回的 rclone 根，缺省主卷）
+    vol_req = str(body.get("volume") or "").strip().rstrip("/")
+    vols = STATE.get("volumePairs") or [LEGACY_VOLUME]
+    if vol_req:
+        uvol = next((p for p in vols if p["rclone"] == vol_req), None)
+        if not uvol:
+            return {"error": "未知存储空间：%s" % vol_req}
+    else:
+        uvol = vols[0]
+    uroot = uvol["rclone"]
+    # v4.07：与 action=start 同一道闸，不可写的卷不接单
+    if not uvol.get("writable", True):
+        return {"error": "「%s」（%s）当前不可写（写数据被系统拒绝），请改选其它存储空间"
+                         % (uvol.get("name") or uroot, uroot)}
+    try:
+        r = rc("operations/copyurl", fs=uroot + "/" + sub, remote="",
+               url=url, autoFilename="true", _async="true")
+    except Exception as e:
+        return {"error": "提交失败: %s" % str(e)[:150]}
+    jid = r.get("jobid")
+    if not jid:
+        return {"error": "未获取到任务 id: %s" % json.dumps(r)[:120]}
+    guess = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1] or "url-file"
+    job = {"id": int(time.time() * 1000), "jobid": jid, "remote": "URL",
+           "subpath": guess, "src": url, "mode": "copy",
+           "dest": uroot + "/" + sub, "state": "running",
+           "started": time.strftime("%m-%d %H:%M"),
+           "bytes": 0, "total": 0, "speed": 0, "eta": None, "error": ""}
+    with LOCK:
+        jobs = load_jobs()
+        jobs.append(job)
+        save_jobs(jobs)
+    return {"job": job}
+
+@action("cloudrm")
+def h_cloudrm(body):
+    remote = str(body.get("remote") or "").strip()
+    path = str(body.get("path") or "").strip("/")
+    if not remote or not path:
+        return {"error": "缺少参数"}
+    # v3.44：hard=true 走 PikPak 的彻底删除（files:batchDelete），不进回收站
+    if _truthy(body.get("hard")):
+        return cloud_hard_delete(remote, path, bool(body.get("isfile")))
+    try:
+        if body.get("isfile"):
+            rc("operations/deletefile", _strict=True, fs=remote + ":", remote=path)
+        else:
+            rc("operations/purge", _strict=True, fs=remote + ":", remote=path)
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    return {"ok": True}
+
+@action("renamebatch")
+def h_renamebatch(body):
+    remote = str(body.get("remote") or "").strip()
+    items = body.get("items")
+    if not isinstance(items, list) or not items:
+        return {"error": "缺少参数：items（要重命名的文件列表）"}
+    if len(items) > RENAME_MAX_ITEMS:
+        return {"error": "一次最多重命名 %d 项，请分批处理" % RENAME_MAX_ITEMS}
+    return rename_batch(remote, str(body.get("path") or "").strip("/"), items)
+
+@action("localrenamebatch")
+def h_localrenamebatch(body):
+    return local_rename_batch(str(body.get("path") or ""), body.get("items"))
+
+@action("trashlist")
+def h_trashlist(body):
+    remote = str(body.get("remote") or "").strip()
+    if not remote:
+        return {"error": "缺少参数：remote（请选择账号）"}
+    if remote not in pikpak_remotes():
+        return {"error": "只有 PikPak 账号有回收站；该账号不是 PikPak 类型",
+                "unsupported": True}
+    try:
+        rows = pk_trash_list(remote)
+    except Exception as e:
+        return {"error": "读取回收站失败：%s" % mask_secret(str(e))[:150]}
+    items = [map_trash(f) for f in rows]
+    return {"items": items, "total": len(items),
+            "bytes": sum(i["size"] for i in items)}
+
+@action("trashop")
+def h_trashop(body):
+    remote = str(body.get("remote") or "").strip()
+    op = str(body.get("op") or "").strip()
+    if not remote:
+        return {"error": "缺少参数：remote（请选择账号）"}
+    if remote not in pikpak_remotes():
+        return {"error": "只有 PikPak 账号有回收站", "unsupported": True}
+    if op not in ("delete", "restore"):
+        return {"error": "op 只能是 delete / restore"}
+    ids = body.get("ids")
+    if _truthy(body.get("all")):
+        try:
+            ids = [f.get("id") for f in pk_trash_list(remote, max_pages=8)]
         except Exception as e:
             return {"error": "读取回收站失败：%s" % mask_secret(str(e))[:150]}
-        items = [map_trash(f) for f in rows]
-        return {"items": items, "total": len(items),
-                "bytes": sum(i["size"] for i in items)}
+    if not isinstance(ids, list) or not ids:
+        return {"error": "没有要处理的条目"}
+    try:
+        r = pk_batch_ids(remote, "batchDelete" if op == "delete" else "batchUntrash", ids)
+    except Exception as e:
+        return {"error": "操作失败：%s" % mask_secret(str(e))[:150]}
+    return {"ok": r.get("ok"), "op": op,
+            "text": ("已彻底删除 %d 项" % r.get("ok")) if op == "delete"
+                    else ("已恢复 %d 项" % r.get("ok"))}
 
-    if action == "trashop":
-        # op=delete(彻底删除) / restore(恢复到原位置)
-        remote = str(body.get("remote") or "").strip()
-        op = str(body.get("op") or "").strip()
-        if not remote:
-            return {"error": "缺少参数：remote（请选择账号）"}
-        if remote not in pikpak_remotes():
-            return {"error": "只有 PikPak 账号有回收站", "unsupported": True}
-        if op not in ("delete", "restore"):
-            return {"error": "op 只能是 delete / restore"}
-        ids = body.get("ids")
-        if _truthy(body.get("all")):
-            try:
-                ids = [f.get("id") for f in pk_trash_list(remote, max_pages=8)]
-            except Exception as e:
-                return {"error": "读取回收站失败：%s" % mask_secret(str(e))[:150]}
-        if not isinstance(ids, list) or not ids:
-            return {"error": "没有要处理的条目"}
-        try:
-            r = pk_batch_ids(remote, "batchDelete" if op == "delete" else "batchUntrash", ids)
-        except Exception as e:
-            return {"error": "操作失败：%s" % mask_secret(str(e))[:150]}
-        return {"ok": r.get("ok"), "op": op,
-                "text": ("已彻底删除 %d 项" % r.get("ok")) if op == "delete"
-                        else ("已恢复 %d 项" % r.get("ok"))}
+@action("playinfo")
+def h_playinfo(body):
+    return cloud_play_info(str(body.get("remote") or "").strip(),
+                           str(body.get("path") or "").strip("/"))
 
-    if action == "playinfo":
-        # 只签发地址，不代理流量：浏览器直连 CDN 才能跑满带宽
-        return cloud_play_info(str(body.get("remote") or "").strip(),
-                               str(body.get("path") or "").strip("/"))
+@action("unzipinfo")
+def h_unzipinfo(body):
+    return unzip_preview(str(body.get("remote") or "").strip(),
+                         str(body.get("path") or "").strip("/"),
+                         str(body.get("password") or ""))
 
-    if action == "unzipinfo":
-        return unzip_preview(str(body.get("remote") or "").strip(),
+@action("unzip")
+def h_unzip(body):
+    return unzip_start_cloud(str(body.get("remote") or "").strip(),
                              str(body.get("path") or "").strip("/"),
                              str(body.get("password") or ""))
 
-    if action == "unzip":
-        return unzip_start_cloud(str(body.get("remote") or "").strip(),
-                                 str(body.get("path") or "").strip("/"),
-                                 str(body.get("password") or ""))
+@action("localunzip")
+def h_localunzip(body):
+    return local_unzip_start(str(body.get("path") or ""),
+                             str(body.get("password") or ""),
+                             _truthy(body.get("deleteAfter")))
 
-    if action == "localunzip":
-        return local_unzip_start(str(body.get("path") or ""),
-                                 str(body.get("password") or ""),
-                                 _truthy(body.get("deleteAfter")))
+@action("cloudmv")
+def h_cloudmv(body):
+    remote = str(body.get("remote") or "").strip()
+    path = str(body.get("path") or "").strip("/")
+    newname = str(body.get("newname") or "").strip()
+    if not remote or not path or not newname:
+        return {"error": "缺少参数"}
+    if "/" in newname or newname in (".", ".."):
+        return {"error": "新名称不合法"}
+    parent = path.rsplit("/", 1)[0] if "/" in path else ""
+    dst = (parent + "/" + newname) if parent else newname
+    try:
+        rc("operations/movefile", _strict=True,
+           srcFs=remote + ":", srcRemote=path,
+           dstFs=remote + ":", dstRemote=dst)
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    return {"ok": True, "newPath": dst}
 
-    if action == "cloudmv":
-        # 仅支持重命名云端文件（rclone rc 没有目录改名方法）
-        remote = str(body.get("remote") or "").strip()
-        path = str(body.get("path") or "").strip("/")
-        newname = str(body.get("newname") or "").strip()
-        if not remote or not path or not newname:
-            return {"error": "缺少参数"}
-        if "/" in newname or newname in (".", ".."):
-            return {"error": "新名称不合法"}
-        parent = path.rsplit("/", 1)[0] if "/" in path else ""
-        dst = (parent + "/" + newname) if parent else newname
-        try:
-            rc("operations/movefile", _strict=True,
-               srcFs=remote + ":", srcRemote=path,
-               dstFs=remote + ":", dstRemote=dst)
-        except Exception as e:
-            return {"error": str(e)[:200]}
-        return {"ok": True, "newPath": dst}
+@action("sharecreate")
+def h_sharecreate(body):
+    return share_create(body.get("remote"), body.get("items"),
+                        body.get("days", 7), body.get("passCode", ""),
+                        body.get("limit", 100))
 
-    if action == "sharecreate":
-        # v3.82：账号内文件 / 文件夹 → 正式 PikPak 分享链接（可保留、可管理）
-        return share_create(body.get("remote"), body.get("items"),
-                            body.get("days", 7), body.get("passCode", ""),
-                            body.get("limit", 100))
+@action("cloudlink")
+def h_cloudlink(body):
+    remote = str(body.get("remote") or "").strip()
+    path = str(body.get("path") or "").strip("/")
+    if not remote or not path:
+        return {"error": "缺少参数"}
+    s = load_settings()
+    order = [("proxy", True), ("direct", False)] if s["proxy"] else \
+            [("direct", False), ("proxy", True)]
+    errs = []
+    for via, pv in order:
+        code, out, err = rclone_cli(["link", remote + ":" + path], proxy=pv)
+        if code == 0 and out.startswith("http"):
+            return {"ok": True, "url": out, "via": via}
+        errs.append("%s: %s" % (via, (err or out)[:90]))
+    return {"error": " ｜ ".join(errs)}
 
-    if action == "cloudlink":
-        # 临时下载直链（rclone link）：与上面的正式分享链接不是一回事
-        remote = str(body.get("remote") or "").strip()
-        path = str(body.get("path") or "").strip("/")
-        if not remote or not path:
-            return {"error": "缺少参数"}
-        s = load_settings()
-        order = [("proxy", True), ("direct", False)] if s["proxy"] else \
-                [("direct", False), ("proxy", True)]
-        errs = []
-        for via, pv in order:
-            code, out, err = rclone_cli(["link", remote + ":" + path], proxy=pv)
-            if code == 0 and out.startswith("http"):
-                return {"ok": True, "url": out, "via": via}
-            errs.append("%s: %s" % (via, (err or out)[:90]))
-        return {"error": " ｜ ".join(errs)}
-
-    if action == "speedtest":
-        # 同一云端文件：直连 / 代理各下载最多 SPEEDTEST_SECONDS 秒，对比 MiB/s。
-        # 前端可带 phase 分两次调用，用来显示「正在测直连 / 正在测代理」；
-        # 不带 phase 时两条都跑，兼容未强刷的旧页面。
-        remote = str(body.get("remote") or "").strip()
-        path = str(body.get("path") or "").strip("/")
-        if not remote or not path:
-            return {"error": "缺少参数"}
-        phase = str(body.get("phase") or "both").strip()
-        if phase in ("direct", "proxy"):
-            routes = [(phase, phase == "proxy")]
-        elif phase == "both":
-            routes = [("direct", False), ("proxy", True)]
-        else:
-            return {"error": "phase 只能是 direct / proxy / both"}
-        src = remote + ":" + path
-        # 测速临时文件放主卷（对比测速本身与存储空间无关，只是需要一个落盘点）
-        tmp_local = primary_root().rstrip("/") + "/__speedtest.tmp"
-        tmp_cont = (STATE.get("volumePairs") or [LEGACY_VOLUME])[0]["rclone"].rstrip("/") + "/__speedtest.tmp"
-        # 硬超时必须放在容器内：PikPak captcha / TLS 连接被重置时 rclone 会一直等远端，
-        # --max-duration 只是软限制（等 API 响应期间不检查），只靠 Python 超时杀掉
-        # docker exec 客户端又会让容器内 rclone 残留，下一次测速两个进程互踩同一临时文件。
-        cont_cmd = ["/usr/bin/timeout", "-s", "KILL",
-                    "%ds" % (SPEEDTEST_SECONDS + 3), "rclone", "copyto", src, tmp_cont,
-                    "--max-duration", "%ds" % SPEEDTEST_SECONDS, "--ignore-checksum",
-                    "--buffer-size", "0", "--log-level", "ERROR"]
-        res, errs = {}, {}
-        try:
-            for label, pv in routes:
-                try:
-                    os.remove(tmp_local)
-                except OSError:
-                    pass
-                cmd = ["docker", "exec"] + (
-                    proxy_env_args() if pv else []
-                ) + [RCLONE_CONTAINER] + cont_cmd
-                t0 = time.time()
-                p = None
-                try:
-                    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                       timeout=SPEEDTEST_SECONDS + 6)
-                except subprocess.TimeoutExpired:
-                    pass
-                except Exception as e:
-                    errs[label] = str(e)[:160]
-                elapsed = time.time() - t0
-                # 小文件提前下完时用真实耗时做分母，避免固定窗口把速度算低
-                window = min(max(elapsed, 0.2), float(SPEEDTEST_SECONDS))
-                try:
-                    sz = os.path.getsize(tmp_local)
-                except OSError:
-                    sz = 0
-                res[label] = round(sz / 1048576.0 / window, 2)
-                tail = ((p.stderr or "") + (p.stdout or ""))[-180:] if p else "timeout"
-                if not tail.strip() or tail == "timeout":
-                    # 被 timeout -s KILL 掐掉时 rclone 来不及写日志，别把空诊断丢给用户
-                    tail = ("远端在 %ds 内无响应，已强制终止（常见于 PikPak captcha / 风控 / 连接被重置）"
-                            % (SPEEDTEST_SECONDS + 3))
-                errs[label] = (errs.get(label, "") + " " + tail).strip()[:200]
-            out = {"seconds": SPEEDTEST_SECONDS, "phase": phase}
-            out.update(res)
-            if all(res.get(k, 0) == 0 for k, _ in routes):
-                out["error"] = ("没拉到数据（文件不存在 / 日配额 / 风控 captcha / 连接被重置都可能）。"
-                                "诊断: %s") % (errs.get(routes[0][0], "")[:150])
-            return out
-        finally:
+@action("speedtest")
+def h_speedtest(body):
+    remote = str(body.get("remote") or "").strip()
+    path = str(body.get("path") or "").strip("/")
+    if not remote or not path:
+        return {"error": "缺少参数"}
+    phase = str(body.get("phase") or "both").strip()
+    if phase in ("direct", "proxy"):
+        routes = [(phase, phase == "proxy")]
+    elif phase == "both":
+        routes = [("direct", False), ("proxy", True)]
+    else:
+        return {"error": "phase 只能是 direct / proxy / both"}
+    src = remote + ":" + path
+    # 测速临时文件放主卷（对比测速本身与存储空间无关，只是需要一个落盘点）
+    tmp_local = primary_root().rstrip("/") + "/__speedtest.tmp"
+    tmp_cont = (STATE.get("volumePairs") or [LEGACY_VOLUME])[0]["rclone"].rstrip("/") + "/__speedtest.tmp"
+    # 硬超时必须放在容器内：PikPak captcha / TLS 连接被重置时 rclone 会一直等远端，
+    # --max-duration 只是软限制（等 API 响应期间不检查），只靠 Python 超时杀掉
+    # docker exec 客户端又会让容器内 rclone 残留，下一次测速两个进程互踩同一临时文件。
+    cont_cmd = ["/usr/bin/timeout", "-s", "KILL",
+                "%ds" % (SPEEDTEST_SECONDS + 3), "rclone", "copyto", src, tmp_cont,
+                "--max-duration", "%ds" % SPEEDTEST_SECONDS, "--ignore-checksum",
+                "--buffer-size", "0", "--log-level", "ERROR"]
+    res, errs = {}, {}
+    try:
+        for label, pv in routes:
             try:
                 os.remove(tmp_local)
             except OSError:
                 pass
-
-    # 用户已删除 aria2-pro / yt-dlp 容器，BT 磁力与视频下载入口从控制台移除。
-    # 这里只给尚未强刷的旧页面一个明确提示，不再调用任何已不存在的服务。
-    if action in ("btadd", "btlist", "btctrl", "ytadd", "ytlist", "ytdel"):
-        return {"error": "BT / 磁力与视频下载已停用（aria2-pro、yt-dlp 容器已删除），请 Ctrl+F5 刷新页面",
-                "tasks": []}
-
-    if action == "verify":
-        # 一致性校验：云盘 ↔ 落盘目录/单文件。只读，不改任何数据。
-        return verify_compare(body.get("remote"), body.get("cloudPath"),
-                              body.get("localPath"), body.get("mode"), body.get("limit"))
-
-    # ── v3.81：云端文件夹「下载完毕 / 有更新」 ─────────────────────────────
-    if action == "folderstatus":
-        remote = str(body.get("remote") or "").strip()
-        if not remote:
-            return {"error": "缺少参数：remote"}
-        return folder_status_batch(remote, str(body.get("path") or "").strip("/"),
-                                   body.get("folders"), bool(body.get("refresh")))
-
-    if action == "folderack":
-        remote = str(body.get("remote") or "").strip()
-        if not remote:
-            return {"error": "缺少参数：remote"}
-        return folder_ack(remote, str(body.get("path") or "").strip("/"),
-                          body.get("names"))
-
-    # ── v3.81：云端 / 本地文件完整 CRUD ───────────────────────────────────
-    if action == "cloudmkdir":
-        return cloud_mkdir(str(body.get("remote") or "").strip(),
-                           str(body.get("path") or "").strip("/"),
-                           body.get("name"))
-
-    if action == "cloudmove":
-        return cloud_move_batch(str(body.get("remote") or "").strip(),
-                                str(body.get("path") or "").strip("/"),
-                                body.get("items"),
-                                str(body.get("dest") or "").strip("/"))
-
-    if action == "cloudrmbatch":
-        return cloud_rm_batch(str(body.get("remote") or "").strip(),
-                              str(body.get("path") or "").strip("/"),
-                              body.get("items"), bool(body.get("hard")))
-
-    if action == "localmkdir":
-        return local_mkdir(str(body.get("path") or ""), body.get("name"))
-
-    if action == "localmove":
-        return local_move_batch(str(body.get("path") or ""), body.get("items"),
-                                str(body.get("dest") or ""))
-
-    if action == "localtrash":
-        return local_trash_batch(str(body.get("path") or ""), body.get("items"))
-
-    if action == "localtrashlist":
-        return local_trash_list()
-
-    if action == "localtrashrestore":
-        return local_trash_restore(body.get("ids"), bool(body.get("all")))
-
-    if action == "localtrashpurge":
-        return local_trash_purge(body.get("ids"), bool(body.get("all")))
-
-    if action == "localfiles":
-        # 本地文件页：只读列目录（文件本体走 /media/ 的 Range 流）
-        return localfiles_listing(str(body.get("path") or ""))
-
-    if action == "localdirs":
-        # 各存储空间下的现有目录（供保存目录下拉点选）。
-        # v3.57 返回分组 volumes（root=rclone 侧根，下载时随 start/urldl 传回 volume）；
-        # dirs 保留主卷平铺列表，兼容旧前端。
-        def _vol_dirs(root):
+            cmd = ["docker", "exec"] + (
+                proxy_env_args() if pv else []
+            ) + [RCLONE_CONTAINER] + cont_cmd
+            t0 = time.time()
+            p = None
             try:
-                return sorted(
-                    n for n in os.listdir(root)
-                    if os.path.isdir(os.path.join(root, n))
-                    and not n.startswith(".") and n != "__speedtest.tmp"
-                )
+                p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                   timeout=SPEEDTEST_SECONDS + 6)
+            except subprocess.TimeoutExpired:
+                pass
             except Exception as e:
-                return []
-        vols = storages()
-        volumes = [{"root": v["rclone"], "console": v["console"], "name": v["name"],
-                    "dirs": _vol_dirs(v["console"])} for v in vols]
-        return {"dirs": volumes[0]["dirs"] if volumes else [], "volumes": volumes}
-
-    if action == "health":
+                errs[label] = str(e)[:160]
+            elapsed = time.time() - t0
+            # 小文件提前下完时用真实耗时做分母，避免固定窗口把速度算低
+            window = min(max(elapsed, 0.2), float(SPEEDTEST_SECONDS))
+            try:
+                sz = os.path.getsize(tmp_local)
+            except OSError:
+                sz = 0
+            res[label] = round(sz / 1048576.0 / window, 2)
+            tail = ((p.stderr or "") + (p.stdout or ""))[-180:] if p else "timeout"
+            if not tail.strip() or tail == "timeout":
+                # 被 timeout -s KILL 掐掉时 rclone 来不及写日志，别把空诊断丢给用户
+                tail = ("远端在 %ds 内无响应，已强制终止（常见于 PikPak captcha / 风控 / 连接被重置）"
+                        % (SPEEDTEST_SECONDS + 3))
+            errs[label] = (errs.get(label, "") + " " + tail).strip()[:200]
+        out = {"seconds": SPEEDTEST_SECONDS, "phase": phase}
+        out.update(res)
+        if all(res.get(k, 0) == 0 for k, _ in routes):
+            out["error"] = ("没拉到数据（文件不存在 / 日配额 / 风控 captcha / 连接被重置都可能）。"
+                            "诊断: %s") % (errs.get(routes[0][0], "")[:150])
+        return out
+    finally:
         try:
-            m = rc("core/memstats")
-        except Exception as e:
-            return {"error": str(e)[:150]}
-        fin = 0
-        try:
-            jl = rc("job/list")
-            fin = len(jl.get("finishedIds") or [])
-        except Exception:
+            os.remove(tmp_local)
+        except OSError:
             pass
-        return {"allocMB": round((m.get("Alloc") or 0) / 1048576, 1),
-                "sysMB": round((m.get("Sys") or 0) / 1048576, 1),
-                "finishedJobs": fin}
 
-    raise RuntimeError("未知操作")
+@action("btadd", "btlist", "btctrl", "ytadd", "ytlist", "ytdel")
+def h_disabled_legacy(body):
+    return {"error": "BT / 磁力与视频下载已停用（aria2-pro、yt-dlp 容器已删除），请 Ctrl+F5 刷新页面",
+            "tasks": []}
+
+@action("verify")
+def h_verify(body):
+    return verify_compare(body.get("remote"), body.get("cloudPath"),
+                          body.get("localPath"), body.get("mode"), body.get("limit"))
+
+@action("folderstatus")
+def h_folderstatus(body):
+    remote = str(body.get("remote") or "").strip()
+    if not remote:
+        return {"error": "缺少参数：remote"}
+    return folder_status_batch(remote, str(body.get("path") or "").strip("/"),
+                               body.get("folders"), bool(body.get("refresh")))
+
+@action("folderack")
+def h_folderack(body):
+    remote = str(body.get("remote") or "").strip()
+    if not remote:
+        return {"error": "缺少参数：remote"}
+    return folder_ack(remote, str(body.get("path") or "").strip("/"),
+                      body.get("names"))
+
+@action("cloudmkdir")
+def h_cloudmkdir(body):
+    return cloud_mkdir(str(body.get("remote") or "").strip(),
+                       str(body.get("path") or "").strip("/"),
+                       body.get("name"))
+
+@action("cloudmove")
+def h_cloudmove(body):
+    return cloud_move_batch(str(body.get("remote") or "").strip(),
+                            str(body.get("path") or "").strip("/"),
+                            body.get("items"),
+                            str(body.get("dest") or "").strip("/"))
+
+@action("cloudrmbatch")
+def h_cloudrmbatch(body):
+    return cloud_rm_batch(str(body.get("remote") or "").strip(),
+                          str(body.get("path") or "").strip("/"),
+                          body.get("items"), bool(body.get("hard")))
+
+@action("localmkdir")
+def h_localmkdir(body):
+    return local_mkdir(str(body.get("path") or ""), body.get("name"))
+
+@action("localmove")
+def h_localmove(body):
+    return local_move_batch(str(body.get("path") or ""), body.get("items"),
+                            str(body.get("dest") or ""))
+
+@action("localtrash")
+def h_localtrash(body):
+    return local_trash_batch(str(body.get("path") or ""), body.get("items"))
+
+@action("localtrashlist")
+def h_localtrashlist(body):
+    return local_trash_list()
+
+@action("localtrashrestore")
+def h_localtrashrestore(body):
+    return local_trash_restore(body.get("ids"), bool(body.get("all")))
+
+@action("localtrashpurge")
+def h_localtrashpurge(body):
+    return local_trash_purge(body.get("ids"), bool(body.get("all")))
+
+@action("localfiles")
+def h_localfiles(body):
+    return localfiles_listing(str(body.get("path") or ""))
+
+@action("localdirs")
+def h_localdirs(body):
+    def _vol_dirs(root):
+        try:
+            return sorted(
+                n for n in os.listdir(root)
+                if os.path.isdir(os.path.join(root, n))
+                and not n.startswith(".") and n != "__speedtest.tmp"
+            )
+        except Exception as e:
+            return []
+    vols = storages()
+    volumes = [{"root": v["rclone"], "console": v["console"], "name": v["name"],
+                "dirs": _vol_dirs(v["console"])} for v in vols]
+    return {"dirs": volumes[0]["dirs"] if volumes else [], "volumes": volumes}
+
+@action("health")
+def h_health(body):
+    try:
+        m = rc("core/memstats")
+    except Exception as e:
+        return {"error": str(e)[:150]}
+    fin = 0
+    try:
+        jl = rc("job/list")
+        fin = len(jl.get("finishedIds") or [])
+    except Exception:
+        pass
+    return {"allocMB": round((m.get("Alloc") or 0) / 1048576, 1),
+            "sysMB": round((m.get("Sys") or 0) / 1048576, 1),
+            "finishedJobs": fin}
+def api(action, body):
+    fn = HANDLERS.get(action)
+    if fn is None:
+        raise RuntimeError("未知操作")
+    return fn(body)
 
 # ---------------------------------------------------------------------------
 # 前端静态资源（./static/，容器内即 /app/static）
@@ -11378,14 +11424,14 @@ def api(action, body):
 # v3.80：候选里必须带上「脚本所在目录」—— 之前只有 /app 与 /vol1 两个写死的路径，
 # 用户把仓库放到 /opt/cloud-shuttle 或任意 bind 目录时，两处都不存在，STATIC_DIR 就
 # 落回不存在的 /app/static，整站静态资源 404（表现为打开页面一片白）。
-_APP_HOME = os.path.dirname(os.path.abspath(__file__))
+_APP_HOME = APP_HOME
 STATIC_DIR_CANDIDATES = ("/app/static", "/vol1/@appshare/zcode/console/static",
                          os.path.join(_APP_HOME, "static"))
 STATIC_DIR = next((p for p in STATIC_DIR_CANDIDATES if os.path.isdir(p)), STATIC_DIR_CANDIDATES[-1])
 COLLECTOR_PS_CANDIDATES = ("/app/collector.ps1", "/vol1/@appshare/zcode/console/collector.ps1",
-                           os.path.join(os.path.dirname(os.path.abspath(__file__)), "collector.ps1"))
+                           os.path.join(APP_HOME, "collector.ps1"))
 LOGIN_PS_CANDIDATES = ("/app/login-collector.ps1", "/vol1/@appshare/zcode/console/login-collector.ps1",
-                       os.path.join(os.path.dirname(os.path.abspath(__file__)), "login-collector.ps1"))
+                       os.path.join(APP_HOME, "login-collector.ps1"))
 
 
 def _ps_to_bat(ps_candidates, console_url, title, stem, missing):

@@ -30,6 +30,8 @@ curl -s -X POST http://<控制台地址>/api \
 
 ## 全部 action（由源码自动提取，共 87 个）
 
+## 全部 action（由源码自动提取，共 96 个)
+
 - `about`
 - `accounts`
 - `acctadd`
@@ -43,6 +45,11 @@ curl -s -X POST http://<控制台地址>/api \
 - `acctrename`
 - `acctrepair`
 - `accttest`
+- `autotune`
+- `autotuneinfo`
+- `btadd`
+- `btctrl`
+- `btlist`
 - `bwlimit`
 - `cleanup`
 - `clearfinished`
@@ -77,12 +84,15 @@ curl -s -X POST http://<控制台地址>/api \
 - `localtrashrestore`
 - `localunzip`
 - `myshares`
+- `notifystate`
 - `playinfo`
 - `providers`
 - `proxycheck`
+- `pushplustest`
 - `quota`
 - `remotes`
 - `remove`
+- `remuxscan`
 - `renamebatch`
 - `resetsettings`
 - `resume`
@@ -101,6 +111,7 @@ curl -s -X POST http://<控制台地址>/api \
 - `start`
 - `stats`
 - `stop`
+- `tput`
 - `transfers`
 - `trashlist`
 - `trashop`
@@ -114,6 +125,9 @@ curl -s -X POST http://<控制台地址>/api \
 - `verify`
 - `version`
 - `xferstart`
+- `ytadd`
+- `ytdel`
+- `ytlist`
 
 各 action 的完整参数、返回字段与调用位置见 `download-console.py` 的 `api()`：
 
