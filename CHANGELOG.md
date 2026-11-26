@@ -3,6 +3,29 @@
 本仓库为首次公开整理，只记录仓库化时的版本与最近五次变更；更早的迭代没有保留独立记录。
 版本号对应 `download-console.py` 里的 `APP_VERSION`，也显示在页面页脚。
 
+## v4.21 — 结构重构：2,114 行的 api() 铺平成 96 个可独立测试的 @action 函数（2026-11-26）
+
+按 `docs/audit-refactor/` 执行计划完成「完整性检测 + Bug 猎杀 + 结构优化」全流程（阶段 0–4）：
+
+- **api() 铺平**：原 2,114 行、90 个 `if action == "..."` 分支 + 1 组停用提示分支，机械搬移为
+  `HANDLERS` 注册表 + 97 个 `@action` 函数（`h_<action>(body)`，注册顺序 = 原分支顺序）。
+  新 `api()` 只剩 5 行（查表 + 未知 action 报错）。**AST 逐分支等价断言 96/96 通过**（只搬不改）。
+- **路径常量归一**：全文 6 处 `dirname(abspath(__file__))` 收敛为 `APP_HOME` 单一出处，行为不变。
+- **修复 2 处接口字段断链**：`jobs` 与 `resetsettings` 响应缺 `proxyScope` 字段，而前端
+  v3.77 的全局代理模式同步逻辑一直在读它（app.js:1128 / 3073）——外部改代理或后端自动回落时
+  界面指示不同步。两处响应补上 `proxy_scope()`。
+- **API.md 清单重生成**：原声称 87 个 action 实列 86 项且漏了 remuxscan / pushplustest /
+  autotune 等，现按源码重新提取为 96 个，与 `sorted(HANDLERS)` 一致。
+- **新增回归测试** `tests/test_regression_proxyscope.py`（直调 api() 真分支锁响应键），测试
+  335 → **337 项**全绿。
+- **新增审计工具**（`scripts/`）：`api_audit.py`（前端/后端/文档三方接口对账，v4.21 起直接读
+  HANDLERS）、`verify_refactor.py`（AST 等价断言）、`ghost_check.py`（模板幽灵字段）、
+  `field_check.py`（字段名比对）。
+- 分发协议**零触碰**：`UPDATE_FILES` 白名单、`build_release.py`、Dockerfile、测试加载方式
+  均未改动；单文件结构不变，在线更新路径照旧。
+- 完整执行记录见 `docs/audit-refactor/EXECUTION-SUMMARY.md`；四子系统 Bug 猎杀结论为
+  0 确认缺陷（20 项「已验证无问题」备忘见 `docs/audit-refactor/templates/BUG-TRACKER.md`）。
+
 ## v4.20 — 发送失败不再无限重试：过期的「下载完成」不会再半夜补发（2026-11-26）
 
 同一份日志里还有第二条线索：一个已被删掉的任务 `svj798ds`，「下载完成」从 10:39 起每 5 分钟重试一次
