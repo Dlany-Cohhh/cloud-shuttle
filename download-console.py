@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.18"
+APP_VERSION = "v4.19"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1584,8 +1584,9 @@ NOTIFY_SEEN_MAX = 400         # 去重表保留条数
 # 但任务进入 error 后，残留的在飞传输仍在推进字节，键每 5 秒变一次，
 # 于是一次故障被当成几十次新失败连发（实测 22:30 起每 6 秒一条，PushPlus 直接限流报
 # 「服务端验证错误」）。改为键里去掉 bytes，改用「同键 30 分钟内只发一次」。
-NOTIFY_REPEAT_SEC = 1800
+NOTIFY_REPEAT_SEC = 1800      # v4.19：只用于「同一个失败错因反复失败」，成功通知不受它约束
 NOTIFY_MAX_PER_SCAN = 3       # 一轮巡检最多发几条，防雪崩
+NOTIFY_STATE_VER = 2          # v4.19 去重表结构：按任务记「上次见到的状态 + 错因」
 NOTIFY_BACKOFF_BASE = 60      # 发送失败后的退避起点（秒）
 NOTIFY_BACKOFF_MAX = 300      # 退避上限
 NOTIFY_BACKOFF = {"until": 0.0, "fails": 0}   # 退避状态（内存即可，重启清零不算错）
@@ -1618,12 +1619,42 @@ def notify_event(job):
     return None
 
 
-def notify_key(job):
-    """去重键：同一任务、同一终态、同一错因。
-    v4.15：故意不含 bytes —— 任务进 error 后残留传输还在推进字节，带 bytes 会把一次
-    故障拆成几十条「新失败」；「点继续后再失败要再通知」改由 NOTIFY_REPEAT_SEC 冷却保证。"""
-    j = job or {}
-    return "%s|%s|%s" % (j.get("id"), j.get("state"), str(j.get("error") or "")[:60])
+def notify_sig(job):
+    """v4.19：只取错因摘要，配合「状态」一起判断有没有变化。
+    不再把 id|state|error 拼成一次性键 —— 那种键配「30 分钟冷却」会变成心跳：
+    任务一直停在 done，冷却一过就当成新事件再推一遍（实测一天推了几十轮）；
+    错因被清空（比如点详情后重试/清错）也会换键再推一次。"""
+    return str((job or {}).get("error") or "").strip()[:60]
+
+
+def _notify_state_load():
+    """读去重表，返回 (jobs_map, need_seed)。
+    v2 结构：{"v": 2, "jobs": {"<id>": {"st": 状态, "sig": 错因, "ts": 通知时间}}}
+    老格式（v4.15 的 "id|state|err" → ts 平表）迁移时 need_seed=True：
+    只把当前状态登记一遍、不补发，避免升级瞬间又炸一串。"""
+    raw = _read_json(NOTIFY_STATE_FILE, None)
+    if isinstance(raw, dict) and raw.get("v") == NOTIFY_STATE_VER and isinstance(raw.get("jobs"), dict):
+        return {str(k): dict(v) for k, v in raw["jobs"].items() if isinstance(v, dict)}, False
+    jobs = {}
+    if isinstance(raw, dict):                       # 老平表 → 迁移
+        for k, v in raw.items():
+            jid = str(k).split("|", 1)[0]
+            if jid and jid not in jobs:
+                jobs[jid] = {"st": None, "sig": None, "ts": int(v or 0)}
+        return jobs, True
+    return {}, True                                  # 首次启用
+
+
+def _notify_state_save(jobs, live_ids=None):
+    """落盘。只清理「任务已经不在了」的条目 —— 仍在列表里的任务绝不能丢，
+    一丢下次巡检就从「没有记忆」变成「又是新事件」，等于把通知重新发一遍。"""
+    if live_ids is not None:
+        jobs = {k: v for k, v in jobs.items() if k in live_ids}
+    if len(jobs) > NOTIFY_SEEN_MAX:
+        keep = sorted(jobs.items(), key=lambda kv: int(kv[1].get("ts") or 0), reverse=True)
+        jobs = dict(keep[:NOTIFY_SEEN_MAX])
+    _write_json(NOTIFY_STATE_FILE, {"v": NOTIFY_STATE_VER, "jobs": jobs}, quiet=True)
+
 
 
 def _h(s, n=200):
@@ -1714,8 +1745,9 @@ def notify_scan(send=None, now=None):
     """巡检一次：把「刚进入终态」的任务发到微信。返回 {enabled, sent, skipped, errors, seeded}。
     send 可注入（测试用）；now 可注入（测试用）。
 
-    v4.15 三条护栏：同键 30 分钟冷却、一轮最多 3 条、发送失败指数退避 ——
-    否则 PushPlus 限流时会把「一次故障」变成几十条重复推送。"""
+    v4.19 改为边沿触发：按任务记住「上次见到的状态 + 错因」，只有真变了才发。
+    v4.15 的「同键 30 分钟冷却」是平事件触发，任务停在 done 时等于每半小时重播一次，
+    错因被清空也会换键再发 —— 这就是用户看到的「一直推送」。"""
     s = load_settings()
     enabled = _truthy(s.get("pushplusOn"))
     token = str(s.get("pushplusToken") or "").strip()
@@ -1733,42 +1765,63 @@ def notify_scan(send=None, now=None):
     with LOCK:
         jobs = load_jobs()
     with NOTIFY_LOCK:
-        raw = _read_json(NOTIFY_STATE_FILE, None)
-        first = not isinstance(raw, dict)
-        seen = dict(raw) if isinstance(raw, dict) else {}
-        out["seeded"] = first
+        state, seed = _notify_state_load()
+        out["seeded"] = seed
         ts = int(ts_now)
-        changed = first
+        if seed:
+            # 首次启用 / 从老格式迁移：只登记现状，不把历史任务补发一遍
+            for j in jobs:
+                jid = str((j or {}).get("id") or "")
+                if jid:
+                    state[jid] = {"st": str(j.get("state") or ""), "sig": notify_sig(j), "ts": ts}
+            _notify_state_save(state, {str((j or {}).get("id") or "") for j in jobs})
+            return out
+        live = {str((j or {}).get("id") or "") for j in jobs}
+        changed = False
         for j in jobs:
+            jid = str((j or {}).get("id") or "")
+            if not jid:
+                continue
+            st = str(j.get("state") or "")
+            sig = notify_sig(j)
+            prev = state.get(jid) or {}
+            if prev.get("st") == st and (prev.get("sig") or "") == sig:
+                continue                     # 状态没动：不发、不写，天然安静
             kind = notify_event(j)
+            nts = int(prev.get("nts") or 0)          # 上次真正发出去的时间（不是观察时间）
             if not kind:
-                continue
-            k = notify_key(j)
-            last = seen.get(k)
-            if last is not None and ts - int(last) < NOTIFY_REPEAT_SEC:
-                out["skipped"] += 1
-                continue
-            if first:
-                # 首次启用：只登记当前终态，不把历史任务一股脑补发一遍
-                seen[k] = ts
+                state[jid] = {"st": st, "sig": sig, "ts": ts, "nts": nts}
                 changed = True
                 continue
+            if kind == "success" and prev.get("st") == "done":
+                # 完成通知只认「非 done → done」这一次跃迁；done 之后错因被清空/改写
+                # 只是文案变化，不许再当成新的完成事件重推一遍
+                state[jid] = {"st": st, "sig": sig, "ts": ts, "nts": nts}
+                changed = True
+                continue
+            # 失败类兜底：同一任务 30 分钟内最多一条「失败」，自动重试/看门狗来回跑时不刷屏
+            if kind == "fail" and nts and ts - nts < NOTIFY_REPEAT_SEC:
+                state[jid] = {"st": st, "sig": sig, "ts": ts, "nts": nts}
+                changed = True
+                out["skipped"] += 1
+                continue
             if out["sent"] >= NOTIFY_MAX_PER_SCAN:
-                break
+                out["skipped"] += 1
+                continue                     # 不登记，下一轮接着发（这一条不能丢）
             try:
                 res = (send or pushplus_send)(token, notify_title(j, kind),
                                               notify_content(j, kind, time.strftime("%Y-%m-%d %H:%M")))
                 code = int((res or {}).get("code") or 0) if isinstance(res, dict) else -1
                 if code == 200:
                     out["sent"] += 1
-                    seen[k] = ts
+                    state[jid] = {"st": st, "sig": sig, "ts": ts, "nts": ts}
                     changed = True
                     NOTIFY_BACKOFF["fails"] = 0
                     NOTIFY_BACKOFF["until"] = 0.0
                 else:
                     msg = (res or {}).get("msg") if isinstance(res, dict) else str(res)
                     out["errors"].append("%s：%s" % (notify_title(j, kind)[:40], str(msg)[:80]))
-                    # 失败不登记键，退避后再试；否则这条通知就永久丢了
+                    # 失败不登记状态，退避后再试；否则这条通知就永久丢了
                     fails = int(NOTIFY_BACKOFF.get("fails") or 0) + 1
                     NOTIFY_BACKOFF["fails"] = fails
                     wait = min(NOTIFY_BACKOFF_MAX, NOTIFY_BACKOFF_BASE * (2 ** (fails - 1)))
@@ -1785,10 +1838,7 @@ def notify_scan(send=None, now=None):
                 break
             time.sleep(NOTIFY_SEND_GAP)
         if changed:
-            if len(seen) > NOTIFY_SEEN_MAX:
-                keep = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:NOTIFY_SEEN_MAX]
-                seen = dict(keep)
-            _write_json(NOTIFY_STATE_FILE, seen, quiet=True)
+            _notify_state_save(state, live)
     return out
 
 
@@ -10216,11 +10266,11 @@ def api(action, body):
         # 给前端看「当前能不能发、发过几条」，不暴露 token 原文
         s = load_settings()
         token = str(s.get("pushplusToken") or "")
-        seen = _read_json(NOTIFY_STATE_FILE, {})
+        seen, _ = _notify_state_load()
         return {"on": bool(_truthy(s.get("pushplusOn"))),
                 "tokenSet": pushplus_token_ok(token),
                 "tokenTail": token[-4:] if token else "",
-                "sentCount": len(seen) if isinstance(seen, dict) else 0}
+                "sentCount": len(seen)}
 
     if action == "quota":
         remotes = [str(r) for r in (body.get("remotes") or [])]

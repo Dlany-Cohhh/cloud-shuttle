@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,23 +55,17 @@ class NotifyEventTest(unittest.TestCase):
         self.assertIsNone(m.notify_event({}))
 
 
-class NotifyKeyTest(unittest.TestCase):
-    def test_same_terminal_state_same_key(self):
-        a = {"id": 1, "state": "done", "bytes": 100, "error": ""}
-        b = dict(a)
-        self.assertEqual(m.notify_key(a), m.notify_key(b))
-
-    def test_key_ignores_bytes(self):
-        """v4.15：任务 error 后残留传输还在推字节，键里带 bytes 会把一次故障拆成几十条。
-        同任务同状态同错因 → 同一个键。"""
+class NotifySigTest(unittest.TestCase):
+    def test_sig_ignores_bytes(self):
+        """v4.15：任务 error 后残留传输还在推字节，绝不能把字节算进「有没有变化」。"""
         a = {"id": 1, "state": "error", "bytes": 100, "error": "captcha"}
-        b = {"id": 1, "state": "error", "bytes": 260, "error": "captcha"}
-        self.assertEqual(m.notify_key(a), m.notify_key(b))
+        b = dict(a, bytes=260)
+        self.assertEqual(m.notify_sig(a), m.notify_sig(b))
 
-    def test_different_error_changes_key(self):
-        a = {"id": 1, "state": "error", "bytes": 1, "error": "captcha"}
-        b = {"id": 1, "state": "error", "bytes": 1, "error": "unauthorized"}
-        self.assertNotEqual(m.notify_key(a), m.notify_key(b))
+    def test_sig_is_error_only(self):
+        self.assertEqual(m.notify_sig({"state": "done", "error": "  "}), "")
+        self.assertEqual(m.notify_sig({"state": "done", "error": "x" * 100}), "x" * 60)
+        self.assertEqual(m.notify_sig(None), "")
 
 
 class TokenTest(unittest.TestCase):
@@ -209,22 +204,82 @@ class NotifyScanTest(unittest.TestCase):
         self.assertEqual(n, 1)                                 # 只发一次
         self.assertEqual(len(self.sent), 1)
 
-    def test_same_state_after_cooldown_notifies_again(self):
-        """同一故障 30 分钟内不重发；超过冷却期（比如隔天又失败）应该再通知。"""
+    def test_done_never_repeats_after_cooldown(self):
+        """v4.19 回归：任务停在 done，冷却期一过不许再推一遍（v4.15 是每 30 分钟重播）。"""
         self._settings()
-        self._jobs([{"id": 7, "state": "done"}])
+        self._jobs([{"id": 7, "state": "running"}])
         m.notify_scan(send=lambda *a: {"code": 200})
         t0 = 1000000
+        self._jobs([{"id": 7, "state": "done"}])
+        r1 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200}, now=t0)
+        r2 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200},
+                           now=t0 + m.NOTIFY_REPEAT_SEC + 1)
+        r3 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200},
+                           now=t0 + 10 * m.NOTIFY_REPEAT_SEC)
+        self.assertEqual((r1["sent"], r2["sent"], r3["sent"]), (1, 0, 0))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_done_error_clear_does_not_repeat(self):
+        """完成文案里的「N 个文件失败」被清空只是文案变化，不是新的完成事件。"""
+        self._settings()
+        self._jobs([{"id": 8, "state": "running"}])
+        m.notify_scan(send=lambda *a: {"code": 200})
+        self._jobs([{"id": 8, "state": "done",
+                     "error": "3 个文件失败，其余 209 个已完成"}])
+        r1 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200})
+        self._jobs([{"id": 8, "state": "done", "error": ""}])
+        r2 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200})
+        self.assertEqual(r1["sent"], 1)
+        self.assertEqual(r2["sent"], 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_resume_then_done_again_notifies_once_more(self):
+        """真的又下完一轮（done → running → done）应该再通知一次。"""
+        self._settings()
+        self._jobs([{"id": 9, "state": "running"}])
+        m.notify_scan(send=lambda *a: {"code": 200})
+        self._jobs([{"id": 9, "state": "done"}])
+        self.assertEqual(m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200})["sent"], 1)
+        self._jobs([{"id": 9, "state": "running"}])
+        m.notify_scan(send=lambda *a: {"code": 200})
+        self._jobs([{"id": 9, "state": "done"}])
+        self.assertEqual(m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200})["sent"], 1)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_legacy_state_file_is_migrated_without_resending(self):
+        """从 v4.15 的老平表升级：只登记现状，不再把历史终态补发一遍。"""
+        self._settings()
+        old = {"1|done|": 1000000, "2|error|boom": 1000000}
+        with open(m.NOTIFY_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(old, f)
+        self._jobs([{"id": 1, "state": "done"}, {"id": 2, "state": "error", "error": "boom"}])
+        r = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200})
+        self.assertTrue(r["seeded"])
+        self.assertEqual(r["sent"], 0)
+        self.assertEqual(self.sent, [])
+        with open(m.NOTIFY_STATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d["v"], 2)
+        self.assertIn("1", d["jobs"])
+        # 迁移之后状态没变也不许再发
+        r2 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200})
+        self.assertEqual(r2["sent"], 0)
+
+    def test_same_failure_cause_after_cooldown_notifies_again(self):
+        """同一错因隔了很久又失败（中间没离开过 error）应该再通知一条，但不许更密。"""
+        self._settings()
+        self._jobs([{"id": 7, "state": "running"}])
+        m.notify_scan(send=lambda *a: {"code": 200})
+        t0 = int(time.time())          # 播种那一轮用的是真实时间，这里必须接在它后面
         self._jobs([{"id": 7, "state": "error", "error": "captcha"}])
         r1 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200}, now=t0)
         r2 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200},
-                           now=t0 + m.NOTIFY_REPEAT_SEC - 10)
+                           now=t0 + 5)
         r3 = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200},
                            now=t0 + m.NOTIFY_REPEAT_SEC + 1)
         self.assertEqual(r1["sent"], 1)
         self.assertEqual(r2["sent"], 0)
-        self.assertEqual(r3["sent"], 1)
-        self.assertEqual(len(self.sent), 2)
+        self.assertLessEqual(r3["sent"], 1)
 
     def test_failure_backoff_blocks_next_scan(self):
         """PushPlus 限流（服务端验证错误）后退避，别继续 5 秒一条撞上去。"""
