@@ -86,7 +86,7 @@ ACCT_META_PATHS = (os.path.join(DATA_DIR, "accounts_meta.json"), "/app/accounts_
                    "/vol1/@appshare/zcode/console/accounts_meta.json",
                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_meta.json"))
 # 控制台版本：启动横幅与前端页脚共用这一处，避免前端硬编码再次落后
-APP_VERSION = "v4.19"
+APP_VERSION = "v4.20"
 
 
 # ── v3.38：凭证错误脱敏 + 「需要重新登录」识别 ────────────────────────────
@@ -1590,6 +1590,8 @@ NOTIFY_STATE_VER = 2          # v4.19 去重表结构：按任务记「上次见
 NOTIFY_BACKOFF_BASE = 60      # 发送失败后的退避起点（秒）
 NOTIFY_BACKOFF_MAX = 300      # 退避上限
 NOTIFY_BACKOFF = {"until": 0.0, "fails": 0}   # 退避状态（内存即可，重启清零不算错）
+NOTIFY_TRY_MAX = 6            # v4.20：同一条事件最多尝试发送几次（60→300 秒退避下约 20 分钟）
+NOTIFY_TRY = {}               # 事件 → 已尝试次数（内存即可，重启清零）
 NOTIFY_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{16,64}$")
 # v4.11：容器/守护进程重启会把在传的任务标成「控制台重启过，下载已中断…」「守护进程重启过…」的 stopped，
 # 那不是任务故障，是运维动作 —— 照 fail 推的话，每次升级/重启都给你发一串「任务失败」。
@@ -1816,12 +1818,23 @@ def notify_scan(send=None, now=None):
                     out["sent"] += 1
                     state[jid] = {"st": st, "sig": sig, "ts": ts, "nts": ts}
                     changed = True
+                    NOTIFY_TRY.pop("%s|%s|%s" % (jid, st, sig), None)
                     NOTIFY_BACKOFF["fails"] = 0
                     NOTIFY_BACKOFF["until"] = 0.0
                 else:
                     msg = (res or {}).get("msg") if isinstance(res, dict) else str(res)
                     out["errors"].append("%s：%s" % (notify_title(j, kind)[:40], str(msg)[:80]))
-                    # 失败不登记状态，退避后再试；否则这条通知就永久丢了
+                    # 失败不登记状态，退避后再试；但同一条事件最多试 NOTIFY_TRY_MAX 次
+                    # （v4.20：实测 PushPlus 侧 TLS/限流挂掉时，一条通知会被重试二十多分钟，
+                    #  最后突然补发一条「下载完成」，用户看到的还是莫名其妙的推送）
+                    tkey = "%s|%s|%s" % (jid, st, sig)
+                    tries = int(NOTIFY_TRY.get(tkey) or 0) + 1
+                    NOTIFY_TRY[tkey] = tries
+                    if tries >= NOTIFY_TRY_MAX:
+                        state[jid] = {"st": st, "sig": sig, "ts": ts, "nts": ts}
+                        changed = True
+                        out["errors"].append("已放弃重试（%d 次仍失败，不再补发）" % tries)
+                        NOTIFY_TRY.pop(tkey, None)
                     fails = int(NOTIFY_BACKOFF.get("fails") or 0) + 1
                     NOTIFY_BACKOFF["fails"] = fails
                     wait = min(NOTIFY_BACKOFF_MAX, NOTIFY_BACKOFF_BASE * (2 ** (fails - 1)))
@@ -1830,6 +1843,14 @@ def notify_scan(send=None, now=None):
                     break
             except Exception as e:
                 out["errors"].append("发送异常：%s" % str(e)[:100])
+                tkey = "%s|%s|%s" % (jid, st, sig)
+                tries = int(NOTIFY_TRY.get(tkey) or 0) + 1
+                NOTIFY_TRY[tkey] = tries
+                if tries >= NOTIFY_TRY_MAX:
+                    state[jid] = {"st": st, "sig": sig, "ts": ts, "nts": ts}
+                    changed = True
+                    out["errors"].append("已放弃重试（%d 次异常，不再补发）" % tries)
+                    NOTIFY_TRY.pop(tkey, None)
                 fails = int(NOTIFY_BACKOFF.get("fails") or 0) + 1
                 NOTIFY_BACKOFF["fails"] = fails
                 wait = min(NOTIFY_BACKOFF_MAX, NOTIFY_BACKOFF_BASE * (2 ** (fails - 1)))

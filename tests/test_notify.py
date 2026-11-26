@@ -132,6 +132,7 @@ class NotifyScanTest(unittest.TestCase):
         m.NOTIFY_SEND_GAP = 0        # 测试里不必真的间隔 1 秒
         m.NOTIFY_BACKOFF.clear()
         m.NOTIFY_BACKOFF.update({"until": 0.0, "fails": 0})
+        m.NOTIFY_TRY.clear()
         self.sent = []
 
     def tearDown(self):
@@ -280,6 +281,28 @@ class NotifyScanTest(unittest.TestCase):
         self.assertEqual(r1["sent"], 1)
         self.assertEqual(r2["sent"], 0)
         self.assertLessEqual(r3["sent"], 1)
+
+    def test_gives_up_after_max_tries(self):
+        """v4.20：PushPlus 侧一直连不上时，同一条事件最多试 NOTIFY_TRY_MAX 次，
+        之后登记状态不再补发（否则二十多分钟后会突然丢一条过期的「下载完成」）。"""
+        self._settings()
+        self._jobs([{"id": 12, "state": "running"}])
+        m.notify_scan(send=lambda *a: {"code": 200})
+        t0 = int(time.time())
+        self._jobs([{"id": 12, "state": "error", "error": "boom"}])
+        calls = []
+
+        def bad(*_a):
+            calls.append(1)
+            return {"code": -1, "msg": "ssl handshake"}
+
+        for i in range(12):
+            m.notify_scan(send=bad, now=t0 + i * 400)      # 每次都跨过退避窗口
+        self.assertEqual(len(calls), m.NOTIFY_TRY_MAX)     # 到上限就放弃，不再无限重试
+        r = m.notify_scan(send=lambda *a: self.sent.append(a) or {"code": 200},
+                          now=t0 + 10000)
+        self.assertEqual(r["sent"], 0)                     # 放弃后同一状态不再补发
+        self.assertEqual(self.sent, [])
 
     def test_failure_backoff_blocks_next_scan(self):
         """PushPlus 限流（服务端验证错误）后退避，别继续 5 秒一条撞上去。"""
